@@ -1126,7 +1126,7 @@ def _run_strike_gold(
         ("even12", list(range(0, NUM_LAYERS, 2))),
         ("all24", list(range(NUM_LAYERS))),
     ]
-    keep_fracs = [0.50, 0.35]
+    keep_fracs = [0.70, 0.60, 0.55, 0.50]
     grad_accums = [1, 4, 8]
     repair_steps = args.gold_repair_steps
 
@@ -1279,8 +1279,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--strike-gold", action="store_true", default=False,
         help="Run focused strike-gold experiment plan instead of the phase matrix. "
-             "Sweeps even12/all24 x keep_frac{0.50,0.35} x grad_accum{1,4,8} with "
-             "early stopping and PPL guardrails. Saves importance/kept-indices artifacts.",
+             "Sweeps even12/all24 x keep_frac{0.70,0.60,0.55,0.50} x grad_accum{1,4,8} "
+             "with early stopping and PPL guardrails. Saves importance/kept-indices artifacts.",
     )
     p.add_argument(
         "--gold-repair-steps", type=int, default=1000,
@@ -1306,8 +1306,8 @@ def parse_args() -> argparse.Namespace:
         help="Number of layers to compress per stage (default: 6).",
     )
     p.add_argument(
-        "--stage-repair-steps", type=int, default=500,
-        help="Max repair optimizer steps per stage (default: 500).",
+        "--stage-repair-steps", type=int, default=250,
+        help="Max repair optimizer steps per stage (default: 250).",
     )
     p.add_argument(
         "--stage-guardrail", type=float, default=200.0,
