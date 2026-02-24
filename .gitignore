@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+pnn/
+
+# Test cache
+.pytest_cache/
+
+# Experiment outputs
+runs/
+runs_*/
+*.tar.gz
+
+# Mac junk
+.DS_Store
+._*
+__MACOSX/
+
+# IDE
+.vscode/
+.idea/

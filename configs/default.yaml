@@ -1,0 +1,40 @@
+# ──────────────────────────────────────────────
+# pnn_compiler default configuration
+# ──────────────────────────────────────────────
+
+model:
+  name: "Qwen/Qwen2-0.5B"
+
+hardware:
+  device: "cuda"                     # "cuda" | "cpu"
+  dtype: "bf16"                      # bf16 | fp16 | fp32  (A100: bf16)
+  allow_tf32: true
+
+compression:
+  layers: [3]                        # which transformer layers to compress
+  block_size: 128                    # contiguous neuron block granularity
+  keep_frac: 0.50                    # fraction of FFN blocks to keep
+
+calibration:
+  n_texts: 400                       # calibration texts from wikitext-2 train
+  max_len: 256
+
+data:
+  n_texts_train: 2500                # repair training texts
+  n_texts_eval: 300                  # eval texts per split
+
+repair:
+  steps: 2000
+  lr: 3.0e-4
+  warmup: 100
+  weight_decay: 0.01
+
+eval:
+  max_eval_tokens: 40000
+
+bench:
+  n_texts: 200
+  warmup_iters: 20
+  iters: 80
+
+seed: 0

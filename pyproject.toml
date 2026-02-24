@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pnn-compiler"
+version = "0.1.0"
+description = "Demand-aware FFN block compression + fast repair for HF Transformers (Qwen2-style SwiGLU MLPs)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "BumbleB Team" }]
+
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.38",
+    "datasets>=2.16",
+    "accelerate>=0.26",
+    "numpy>=1.24",
+    "typer[all]>=0.9",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.2",
+]
+
+[project.scripts]
+pnn = "pnn_compiler.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests that need model download + inference",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
