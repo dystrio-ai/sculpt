@@ -211,11 +211,14 @@ def _select_for_layer(
         )
         kept_blocks, kept_idx, arts = select_blocks_structural(
             geom["D"], keep_frac, BLOCK_SIZE, topk_edges=20,
+            block_energy=geom.get("block_energy"),
+            feature_multiplier=geom.get("feature_multiplier", 3),
         )
         importance_vectors[li] = geom["D"].cpu()
         kept_indices[li] = kept_idx.cpu()
         structural_artifacts[li] = {
             "D": geom["D"].cpu(),
+            "block_energy": geom["block_energy"].cpu() if geom.get("block_energy") is not None else None,
             "edges": arts["edges"].cpu(),
             "k_edge": arts["k_edge"].cpu(),
             "block_scores": arts["block_scores"].cpu(),

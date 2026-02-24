@@ -57,20 +57,31 @@ def collect_block_geometry_swiglu(
 ) -> Dict[str, object]:
     """Compute block-level covariance of SwiGLU activations for structural selection.
 
-    For each token, computes z[b] = mean(|a[lo:hi]|) where a = act(gate(x)) * up(x),
-    then accumulates Cov(z) in float64.  Returns the covariance matrix D plus metadata.
+    Per block b and per token, extracts three features:
+        mu_b   = mean(a_block)
+        sigma_b = std(a_block)
+        mag_b  = mean(|a_block|)
+
+    The token feature vector z has dimension 3*n_blocks:
+        z = [mu_0, sigma_0, mag_0, mu_1, sigma_1, mag_1, ...]
+
+    Accumulates Cov(z) in float64 across tokens and returns the covariance
+    matrix D (3B x 3B), per-block mean energy, and metadata.
     """
     layer = model.model.layers[layer_idx]
     mlp = layer.mlp
     ffn = mlp.gate_proj.out_features
     n_blocks = math.ceil(ffn / block_size)
+    F = 3  # features per block: mu, sigma, mag
+    dim = F * n_blocks
 
-    sum_z = torch.zeros(n_blocks, dtype=torch.float64, device=device)
-    sum_zz = torch.zeros(n_blocks, n_blocks, dtype=torch.float64, device=device)
+    sum_z = torch.zeros(dim, dtype=torch.float64, device=device)
+    sum_zz = torch.zeros(dim, dim, dtype=torch.float64, device=device)
+    sum_mag = torch.zeros(n_blocks, dtype=torch.float64, device=device)
     total_tokens = 0
 
     def hook(module, inputs, output):
-        nonlocal sum_z, sum_zz, total_tokens
+        nonlocal sum_z, sum_zz, sum_mag, total_tokens
         if total_tokens >= max_tokens:
             return
         x = inputs[0]
@@ -85,11 +96,20 @@ def collect_block_geometry_swiglu(
             a = a[:budget]
             T = budget
 
-        z = torch.zeros(T, n_blocks, dtype=torch.float64, device=device)
+        a64 = a.to(torch.float64)
+        z = torch.zeros(T, dim, dtype=torch.float64, device=device)
         for b in range(n_blocks):
             lo = b * block_size
             hi = min(ffn, (b + 1) * block_size)
-            z[:, b] = a[:, lo:hi].abs().to(torch.float64).mean(dim=1)
+            blk = a64[:, lo:hi]                      # [T, block_len]
+            mu = blk.mean(dim=1)                      # [T]
+            sigma = blk.std(dim=1, correction=0)      # [T]
+            mag = blk.abs().mean(dim=1)               # [T]
+            base = F * b
+            z[:, base] = mu
+            z[:, base + 1] = sigma
+            z[:, base + 2] = mag
+            sum_mag += mag.sum(dim=0).unsqueeze(0) if mag.dim() == 0 else mag.sum()
 
         sum_z += z.sum(dim=0)
         sum_zz += z.T @ z
@@ -108,10 +128,13 @@ def collect_block_geometry_swiglu(
     N = max(total_tokens, 1)
     mean_z = sum_z / N
     D = (sum_zz / N) - mean_z.unsqueeze(1) * mean_z.unsqueeze(0)
+    block_energy = (sum_mag / N).cpu()
 
     return {
         "D": D.cpu(),
+        "block_energy": block_energy,
         "n_tokens": total_tokens,
         "block_size": block_size,
         "n_blocks": n_blocks,
+        "feature_multiplier": F,
     }

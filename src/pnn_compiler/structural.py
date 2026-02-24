@@ -178,6 +178,28 @@ def geometry_diagnostics(
 # ── Diversity-penalized greedy selection ──────────────────────────────────────
 
 
+def _aggregate_feature_conductance_to_blocks(
+    u: np.ndarray,
+    v: np.ndarray,
+    k_edge: np.ndarray,
+    n_blocks: int,
+    feat_per_block: int,
+) -> np.ndarray:
+    """Sum edge conductance incident to any feature node of a block.
+
+    Feature indices for block b are [b*F, b*F+1, ..., b*F+F-1].
+    Block score = sum of k_edge over all edges touching any of those nodes.
+    """
+    score = np.zeros(n_blocks, dtype=np.float64)
+    for e in range(len(u)):
+        block_u = int(u[e]) // feat_per_block
+        block_v = int(v[e]) // feat_per_block
+        score[block_u] += k_edge[e]
+        if block_v != block_u:
+            score[block_v] += k_edge[e]
+    return score
+
+
 def select_blocks_structural(
     D: torch.Tensor,
     keep_frac: float,
@@ -185,41 +207,66 @@ def select_blocks_structural(
     topk_edges: int = 20,
     n_physarum_iters: int = 200,
     diversity_lambda: float = 0.3,
+    block_energy: torch.Tensor | None = None,
+    feature_multiplier: int = 3,
 ) -> Tuple[List[int], torch.Tensor, Dict[str, object]]:
-    """Structural block selection via coupling geometry.
+    """Structural block selection via coupling geometry (v2).
 
-    Returns (kept_blocks, kept_idx, artifacts) where artifacts contains
-    intermediate data for saving/diagnostics.
+    D is a (F*B x F*B) covariance matrix where F=feature_multiplier features
+    per block.  The graph + Physarum operate on the F*B feature nodes, then
+    conductance is aggregated back to B blocks.  Block scores are modulated
+    by block_energy (mean activation magnitude) when provided.
+
+    Returns (kept_blocks, kept_idx, artifacts).
     """
-    n_blocks = D.shape[0]
-    keep_blocks = max(1, int(math.ceil(keep_frac * n_blocks)))
+    n_feat = D.shape[0]
+    F = feature_multiplier
+    n_blocks = n_feat // F
+    if n_blocks == 0:
+        n_blocks = max(1, n_feat)
+        F = 1
+    keep_blocks_n = max(1, int(math.ceil(keep_frac * n_blocks)))
 
+    # Graph + Physarum on the full F*B feature-node space
     u, v, w = build_graph_from_cov(D, mode="corr", sparsify="topk", k=topk_edges)
-    k_edge = physarum_conductance(u, v, w, n_blocks, n_iters=n_physarum_iters)
-    raw_scores = block_scores_from_conductance(u, v, k_edge, n_blocks)
+    k_edge = physarum_conductance(u, v, w, n_feat, n_iters=n_physarum_iters)
+
+    # Aggregate feature-level conductance back to blocks
+    raw_scores = _aggregate_feature_conductance_to_blocks(u, v, k_edge, n_blocks, F)
+
+    # Modulate by normalised block energy
+    if block_energy is not None:
+        be = block_energy.numpy().astype(np.float64) if isinstance(block_energy, torch.Tensor) else np.asarray(block_energy, dtype=np.float64)
+        be = be[:n_blocks]
+        be_norm = be / (be.max() + 1e-30)
+        raw_scores = raw_scores * (0.5 + 0.5 * be_norm)
 
     diags = geometry_diagnostics(D, k_edge)
 
-    # Greedy selection with diversity penalty: penalise neighbours of already-selected blocks
-    scores = raw_scores.copy()
-    selected: List[int] = []
+    # Build block-level adjacency for diversity penalty
     adj_weight = np.zeros((n_blocks, n_blocks), dtype=np.float64)
     for e in range(len(u)):
-        adj_weight[u[e], v[e]] += k_edge[e]
-        adj_weight[v[e], u[e]] += k_edge[e]
+        bu = int(u[e]) // F
+        bv = int(v[e]) // F
+        if bu != bv:
+            adj_weight[bu, bv] += k_edge[e]
+            adj_weight[bv, bu] += k_edge[e]
 
-    for _ in range(keep_blocks):
+    # Greedy selection with diversity penalty
+    scores = raw_scores.copy()
+    selected: List[int] = []
+
+    for _ in range(keep_blocks_n):
         best = int(np.argmax(scores))
         selected.append(best)
         scores[best] = -1e30
-        # Penalise neighbours proportional to coupling strength
         if diversity_lambda > 0:
             neighbour_penalty = adj_weight[best] / (adj_weight[best].max() + 1e-30)
             scores -= diversity_lambda * neighbour_penalty * raw_scores[best]
 
     selected.sort()
 
-    ffn = n_blocks * block_size  # approximate; caller adjusts for last partial block
+    ffn = n_blocks * block_size
     idx: List[int] = []
     for b in selected:
         lo = b * block_size
@@ -228,7 +275,7 @@ def select_blocks_structural(
 
     kept_idx = torch.tensor(idx, dtype=torch.long)
 
-    edges = torch.tensor(np.stack([u, v, w], axis=1), dtype=torch.float64)
+    edges = torch.tensor(np.stack([u, v, w], axis=1), dtype=torch.float64) if len(u) > 0 else torch.zeros(0, 3, dtype=torch.float64)
     artifacts = {
         "edges": edges,
         "k_edge": torch.from_numpy(k_edge),
