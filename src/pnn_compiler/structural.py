@@ -1,7 +1,12 @@
-"""Structural block selection via coupling geometry and Physarum-like conductance learning.
+"""Structural block selection via operator-fidelity + coupling-geometry diversity.
 
-Pipeline: D_cov -> correlation graph -> sparsified edges -> Physarum conductance
--> centrality block scores -> diversity-penalized greedy selection -> kept_idx.
+v3 pipeline:
+  1. Base score  = operator sensitivity (how much zeroing block changes MLP output)
+  2. Modulated   by normalised block energy
+  3. Diversity   from coupling graph (D_cov -> correlation -> Physarum conductance)
+                 penalises selecting tightly-coupled neighbours
+
+Falls back to v2 (conductance centrality) when block_sensitivity is not provided.
 """
 
 from __future__ import annotations
@@ -206,16 +211,19 @@ def select_blocks_structural(
     block_size: int,
     topk_edges: int = 20,
     n_physarum_iters: int = 200,
-    diversity_lambda: float = 0.3,
+    diversity_lambda: float = 0.2,
     block_energy: torch.Tensor | None = None,
     feature_multiplier: int = 3,
+    block_sensitivity: torch.Tensor | None = None,
 ) -> Tuple[List[int], torch.Tensor, Dict[str, object]]:
-    """Structural block selection via coupling geometry (v2).
+    """Structural block selection (v3: operator-fidelity + coupling diversity).
 
-    D is a (F*B x F*B) covariance matrix where F=feature_multiplier features
-    per block.  The graph + Physarum operate on the F*B feature nodes, then
-    conductance is aggregated back to B blocks.  Block scores are modulated
-    by block_energy (mean activation magnitude) when provided.
+    When block_sensitivity is provided (v3), it is used as the base score
+    (how much zeroing the block changes MLP output).  The coupling graph from
+    D is used only for the diversity penalty during greedy selection.
+
+    When block_sensitivity is None, falls back to v2 behaviour (conductance
+    centrality as base score).
 
     Returns (kept_blocks, kept_idx, artifacts).
     """
@@ -227,23 +235,13 @@ def select_blocks_structural(
         F = 1
     keep_blocks_n = max(1, int(math.ceil(keep_frac * n_blocks)))
 
-    # Graph + Physarum on the full F*B feature-node space
+    # ── Coupling graph (used for diversity in v3, or scoring in v2 fallback) ──
     u, v, w = build_graph_from_cov(D, mode="corr", sparsify="topk", k=topk_edges)
     k_edge = physarum_conductance(u, v, w, n_feat, n_iters=n_physarum_iters)
 
-    # Aggregate feature-level conductance back to blocks
-    raw_scores = _aggregate_feature_conductance_to_blocks(u, v, k_edge, n_blocks, F)
-
-    # Modulate by normalised block energy
-    if block_energy is not None:
-        be = block_energy.numpy().astype(np.float64) if isinstance(block_energy, torch.Tensor) else np.asarray(block_energy, dtype=np.float64)
-        be = be[:n_blocks]
-        be_norm = be / (be.max() + 1e-30)
-        raw_scores = raw_scores * (0.5 + 0.5 * be_norm)
-
     diags = geometry_diagnostics(D, k_edge)
 
-    # Build block-level adjacency for diversity penalty
+    # ── Block-level adjacency from coupling (always needed for diversity) ─────
     adj_weight = np.zeros((n_blocks, n_blocks), dtype=np.float64)
     for e in range(len(u)):
         bu = int(u[e]) // F
@@ -251,8 +249,34 @@ def select_blocks_structural(
         if bu != bv:
             adj_weight[bu, bv] += k_edge[e]
             adj_weight[bv, bu] += k_edge[e]
+    # Normalise rows so penalty is relative
+    row_max = adj_weight.max(axis=1, keepdims=True) + 1e-30
+    adj_norm = adj_weight / row_max
 
-    # Greedy selection with diversity penalty
+    # ── Base scores ───────────────────────────────────────────────────────────
+    if block_sensitivity is not None:
+        # v3: operator-fidelity as base score
+        sens = (block_sensitivity.numpy().astype(np.float64)
+                if isinstance(block_sensitivity, torch.Tensor)
+                else np.asarray(block_sensitivity, dtype=np.float64))
+        sens = sens[:n_blocks]
+        raw_scores = sens.copy()
+    else:
+        # v2 fallback: conductance centrality
+        raw_scores = _aggregate_feature_conductance_to_blocks(
+            u, v, k_edge, n_blocks, F,
+        )
+
+    # Modulate by normalised block energy
+    if block_energy is not None:
+        be = (block_energy.numpy().astype(np.float64)
+              if isinstance(block_energy, torch.Tensor)
+              else np.asarray(block_energy, dtype=np.float64))
+        be = be[:n_blocks]
+        be_norm = be / (be.max() + 1e-30)
+        raw_scores = raw_scores * (0.5 + 0.5 * be_norm)
+
+    # ── Greedy selection with coupling-diversity penalty ──────────────────────
     scores = raw_scores.copy()
     selected: List[int] = []
 
@@ -261,8 +285,7 @@ def select_blocks_structural(
         selected.append(best)
         scores[best] = -1e30
         if diversity_lambda > 0:
-            neighbour_penalty = adj_weight[best] / (adj_weight[best].max() + 1e-30)
-            scores -= diversity_lambda * neighbour_penalty * raw_scores[best]
+            scores -= diversity_lambda * adj_norm[best] * raw_scores[best]
 
     selected.sort()
 
@@ -275,7 +298,8 @@ def select_blocks_structural(
 
     kept_idx = torch.tensor(idx, dtype=torch.long)
 
-    edges = torch.tensor(np.stack([u, v, w], axis=1), dtype=torch.float64) if len(u) > 0 else torch.zeros(0, 3, dtype=torch.float64)
+    edges = (torch.tensor(np.stack([u, v, w], axis=1), dtype=torch.float64)
+             if len(u) > 0 else torch.zeros(0, 3, dtype=torch.float64))
     artifacts = {
         "edges": edges,
         "k_edge": torch.from_numpy(k_edge),

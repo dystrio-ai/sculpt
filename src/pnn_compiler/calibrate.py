@@ -1,4 +1,10 @@
-"""Calibration: collect per-neuron SwiGLU activation importance via forward hooks."""
+"""Calibration: collect per-neuron SwiGLU activation importance via forward hooks.
+
+Functions:
+    collect_ffn_importance_swiglu       – per-neuron magnitude importance (swiglu_mag selector)
+    collect_block_geometry_swiglu       – block-level 3-feature covariance (structural selector)
+    collect_block_operator_sensitivity  – operator-fidelity block sensitivity (structural v3)
+"""
 
 from __future__ import annotations
 
@@ -137,4 +143,83 @@ def collect_block_geometry_swiglu(
         "block_size": block_size,
         "n_blocks": n_blocks,
         "feature_multiplier": F,
+    }
+
+
+@torch.no_grad()
+def collect_block_operator_sensitivity_swiglu(
+    model,
+    tokenizer,
+    layer_idx: int,
+    texts: Sequence[str],
+    max_len: int,
+    device: str,
+    block_size: int,
+    max_tokens: int = 30_000,
+) -> Dict[str, object]:
+    """Measure how much zeroing each block changes the MLP output (operator fidelity).
+
+    For each token, computes:
+        a = act(gate_proj(x)) * up_proj(x)       [T, ffn]
+        y = down_proj(a)                          [T, hidden]
+
+    Then for each block b (neurons lo:hi of a):
+        delta_y_b = W_down[:, lo:hi] @ a[:, lo:hi].T   [hidden, T]
+        score_b  += mean_T ||delta_y_b||^2
+
+    This avoids per-block forward passes by decomposing the output difference
+    via the linearity of down_proj.  Also accumulates block_energy as before.
+    """
+    layer = model.model.layers[layer_idx]
+    mlp = layer.mlp
+    ffn = mlp.gate_proj.out_features
+    n_blocks = math.ceil(ffn / block_size)
+
+    sensitivity = torch.zeros(n_blocks, dtype=torch.float64, device=device)
+    block_energy = torch.zeros(n_blocks, dtype=torch.float64, device=device)
+    total_tokens = 0
+
+    W_down = mlp.down_proj.weight.float()  # [hidden, ffn]
+
+    def hook(module, inputs, output):
+        nonlocal sensitivity, block_energy, total_tokens
+        if total_tokens >= max_tokens:
+            return
+        x = inputs[0]
+        x2 = x.reshape(-1, x.shape[-1])
+        gate = mlp.gate_proj(x2).float()
+        up = mlp.up_proj(x2).float()
+        a = mlp.act_fn(gate) * up  # [T, ffn]
+
+        T = a.shape[0]
+        budget = max_tokens - total_tokens
+        if T > budget:
+            a = a[:budget]
+            T = budget
+
+        for b in range(n_blocks):
+            lo = b * block_size
+            hi = min(ffn, (b + 1) * block_size)
+            a_blk = a[:, lo:hi]                          # [T, blk]
+            delta = a_blk @ W_down[:, lo:hi].T            # [T, hidden]
+            sensitivity[b] += delta.pow(2).sum(dim=1).to(torch.float64).sum()
+            block_energy[b] += a_blk.abs().to(torch.float64).mean(dim=1).sum()
+
+        total_tokens += T
+
+    h = mlp.register_forward_hook(hook)
+    model.eval()
+    for t in texts:
+        if total_tokens >= max_tokens:
+            break
+        inp = tokenizer(t, return_tensors="pt", truncation=True, max_length=max_len)
+        inp = {k: v.to(device) for k, v in inp.items()}
+        _ = model(**inp, use_cache=False)
+    h.remove()
+
+    N = max(total_tokens, 1)
+    return {
+        "block_sensitivity": (sensitivity / N).cpu(),
+        "block_energy": (block_energy / N).cpu(),
+        "n_blocks": n_blocks,
     }

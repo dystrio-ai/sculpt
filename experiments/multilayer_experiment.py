@@ -47,7 +47,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from pnn_compiler.config import resolve_dtype
 from pnn_compiler.data import load_text_sets, load_ood_texts
 from pnn_compiler.model import load_model_and_tokenizer
-from pnn_compiler.calibrate import collect_ffn_importance_swiglu, collect_block_geometry_swiglu
+from pnn_compiler.calibrate import (
+    collect_ffn_importance_swiglu,
+    collect_block_geometry_swiglu,
+    collect_block_operator_sensitivity_swiglu,
+)
 from pnn_compiler.compile import select_blocks, compress_mlp_layer_swiglu_inplace
 from pnn_compiler.structural import select_blocks_structural
 from pnn_compiler.repair import repair_layers
@@ -209,16 +213,22 @@ def _select_for_layer(
             model, tok, li, texts_cal, MAX_LEN, DEVICE,
             block_size=BLOCK_SIZE, max_tokens=30_000,
         )
+        sens = collect_block_operator_sensitivity_swiglu(
+            model, tok, li, texts_cal, MAX_LEN, DEVICE,
+            block_size=BLOCK_SIZE, max_tokens=30_000,
+        )
         kept_blocks, kept_idx, arts = select_blocks_structural(
             geom["D"], keep_frac, BLOCK_SIZE, topk_edges=20,
             block_energy=geom.get("block_energy"),
             feature_multiplier=geom.get("feature_multiplier", 3),
+            block_sensitivity=sens["block_sensitivity"],
         )
         importance_vectors[li] = geom["D"].cpu()
         kept_indices[li] = kept_idx.cpu()
         structural_artifacts[li] = {
             "D": geom["D"].cpu(),
             "block_energy": geom["block_energy"].cpu() if geom.get("block_energy") is not None else None,
+            "block_sensitivity": sens["block_sensitivity"].cpu(),
             "edges": arts["edges"].cpu(),
             "k_edge": arts["k_edge"].cpu(),
             "block_scores": arts["block_scores"].cpu(),
@@ -799,10 +809,12 @@ def run_compressed(
                     ("edges", f"coupling_edges_layer_{li}.pt"),
                     ("k_edge", f"coupling_k_layer_{li}.pt"),
                     ("block_scores", f"block_scores_layer_{li}.pt"),
+                    ("block_sensitivity", f"block_sensitivity_layer_{li}.pt"),
                 ]:
-                    p = rdir / fname
-                    torch.save(sa[key], p)
-                    artifact_paths[fname.replace(".pt", "")] = fname
+                    if key in sa and sa[key] is not None:
+                        p = rdir / fname
+                        torch.save(sa[key], p)
+                        artifact_paths[fname.replace(".pt", "")] = fname
 
         n_saved = sum(1 for k in artifact_paths if k.startswith("importance_layer_"))
         log.info(f"  Saved artifacts for {n_saved} layers (selector={selector})")
@@ -923,6 +935,7 @@ def run_compressed(
     # Aggregate geometry diagnostics across layers (mean)
     geom_diags: Dict[str, Optional[float]] = {
         "eff_rank95_D": None, "gini_k": None, "top10_edge_mass": None,
+        "mean_block_sensitivity": None, "max_block_sensitivity": None,
     }
     if structural_artifacts:
         keys = ["eff_rank95_D", "gini_k", "top10_edge_mass"]
@@ -931,6 +944,13 @@ def run_compressed(
                     if "diagnostics" in sa and k in sa["diagnostics"]]
             if vals:
                 geom_diags[k] = round(sum(vals) / len(vals), 4)
+        # Aggregate operator sensitivity stats
+        sens_tensors = [sa["block_sensitivity"] for sa in structural_artifacts.values()
+                        if "block_sensitivity" in sa and sa["block_sensitivity"] is not None]
+        if sens_tensors:
+            all_sens = torch.cat(sens_tensors)
+            geom_diags["mean_block_sensitivity"] = round(all_sens.mean().item(), 6)
+            geom_diags["max_block_sensitivity"] = round(all_sens.max().item(), 6)
 
     return {
         "run_id": run_id,
@@ -1076,6 +1096,8 @@ def write_summary(
             "eff_rank95_D": _safe_round(r.get("eff_rank95_D")),
             "gini_k": _safe_round(r.get("gini_k")),
             "top10_edge_mass": _safe_round(r.get("top10_edge_mass")),
+            "mean_block_sensitivity": _safe_round(r.get("mean_block_sensitivity")),
+            "max_block_sensitivity": _safe_round(r.get("max_block_sensitivity")),
         })
 
     fieldnames = list(rows[0].keys())
