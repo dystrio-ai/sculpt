@@ -45,6 +45,7 @@ def test_help_shows_all_flags():
         "--gold-early-stop-patience",
         "--staged", "--stage-size", "--stage-repair-steps", "--stage-guardrail",
         "--final-repair-steps",
+        "--only-layer-desc", "--only-keep-frac", "--only-grad-accum",
         "--selector",
     ]:
         assert flag in result.stdout, f"--help missing flag: {flag}"

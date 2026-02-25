@@ -1173,7 +1173,32 @@ def _run_strike_gold(
     grad_accums = [1, 4, 8]
     repair_steps = args.gold_repair_steps
 
-    total_runs = 1 + len(layer_sets) * len(keep_fracs) * len(grad_accums)
+    # Build full grid then apply filters
+    grid: List[Tuple[str, List[int], float, int]] = [
+        (ld, ll, kf, ga)
+        for ld, ll in layer_sets
+        for kf in keep_fracs
+        for ga in grad_accums
+    ]
+    if args.only_layer_desc:
+        grid = [(ld, ll, kf, ga) for ld, ll, kf, ga in grid
+                if ld == args.only_layer_desc]
+    if args.only_keep_frac >= 0:
+        grid = [(ld, ll, kf, ga) for ld, ll, kf, ga in grid
+                if abs(kf - args.only_keep_frac) < 1e-9]
+    if args.only_grad_accum > 0:
+        grid = [(ld, ll, kf, ga) for ld, ll, kf, ga in grid
+                if ga == args.only_grad_accum]
+
+    if not grid:
+        raise ValueError(
+            f"Strike-gold grid filter produced 0 runs. Filters: "
+            f"only_layer_desc={args.only_layer_desc!r}  "
+            f"only_keep_frac={args.only_keep_frac}  "
+            f"only_grad_accum={args.only_grad_accum}"
+        )
+
+    total_runs = 1 + len(grid)
 
     log.info("")
     log.info("=" * 70)
@@ -1215,53 +1240,51 @@ def _run_strike_gold(
     run_id += 1
 
     # ── Compressed runs grid ──────────────────────────────────────────────────
-    for layer_desc, layers in layer_sets:
-        for kf in keep_fracs:
-            for ga in grad_accums:
-                # Auto-compute final repair budget for staged runs
-                if args.staged and args.final_repair_steps > 0:
-                    final_steps = args.final_repair_steps
-                elif args.staged and repair_steps > 0:
-                    num_stages = math.ceil(len(layers) / args.stage_size)
-                    final_steps = max(0, repair_steps - args.stage_repair_steps * num_stages)
-                else:
-                    final_steps = 0
+    for layer_desc, layers, kf, ga in grid:
+        # Auto-compute final repair budget for staged runs
+        if args.staged and args.final_repair_steps > 0:
+            final_steps = args.final_repair_steps
+        elif args.staged and repair_steps > 0:
+            num_stages = math.ceil(len(layers) / args.stage_size)
+            final_steps = max(0, repair_steps - args.stage_repair_steps * num_stages)
+        else:
+            final_steps = 0
 
-                log.info("")
-                log.info(
-                    f"STRIKE-GOLD: {layer_desc} keep_frac={kf} "
-                    f"grad_accum={ga}"
-                    f"{f'  final_repair={final_steps}' if final_steps > 0 else ''}"
-                )
-                r = run_compressed(
-                    run_id=run_id,
-                    phase=99,  # strike-gold sentinel
-                    layer_desc=layer_desc,
-                    layers=layers,
-                    keep_frac=kf,
-                    repair_steps=repair_steps,
-                    texts=texts,
-                    selector=args.selector,
-                    grad_accum_steps=ga,
-                    curve_every=args.curve_every,
-                    curve_eval_texts=args.curve_eval_texts,
-                    curve_max_eval_tokens=args.curve_max_eval_tokens,
-                    ood_texts=ood_texts,
-                    max_eval_tokens_ood=args.max_eval_tokens_ood,
-                    skip_ablations=args.skip_ablations,
-                    enable_vllm=args.enable_vllm,
-                    vllm_prompts=vllm_prompts,
-                    save_artifacts=True,
-                    ppl_guardrail=args.gold_ppl_guardrail,
-                    early_stop_patience=args.gold_early_stop_patience,
-                    staged=args.staged,
-                    stage_size=args.stage_size,
-                    stage_repair_steps=args.stage_repair_steps,
-                    stage_guardrail=args.stage_guardrail,
-                    final_repair_steps=final_steps,
-                )
-                all_results.append(r)
-                run_id += 1
+        log.info("")
+        log.info(
+            f"STRIKE-GOLD: {layer_desc} keep_frac={kf} "
+            f"grad_accum={ga}"
+            f"{f'  final_repair={final_steps}' if final_steps > 0 else ''}"
+        )
+        r = run_compressed(
+            run_id=run_id,
+            phase=99,  # strike-gold sentinel
+            layer_desc=layer_desc,
+            layers=layers,
+            keep_frac=kf,
+            repair_steps=repair_steps,
+            texts=texts,
+            selector=args.selector,
+            grad_accum_steps=ga,
+            curve_every=args.curve_every,
+            curve_eval_texts=args.curve_eval_texts,
+            curve_max_eval_tokens=args.curve_max_eval_tokens,
+            ood_texts=ood_texts,
+            max_eval_tokens_ood=args.max_eval_tokens_ood,
+            skip_ablations=args.skip_ablations,
+            enable_vllm=args.enable_vllm,
+            vllm_prompts=vllm_prompts,
+            save_artifacts=True,
+            ppl_guardrail=args.gold_ppl_guardrail,
+            early_stop_patience=args.gold_early_stop_patience,
+            staged=args.staged,
+            stage_size=args.stage_size,
+            stage_repair_steps=args.stage_repair_steps,
+            stage_guardrail=args.stage_guardrail,
+            final_repair_steps=final_steps,
+        )
+        all_results.append(r)
+        run_id += 1
 
     write_summary(all_results, baseline)
 
@@ -1375,6 +1398,19 @@ def parse_args() -> argparse.Namespace:
         help="Global consolidation repair steps on all compressed layers after "
              "staged compression completes (default: 0 = none). In strike-gold "
              "mode, auto-computed from remaining budget if not explicitly set.",
+    )
+    # Strike-gold grid filters (debug)
+    p.add_argument(
+        "--only-layer-desc", type=str, default="",
+        help="Filter strike-gold grid to this layer desc, e.g. 'all24' (debug).",
+    )
+    p.add_argument(
+        "--only-keep-frac", type=float, default=-1.0,
+        help="Filter strike-gold grid to this keep_frac, e.g. 0.50 (debug).",
+    )
+    p.add_argument(
+        "--only-grad-accum", type=int, default=-1,
+        help="Filter strike-gold grid to this grad_accum, e.g. 4 (debug).",
     )
     return p.parse_args()
 
