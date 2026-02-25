@@ -1726,9 +1726,19 @@ def main() -> None:
     all_results: List[Dict[str, Any]] = []
     run_id = 0
 
+    # Override grad_accum from --only-grad-accum if set (same filter semantics
+    # as strike-gold, but applied to the phase matrix path too)
+    effective_grad_accum = (
+        args.only_grad_accum if args.only_grad_accum > 0 else args.grad_accum_steps
+    )
+
+    phase_keep_schedule: Optional[Dict[int, float]] = None
+    if args.keep_schedule:
+        phase_keep_schedule = parse_keep_schedule(args.keep_schedule, NUM_LAYERS)
+
     compressed_kwargs: Dict[str, Any] = {
         "selector": args.selector,
-        "grad_accum_steps": args.grad_accum_steps,
+        "grad_accum_steps": effective_grad_accum,
         "curve_every": args.curve_every,
         "curve_eval_texts": args.curve_eval_texts,
         "curve_max_eval_tokens": args.curve_max_eval_tokens,
@@ -1737,6 +1747,16 @@ def main() -> None:
         "skip_ablations": args.skip_ablations,
         "enable_vllm": args.enable_vllm,
         "vllm_prompts": vllm_prompts,
+        "staged": args.staged,
+        "stage_size": args.stage_size,
+        "stage_repair_steps": args.stage_repair_steps,
+        "stage_guardrail": args.stage_guardrail,
+        "final_repair_steps": args.final_repair_steps,
+        "final_repair_lr": args.final_repair_lr,
+        "final_early_stop_patience": args.final_early_stop_patience,
+        "final_curve_every": args.final_curve_every,
+        "early_stop_patience": args.gold_early_stop_patience,
+        "keep_schedule": phase_keep_schedule,
     }
 
     # ── Phase 0: Baseline ─────────────────────────────────────────────────────

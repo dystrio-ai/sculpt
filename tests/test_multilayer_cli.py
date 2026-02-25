@@ -153,6 +153,137 @@ def test_phase_dependency_still_works_with_strike_gold_absent():
     assert result.returncode != 0
 
 
+# ── Unit-style monkeypatch tests ──────────────────────────────────────────────
+
+
+def _import_mle():
+    """Import multilayer_experiment module (lazy, cached)."""
+    import importlib
+    _sys = sys
+    for p in [str(REPO_ROOT / "experiments"), str(REPO_ROOT / "src")]:
+        if p not in _sys.path:
+            _sys.path.insert(0, p)
+    if "multilayer_experiment" in _sys.modules:
+        return _sys.modules["multilayer_experiment"]
+    import multilayer_experiment
+    return multilayer_experiment
+
+
+_MLE_GLOBALS = [
+    "MODEL_ID", "NUM_LAYERS", "RUNS_DIR",
+    "N_TEXTS_CAL", "N_TEXTS_TRAIN", "N_TEXTS_EVAL", "MAX_EVAL_TOKENS",
+    "PREFILL_WARMUP_ITERS", "PREFILL_ITERS", "DECODE_WARMUP_ITERS", "DECODE_ITERS",
+]
+
+
+def test_staged_phase1_receives_staged_kwargs(tmp_path):
+    """When --staged --phases 0,1 --only-grad-accum 8, run_compressed must
+    receive staged=True, stage_repair_steps from CLI, and grad_accum_steps=8."""
+    from unittest.mock import patch, MagicMock
+
+    mle = _import_mle()
+    saved = {k: getattr(mle, k) for k in _MLE_GLOBALS}
+
+    captured = []
+
+    def spy_run_compressed(**kw):
+        captured.append(kw)
+        return {
+            "run_id": kw["run_id"],
+            "phase": kw["phase"],
+            "layer_desc": kw["layer_desc"],
+            "layers": kw["layers"],
+            "keep_frac": kw["keep_frac"],
+            "ppl_w2_test_post": 10.0,
+            "ppl_w103_valid_post": 10.0,
+        }
+
+    baseline_result = {
+        "run_id": 0, "phase": 0, "layer_desc": "baseline",
+        "layers": [], "keep_frac": 1.0, "repair_steps": 0,
+        "actual_repair_steps": 0, "selector_name": "swiglu_mag",
+        "grad_accum_steps": 1, "early_stopped": False,
+        "guardrail_failed": False, "staged": False, "stages_completed": 0,
+        "ppl_w2_test_pre": 10.0, "ppl_w103_valid_pre": 10.0,
+        "ppl_w2_test_post": 10.0, "ppl_w103_valid_post": 10.0,
+        "ppl_ood_pre": None, "ppl_ood_post": None,
+        "prefill_tokens_per_sec_pre": 1000.0,
+        "prefill_tokens_per_sec_post": 1000.0,
+        "decode_tokens_per_sec_pre": 100.0,
+        "decode_tokens_per_sec_post": 100.0,
+        "repair_wall_time_seconds": 0.0, "compile_wall_time_seconds": 0.0,
+        "time_to_recover_90pct": None,
+        "ppl_w103_post_no_repair": 10.0, "ppl_w103_post_random": None,
+        "ppl_ood_post_no_repair": None, "ppl_ood_post_random": None,
+        "prefill_tps_no_repair": 1000.0, "prefill_tps_random": None,
+        "decode_tps_no_repair": 100.0, "decode_tps_random": None,
+        "vllm_metrics": None,
+    }
+
+    mock_cfg = MagicMock()
+    mock_cfg.num_hidden_layers = 24
+
+    try:
+        with (
+            patch.object(mle, "run_compressed", side_effect=spy_run_compressed),
+            patch.object(mle, "run_baseline", return_value=baseline_result),
+            patch.object(mle, "load_text_sets", return_value={
+                "cal": ["x"] * 5, "train": ["x"] * 10,
+                "eval_w2": ["x"] * 50, "eval_w103": ["x"] * 50,
+            }),
+            patch.object(mle, "load_ood_texts", return_value=[]),
+            patch.object(mle, "write_summary"),
+            patch(
+                "transformers.AutoConfig.from_pretrained",
+                return_value=mock_cfg,
+            ),
+            patch("sys.argv", [
+                "mle",
+                "--phases", "0,1",
+                "--staged",
+                "--stage-repair-steps", "300",
+                "--final-repair-steps", "100",
+                "--final-repair-lr", "0.0001",
+                "--final-early-stop-patience", "2",
+                "--final-curve-every", "50",
+                "--only-grad-accum", "8",
+                "--n-ood-texts", "0",
+                "--skip-ablations",
+                "--outdir", str(tmp_path / "test_runs"),
+            ]),
+        ):
+            mle.main()
+    finally:
+        for k, v in saved.items():
+            setattr(mle, k, v)
+
+    assert len(captured) == 3, f"Expected 3 Phase 1 layer configs, got {len(captured)}"
+
+    for i, kw in enumerate(captured):
+        assert kw["staged"] is True, f"run {i}: staged should be True"
+        assert kw["stage_repair_steps"] == 300, (
+            f"run {i}: stage_repair_steps={kw['stage_repair_steps']}, expected 300"
+        )
+        assert kw["final_repair_steps"] == 100, (
+            f"run {i}: final_repair_steps={kw['final_repair_steps']}, expected 100"
+        )
+        assert abs(kw["final_repair_lr"] - 0.0001) < 1e-12, (
+            f"run {i}: final_repair_lr={kw['final_repair_lr']}, expected 0.0001"
+        )
+        assert kw["final_early_stop_patience"] == 2, (
+            f"run {i}: final_early_stop_patience={kw['final_early_stop_patience']}"
+        )
+        assert kw["final_curve_every"] == 50, (
+            f"run {i}: final_curve_every={kw['final_curve_every']}"
+        )
+        assert kw["grad_accum_steps"] == 8, (
+            f"run {i}: grad_accum_steps={kw['grad_accum_steps']}, expected 8"
+        )
+        assert kw["repair_steps"] == 2000, (
+            f"run {i}: Phase 1 repair_steps should be 2000 (staged path handles internally)"
+        )
+
+
 # ── Full smoke test (needs model download + inference) ────────────────────────
 
 
