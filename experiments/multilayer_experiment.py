@@ -98,6 +98,72 @@ NUM_LAYERS = 24  # Qwen2-0.5B
 RUNS_DIR = Path(__file__).resolve().parents[1] / "runs"
 
 
+# ── Layer spec / keep-schedule parsing ─────────────────────────────────────────
+
+
+def parse_layer_spec(spec: str, n_layers: int) -> List[int]:
+    """Parse a layer specification string into a sorted list of layer indices.
+
+    Supports: "0-17", "0-11,12-17", "0,3,6,9".
+    """
+    layers: List[int] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            lo_i, hi_i = int(lo), int(hi)
+            if lo_i < 0 or hi_i >= n_layers or lo_i > hi_i:
+                raise ValueError(
+                    f"Invalid layer range '{part}': must be in [0, {n_layers - 1}]"
+                )
+            layers.extend(range(lo_i, hi_i + 1))
+        else:
+            idx = int(part)
+            if idx < 0 or idx >= n_layers:
+                raise ValueError(
+                    f"Invalid layer index '{part}': must be in [0, {n_layers - 1}]"
+                )
+            layers.append(idx)
+    return sorted(set(layers))
+
+
+def parse_keep_schedule(spec: str, n_layers: int) -> Dict[int, float]:
+    """Parse a keep-schedule string into a per-layer keep_frac dict.
+
+    Format: "0-11:0.55,12-17:0.60,18-23:1.0"
+    Values must be in (0, 1].  Layers not mentioned get the run's default keep_frac.
+    """
+    schedule: Dict[int, float] = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if ":" not in part:
+            raise ValueError(f"Invalid keep-schedule entry '{part}': expected 'range:frac'")
+        range_str, frac_str = part.rsplit(":", 1)
+        frac = float(frac_str)
+        if frac <= 0 or frac > 1.0:
+            raise ValueError(f"keep_frac {frac} out of range (0, 1] in '{part}'")
+        layer_indices = parse_layer_spec(range_str, n_layers)
+        for li in layer_indices:
+            schedule[li] = frac
+    return schedule
+
+
+def _layers_desc_short(layers: List[int]) -> str:
+    """Compact description like '0-17' or '0-11,14-17' from a sorted layer list."""
+    if not layers:
+        return ""
+    ranges: List[str] = []
+    start = prev = layers[0]
+    for li in layers[1:]:
+        if li == prev + 1:
+            prev = li
+        else:
+            ranges.append(f"{start}-{prev}" if prev > start else str(start))
+            start = prev = li
+    ranges.append(f"{start}-{prev}" if prev > start else str(start))
+    return ",".join(ranges)
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
@@ -532,12 +598,21 @@ def run_compressed(
     final_repair_lr: float = 0.0,
     final_early_stop_patience: int = 1,
     final_curve_every: int = 100,
+    keep_schedule: Optional[Dict[int, float]] = None,
 ) -> Dict[str, Any]:
+    # Build per-layer keep_frac map; filter out layers with keep=1.0
+    keep_frac_by_layer: Dict[int, float] = {}
+    for li in layers:
+        keep_frac_by_layer[li] = keep_schedule.get(li, keep_frac) if keep_schedule else keep_frac
+    compressible_layers = [li for li in layers if keep_frac_by_layer[li] < 1.0]
+
     log.info("=" * 70)
     log.info(
         f"Run {run_id}: phase={phase}  {layer_desc}  "
         f"keep_frac={keep_frac}  repair_steps={repair_steps}"
     )
+    if keep_schedule:
+        log.info(f"  keep_schedule: {len(compressible_layers)} compressible of {len(layers)} layers")
     log.info("=" * 70)
 
     _setup_determinism()
@@ -576,10 +651,11 @@ def run_compressed(
             f"decode={metrics_pre['decode_tokens_per_sec']:.0f}"
         )
 
-        chunks = [layers[i:i + stage_size] for i in range(0, len(layers), stage_size)]
+        chunks = [compressible_layers[i:i + stage_size]
+                  for i in range(0, len(compressible_layers), stage_size)]
         log.info(
             f"  Staged compression: {len(chunks)} stages of up to "
-            f"{stage_size} layers each"
+            f"{stage_size} layers each ({len(compressible_layers)} compressible)"
         )
         if final_repair_steps > 0:
             log.info(f"  Final global repair: {final_repair_steps} steps after all stages")
@@ -613,7 +689,7 @@ def run_compressed(
                 kept_blocks, kept_idx = _select_for_layer(
                     model, tok, li, texts["cal"], selector,
                     importance_vectors, kept_indices, structural_artifacts,
-                    keep_frac,
+                    keep_frac_by_layer[li],
                 )
                 rep = compress_mlp_layer_swiglu_inplace(
                     model, li, kept_idx, dtype, DEVICE,
@@ -622,6 +698,7 @@ def run_compressed(
                     "kept_blocks": len(kept_blocks),
                     "original_ffn": original_ffn_dims[li],
                     "ffn_kept": rep["ffn_kept"],
+                    "keep_frac": keep_frac_by_layer[li],
                 }
                 compile_info[li] = info
                 compile_report[str(li)] = {**info, **rep}
@@ -737,24 +814,25 @@ def run_compressed(
     else:
         # ── NON-STAGED: calibrate + compile all at once (original path) ──────
         compile_t0 = time.time()
-        for li in layers:
+        for li in compressible_layers:
             kept_blocks, kept_idx = _select_for_layer(
                 model, tok, li, texts["cal"], selector,
                 importance_vectors, kept_indices, structural_artifacts,
-                keep_frac,
+                keep_frac_by_layer[li],
             )
             rep = compress_mlp_layer_swiglu_inplace(model, li, kept_idx, dtype, DEVICE)
             info = {
                 "kept_blocks": len(kept_blocks),
                 "original_ffn": original_ffn_dims[li],
                 "ffn_kept": rep["ffn_kept"],
+                "keep_frac": keep_frac_by_layer[li],
             }
             compile_info[li] = info
             compile_report[str(li)] = {**info, **rep}
         compile_wall = time.time() - compile_t0
 
-        _assert_physical_slicing(model, layers, original_ffn_dims)
-        _assert_no_masking(model, layers, original_ffn_dims)
+        _assert_physical_slicing(model, compressible_layers, original_ffn_dims)
+        _assert_no_masking(model, compressible_layers, original_ffn_dims)
         log.info("  [OK] Physical slicing verified (shapes reduced, no masking)")
 
         metrics_pre = _collect_metrics(
@@ -812,7 +890,7 @@ def run_compressed(
                 model=model,
                 tokenizer=tok,
                 texts_train=texts["train"],
-                layers=layers,
+                layers=compressible_layers,
                 steps=repair_steps,
                 lr=REPAIR_LR,
                 warmup=REPAIR_WARMUP,
@@ -900,7 +978,11 @@ def run_compressed(
     # ── Write main-variant artifacts ──────────────────────────────────────────
     config_data: Dict[str, Any] = {
         "run_id": run_id, "phase": phase, "layer_desc": layer_desc,
-        "layers": layers, "keep_frac": keep_frac, "repair_steps": repair_steps,
+        "layers": layers,
+        "layers_compressed": compressible_layers,
+        "keep_frac": keep_frac,
+        "keep_schedule": {str(k): v for k, v in (keep_schedule or {}).items()},
+        "repair_steps": repair_steps,
         "actual_repair_steps": actual_repair_steps,
         "selector_name": selector,
         "model_id": MODEL_ID, "dtype": DTYPE, "seed": SEED,
@@ -964,7 +1046,7 @@ def run_compressed(
 
     if not skip_ablations:
         random_metrics_pre, random_metrics_post = _run_random_variant(
-            layers=layers,
+            layers=compressible_layers,
             compile_info=compile_info,
             texts=texts,
             repair_steps=repair_steps,
@@ -1011,6 +1093,11 @@ def run_compressed(
         "layer_desc": layer_desc,
         "layers": layers,
         "keep_frac": keep_frac,
+        "n_layers_compressed": len(compressible_layers),
+        "layers_compressed_desc": _layers_desc_short(compressible_layers),
+        "keep_schedule_str": ",".join(
+            f"{k}:{v}" for k, v in sorted((keep_schedule or {}).items())
+        ) if keep_schedule else "",
         "repair_steps": repair_steps,
         "actual_repair_steps": actual_repair_steps,
         "selector_name": selector,
@@ -1151,6 +1238,10 @@ def write_summary(
             "top10_edge_mass": _safe_round(r.get("top10_edge_mass")),
             "mean_block_sensitivity": _safe_round(r.get("mean_block_sensitivity")),
             "max_block_sensitivity": _safe_round(r.get("max_block_sensitivity")),
+            # Layer / schedule columns
+            "n_layers_compressed": r.get("n_layers_compressed", len(r.get("layers", []))),
+            "layers_compressed_desc": r.get("layers_compressed_desc", ""),
+            "keep_schedule": r.get("keep_schedule_str", ""),
         })
 
     fieldnames = list(rows[0].keys())
@@ -1183,6 +1274,11 @@ def _run_strike_gold(
     grad_accums = [1, 4, 8]
     repair_steps = args.gold_repair_steps
 
+    # Resolve keep_schedule once (shared across grid)
+    ks: Optional[Dict[int, float]] = None
+    if args.keep_schedule:
+        ks = parse_keep_schedule(args.keep_schedule, NUM_LAYERS)
+
     # Build full grid then apply filters
     grid: List[Tuple[str, List[int], float, int]] = [
         (ld, ll, kf, ga)
@@ -1199,6 +1295,14 @@ def _run_strike_gold(
     if args.only_grad_accum > 0:
         grid = [(ld, ll, kf, ga) for ld, ll, kf, ga in grid
                 if ga == args.only_grad_accum]
+
+    # Apply --compress-layers / --skip-last-layers overrides to each grid item
+    if args.compress_layers:
+        override_layers = parse_layer_spec(args.compress_layers, NUM_LAYERS)
+        grid = [(ld, override_layers, kf, ga) for ld, _, kf, ga in grid]
+    elif args.skip_last_layers > 0:
+        grid = [(ld, ll[:-args.skip_last_layers] if args.skip_last_layers < len(ll) else ll,
+                 kf, ga) for ld, ll, kf, ga in grid]
 
     if not grid:
         raise ValueError(
@@ -1228,6 +1332,12 @@ def _run_strike_gold(
         )
         log.info(f"  Final repair:   auto-budget from gold_repair_steps "
                  f"(override: --final-repair-steps={args.final_repair_steps})")
+    if args.compress_layers:
+        log.info(f"  Compress layers: {args.compress_layers}")
+    elif args.skip_last_layers > 0:
+        log.info(f"  Skip last:      {args.skip_last_layers} layers")
+    if args.keep_schedule:
+        log.info(f"  Keep schedule:  {args.keep_schedule}")
     log.info(f"  Total runs:     {total_runs} (1 baseline + {total_runs - 1} compressed)")
     log.info("=" * 70)
 
@@ -1291,11 +1401,12 @@ def _run_strike_gold(
             stage_size=args.stage_size,
             stage_repair_steps=args.stage_repair_steps,
             stage_guardrail=args.stage_guardrail,
-                    final_repair_steps=final_steps,
-                    final_repair_lr=args.final_repair_lr,
-                    final_early_stop_patience=args.final_early_stop_patience,
-                    final_curve_every=args.final_curve_every,
-                )
+            final_repair_steps=final_steps,
+            final_repair_lr=args.final_repair_lr,
+            final_early_stop_patience=args.final_early_stop_patience,
+            final_curve_every=args.final_curve_every,
+            keep_schedule=ks,
+        )
         all_results.append(r)
         run_id += 1
 
@@ -1437,6 +1548,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--only-grad-accum", type=int, default=-1,
         help="Filter strike-gold grid to this grad_accum, e.g. 4 (debug).",
+    )
+    # Layer override / depth-weighted keep schedule
+    p.add_argument(
+        "--compress-layers", type=str, default="",
+        help="Override layers to compress, e.g. '0-17' or '0-11,14-17'. "
+             "Overrides layer_desc's default layer list.",
+    )
+    p.add_argument(
+        "--skip-last-layers", type=int, default=0,
+        help="Drop the last N layers from compression (default: 0). "
+             "Applied to the layer_desc's layer list when --compress-layers is not set.",
+    )
+    p.add_argument(
+        "--keep-schedule", type=str, default="",
+        help="Per-range keep_frac schedule, e.g. '0-11:0.55,12-17:0.60,18-23:1.0'. "
+             "Layers not mentioned use the run's default keep_frac. "
+             "keep_frac=1.0 means skip compression for that layer.",
     )
     return p.parse_args()
 
