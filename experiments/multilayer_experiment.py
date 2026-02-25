@@ -93,7 +93,7 @@ DECODE_TOKENS = 128
 DECODE_WARMUP_ITERS = 3
 DECODE_ITERS = 10
 
-NUM_LAYERS = 24  # Qwen2-0.5B
+NUM_LAYERS = 24  # default for Qwen2-0.5B; overridden at runtime from model
 
 RUNS_DIR = Path(__file__).resolve().parents[1] / "runs"
 
@@ -162,6 +162,26 @@ def _layers_desc_short(layers: List[int]) -> str:
             start = prev = li
     ranges.append(f"{start}-{prev}" if prev > start else str(start))
     return ",".join(ranges)
+
+
+def _detect_num_layers(model) -> int:
+    """Get number of transformer layers from the model."""
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        return len(model.model.layers)
+    if hasattr(model, "config") and hasattr(model.config, "num_hidden_layers"):
+        return model.config.num_hidden_layers
+    raise RuntimeError("Cannot detect num_layers from model")
+
+
+def build_layer_sets(n: int) -> List[Tuple[str, List[int]]]:
+    """Generate standard layer-set configs adapted to model depth n."""
+    six = sorted(set(np.linspace(0, n - 1, min(6, n), dtype=int).tolist()))
+    even = list(range(0, n, 2))[:12]
+    return [
+        ("6layers", six),
+        ("even", even),
+        ("all", list(range(n))),
+    ]
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -483,9 +503,8 @@ def run_baseline(
     _setup_determinism()
     model, tok = _load_fresh_model()
 
-    n_layers = len(model.model.layers)
-    assert n_layers == NUM_LAYERS, f"Expected {NUM_LAYERS} layers, got {n_layers}"
-    log.info(f"  Model loaded: {n_layers} layers")
+    n_layers = _detect_num_layers(model)
+    log.info(f"  Model loaded: {n_layers} layers ({MODEL_ID})")
 
     eval_w2 = texts["eval_w2"]
     eval_w103 = texts["eval_w103"]
@@ -501,7 +520,8 @@ def run_baseline(
     _write_json(rdir / "config.json", {
         "run_id": 0, "phase": 0, "layer_desc": "baseline",
         "layers": [], "keep_frac": 1.0, "repair_steps": 0,
-        "model_id": MODEL_ID, "dtype": DTYPE, "seed": SEED,
+        "model_id": MODEL_ID, "num_layers": NUM_LAYERS,
+        "dtype": DTYPE, "seed": SEED,
         "block_size": BLOCK_SIZE, "max_len": MAX_LEN,
         "grad_accum_steps": 1,
         "max_eval_tokens_ood": max_eval_tokens_ood,
@@ -985,7 +1005,8 @@ def run_compressed(
         "repair_steps": repair_steps,
         "actual_repair_steps": actual_repair_steps,
         "selector_name": selector,
-        "model_id": MODEL_ID, "dtype": DTYPE, "seed": SEED,
+        "model_id": MODEL_ID, "num_layers": NUM_LAYERS,
+        "dtype": DTYPE, "seed": SEED,
         "block_size": BLOCK_SIZE, "max_len": MAX_LEN,
         "grad_accum_steps": grad_accum_steps,
         "curve_every": curve_every,
@@ -1266,10 +1287,8 @@ def _run_strike_gold(
 ) -> None:
     """Focused run-plan designed to surface real speedups."""
 
-    layer_sets = [
-        ("even12", list(range(0, NUM_LAYERS, 2))),
-        ("all24", list(range(NUM_LAYERS))),
-    ]
+    all_sets = build_layer_sets(NUM_LAYERS)
+    layer_sets = [s for s in all_sets if s[0] in ("even", "all")]
     keep_fracs = [0.70, 0.60, 0.55, 0.50]
     grad_accums = [1, 4, 8]
     repair_steps = args.gold_repair_steps
@@ -1426,6 +1445,11 @@ def parse_args() -> argparse.Namespace:
         description="Multi-layer compression experiment harness for pnn_compiler.",
     )
     p.add_argument(
+        "--model-id", type=str, default="Qwen/Qwen2-0.5B",
+        help="HuggingFace model ID (default: Qwen/Qwen2-0.5B). "
+             "Layer sets auto-adapt to the model's num_layers.",
+    )
+    p.add_argument(
         "--grad-accum-steps", type=int, default=1,
         help="Gradient accumulation steps per optimizer update (default: 1).",
     )
@@ -1482,7 +1506,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--strike-gold", action="store_true", default=False,
         help="Run focused strike-gold experiment plan instead of the phase matrix. "
-             "Sweeps even12/all24 x keep_frac{0.70,0.60,0.55,0.50} x grad_accum{1,4,8} "
+             "Sweeps even/all x keep_frac{0.70,0.60,0.55,0.50} x grad_accum{1,4,8} "
              "with early stopping and PPL guardrails. Saves importance/kept-indices artifacts.",
     )
     p.add_argument(
@@ -1572,9 +1596,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     global N_TEXTS_CAL, N_TEXTS_TRAIN, N_TEXTS_EVAL, MAX_EVAL_TOKENS
     global PREFILL_WARMUP_ITERS, PREFILL_ITERS, DECODE_WARMUP_ITERS, DECODE_ITERS
-    global RUNS_DIR
+    global RUNS_DIR, MODEL_ID, NUM_LAYERS
 
     args = parse_args()
+
+    # ── --model-id: override model and detect num_layers ──────────────────────
+    MODEL_ID = args.model_id
+    from transformers import AutoConfig
+    _cfg = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+    NUM_LAYERS = _cfg.num_hidden_layers
 
     logging.basicConfig(
         level=logging.INFO,
@@ -1621,7 +1651,7 @@ def main() -> None:
     # ── Config echo ───────────────────────────────────────────────────────────
     log.info("Multi-layer experiment harness starting")
     log.info(f"Device={DEVICE}  dtype={DTYPE}  seed={SEED}")
-    log.info(f"Model={MODEL_ID}  block_size={BLOCK_SIZE}  max_len={MAX_LEN}")
+    log.info(f"Model={MODEL_ID}  num_layers={NUM_LAYERS}  block_size={BLOCK_SIZE}  max_len={MAX_LEN}")
     log.info(f"phases={sorted(phases)}  outdir={RUNS_DIR}")
     if args.smoke:
         log.info(
@@ -1732,11 +1762,7 @@ def main() -> None:
         log.info("")
         log.info("PHASE 1: LAYER-SET SWEEP (keep_frac=0.50)")
 
-        layer_configs = [
-            ("6layers", [0, 3, 6, 9, 12, 15]),
-            ("even12", list(range(0, NUM_LAYERS, 2))),
-            ("all24", list(range(NUM_LAYERS))),
-        ]
+        layer_configs = build_layer_sets(NUM_LAYERS)
 
         phase1_results: List[Dict[str, Any]] = []
         for desc, layers in layer_configs:

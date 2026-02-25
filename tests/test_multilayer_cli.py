@@ -48,6 +48,7 @@ def test_help_shows_all_flags():
         "--final-early-stop-patience", "--final-curve-every",
         "--only-layer-desc", "--only-keep-frac", "--only-grad-accum",
         "--compress-layers", "--skip-last-layers", "--keep-schedule",
+        "--model-id",
         "--selector",
     ]:
         assert flag in result.stdout, f"--help missing flag: {flag}"
@@ -121,6 +122,16 @@ def test_final_repair_steps_in_help():
     assert result.returncode == 0
     assert "--final-repair-steps" in result.stdout
     assert "consolidation" in result.stdout.lower() or "global" in result.stdout.lower()
+
+
+def test_model_id_accepted_with_help():
+    """--model-id dummy is accepted by argparse (no download when --help)."""
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--model-id", "dummy/model", "--help"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0
+    assert "--model-id" in result.stdout
 
 
 def test_strike_gold_accepts_selector_structural():
