@@ -1829,6 +1829,33 @@ def main() -> None:
         all_results.append(baseline)
         run_id += 1
 
+    # ── Phase filter helpers ───────────────────────────────────────────────────
+    _f_desc = args.only_layer_desc
+    _f_kf = args.only_keep_frac
+    _f_ga = effective_grad_accum  # already resolved from --only-grad-accum
+
+    def _desc_matches(desc: str) -> bool:
+        if not _f_desc:
+            return True
+        if desc == _f_desc:
+            return True
+        if desc.startswith(_f_desc) or _f_desc.startswith(desc):
+            return True
+        return False
+
+    def _kf_matches(kf: float) -> bool:
+        if _f_kf < 0:
+            return True
+        return abs(kf - _f_kf) < 1e-9
+
+    def _log_phase_filters(phase_name: str, before: int, after: int) -> None:
+        if _f_desc or _f_kf >= 0:
+            log.info(
+                f"  Phase filters: only_layer_desc={_f_desc!r}  "
+                f"only_keep_frac={_f_kf}  "
+                f"=> {after}/{before} configs after filtering"
+            )
+
     # ── Phase 1: Layer-set sweep (keep_frac=0.50, repair_steps=2000) ──────────
     best_p1: Optional[Dict[str, Any]] = None
 
@@ -1837,23 +1864,31 @@ def main() -> None:
         log.info("PHASE 1: LAYER-SET SWEEP (keep_frac=0.50)")
 
         layer_configs = build_layer_sets(NUM_LAYERS)
+        p1_kf = 0.50
+        if _f_kf >= 0:
+            p1_kf = _f_kf
+        filtered = [(d, l) for d, l in layer_configs if _desc_matches(d)]
+        _log_phase_filters("Phase 1", len(layer_configs), len(filtered))
 
         phase1_results: List[Dict[str, Any]] = []
-        for desc, layers in layer_configs:
+        for desc, layers in filtered:
             r = run_compressed(
                 run_id=run_id, phase=1, layer_desc=desc, layers=layers,
-                keep_frac=0.50, repair_steps=2000, texts=texts,
+                keep_frac=p1_kf, repair_steps=2000, texts=texts,
                 **compressed_kwargs,
             )
             phase1_results.append(r)
             all_results.append(r)
             run_id += 1
 
-        best_p1 = min(phase1_results, key=lambda r: r["ppl_w2_test_post"])
-        log.info(
-            f"Phase 1 winner: {best_p1['layer_desc']}  "
-            f"PPL w2={best_p1['ppl_w2_test_post']:.2f}"
-        )
+        if phase1_results:
+            best_p1 = min(phase1_results, key=lambda r: r["ppl_w2_test_post"])
+            log.info(
+                f"Phase 1 winner: {best_p1['layer_desc']}  "
+                f"PPL w2={best_p1['ppl_w2_test_post']:.2f}"
+            )
+        else:
+            log.warning("Phase 1: no configs after filtering — skipping")
 
     # ── Phase 2: keep_frac sweep on best layer-set ────────────────────────────
     best_p2: Optional[Dict[str, Any]] = None
@@ -1864,8 +1899,11 @@ def main() -> None:
         log.info(f"PHASE 2: KEEP_FRAC SWEEP (layers={best_p1['layer_desc']})")
 
         keep_fracs = [0.70, 0.50, 0.35, 0.25]
+        filtered_kf = [kf for kf in keep_fracs if _kf_matches(kf)]
+        _log_phase_filters("Phase 2", len(keep_fracs), len(filtered_kf))
+
         phase2_results: List[Dict[str, Any]] = []
-        for kf in keep_fracs:
+        for kf in filtered_kf:
             r = run_compressed(
                 run_id=run_id, phase=2, layer_desc=best_p1["layer_desc"],
                 layers=best_p1["layers"], keep_frac=kf, repair_steps=2000,
@@ -1875,11 +1913,14 @@ def main() -> None:
             all_results.append(r)
             run_id += 1
 
-        best_p2 = min(phase2_results, key=lambda r: r["ppl_w2_test_post"])
-        log.info(
-            f"Phase 2 winner: keep_frac={best_p2['keep_frac']}  "
-            f"PPL w2={best_p2['ppl_w2_test_post']:.2f}"
-        )
+        if phase2_results:
+            best_p2 = min(phase2_results, key=lambda r: r["ppl_w2_test_post"])
+            log.info(
+                f"Phase 2 winner: keep_frac={best_p2['keep_frac']}  "
+                f"PPL w2={best_p2['ppl_w2_test_post']:.2f}"
+            )
+        else:
+            log.warning("Phase 2: no configs after filtering — skipping")
 
     # ── Phase 3: repair_steps sweep on best (layer-set + keep_frac) ───────────
     if 3 in phases:

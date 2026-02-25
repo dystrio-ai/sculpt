@@ -484,6 +484,68 @@ def test_stage_regression_aborts_remaining_stages(tmp_path):
     )
 
 
+def test_phase1_only_layer_desc_filter(tmp_path):
+    """--only-layer-desc even filters Phase 1 to a single layer config."""
+    mle = _import_mle()
+    captured, spy = _spy_factory()
+
+    _run_main_with_args(mle, [
+        "--phases", "0,1",
+        "--only-layer-desc", "even",
+    ], spy, tmp_path)
+
+    assert len(captured) == 1, f"Expected 1 run (even only), got {len(captured)}"
+    assert captured[0]["layer_desc"] == "even"
+    assert captured[0]["keep_frac"] == 0.50
+
+
+def test_phase1_only_keep_frac_override(tmp_path):
+    """--only-keep-frac 0.70 overrides Phase 1 keep_frac from 0.50 to 0.70."""
+    mle = _import_mle()
+    captured, spy = _spy_factory()
+
+    _run_main_with_args(mle, [
+        "--phases", "0,1",
+        "--only-keep-frac", "0.70",
+    ], spy, tmp_path)
+
+    assert len(captured) == 3, f"Expected 3 layer configs, got {len(captured)}"
+    for kw in captured:
+        assert abs(kw["keep_frac"] - 0.70) < 1e-9, (
+            f"keep_frac should be 0.70, got {kw['keep_frac']}"
+        )
+
+
+def test_phase1_combined_filters(tmp_path):
+    """--only-layer-desc even --only-keep-frac 0.70 produces exactly 1 run."""
+    mle = _import_mle()
+    captured, spy = _spy_factory()
+
+    _run_main_with_args(mle, [
+        "--phases", "0,1",
+        "--only-layer-desc", "even",
+        "--only-keep-frac", "0.70",
+    ], spy, tmp_path)
+
+    assert len(captured) == 1, f"Expected 1 run, got {len(captured)}"
+    assert captured[0]["layer_desc"] == "even"
+    assert abs(captured[0]["keep_frac"] - 0.70) < 1e-9
+
+
+def test_phase1_prefix_match(tmp_path):
+    """--only-layer-desc 6 matches '6layers' via prefix."""
+    mle = _import_mle()
+    captured, spy = _spy_factory()
+
+    _run_main_with_args(mle, [
+        "--phases", "0,1",
+        "--only-layer-desc", "6",
+    ], spy, tmp_path)
+
+    assert len(captured) == 1, f"Expected 1 run (6layers via prefix), got {len(captured)}"
+    assert captured[0]["layer_desc"] == "6layers"
+
+
 # ── Full smoke test (needs model download + inference) ────────────────────────
 
 
