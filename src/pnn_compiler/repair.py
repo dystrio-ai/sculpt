@@ -33,6 +33,7 @@ def repair_layers(
     curve_every: int = 250,
     early_stop_patience: int = 0,
     early_stop_key: str = "ppl_w103_valid",
+    regression_limit: float = 0.0,
 ) -> Dict[str, Any]:
     """Train only MLP params in selected layers.
 
@@ -50,6 +51,10 @@ def repair_layers(
     ``early_stop_patience`` (requires ``curve_fn``): stop if the metric
     given by ``early_stop_key`` has not improved for this many consecutive
     curve checkpoints.  0 disables early stopping.
+
+    ``regression_limit`` (requires ``curve_fn``): if > 0, stop immediately
+    when the early_stop_key metric exceeds the best value seen so far by
+    more than this fraction (e.g. 0.10 = 10%).
     """
     for p in model.parameters():
         p.requires_grad = False
@@ -140,18 +145,28 @@ def repair_layers(
             curve_points.append(pt)
             model.train()
 
-            if early_stop_patience > 0:
+            if early_stop_patience > 0 or regression_limit > 0:
                 val = pt.get(early_stop_key, float("inf"))
                 if val < _es_best:
                     _es_best = val
                     _es_no_improve = 0
                 else:
                     _es_no_improve += 1
-                if _es_no_improve >= early_stop_patience:
+
+                if early_stop_patience > 0 and _es_no_improve >= early_stop_patience:
                     print(
                         f"[repair] Early stop at opt_step {opt_step}: "
                         f"{early_stop_key} did not improve for "
                         f"{early_stop_patience} consecutive checkpoints"
+                    )
+                    early_stopped = True
+                    break
+
+                if regression_limit > 0 and _es_best > 0 and val > _es_best * (1.0 + regression_limit):
+                    print(
+                        f"[repair] Regression stop at opt_step {opt_step}: "
+                        f"{early_stop_key}={val:.2f} exceeds best "
+                        f"{_es_best:.2f} by >{regression_limit*100:.0f}%"
                     )
                     early_stopped = True
                     break

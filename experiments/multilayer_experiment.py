@@ -529,6 +529,9 @@ def run_compressed(
     stage_repair_steps: int = 500,
     stage_guardrail: float = 200.0,
     final_repair_steps: int = 0,
+    final_repair_lr: float = 0.0,
+    final_early_stop_patience: int = 1,
+    final_curve_every: int = 100,
 ) -> Dict[str, Any]:
     log.info("=" * 70)
     log.info(
@@ -646,7 +649,7 @@ def run_compressed(
             warmup_stage = min(REPAIR_WARMUP, stage_repair_steps // 5)
             log.info(
                 f"    Repairing layers compressed so far: {compressed_so_far}  "
-                f"steps={stage_repair_steps}  "
+                f"steps={stage_repair_steps}  lr={REPAIR_LR:.2e}  "
                 f"warmup={warmup_stage}  grad_accum={grad_accum_steps}"
             )
 
@@ -682,21 +685,25 @@ def run_compressed(
 
         # ── Final global consolidation repair ─────────────────────────────────
         if final_repair_steps > 0 and not guardrail_failed and compressed_so_far:
+            fr_lr = final_repair_lr if final_repair_lr > 0 else REPAIR_LR
             warmup_final = min(REPAIR_WARMUP, final_repair_steps // 5)
             log.info(
                 f"  Final global repair: layers={compressed_so_far}  "
-                f"steps={final_repair_steps}  warmup={warmup_final}  "
-                f"grad_accum={grad_accum_steps}"
+                f"steps={final_repair_steps}  lr={fr_lr:.2e}  "
+                f"warmup={warmup_final}  grad_accum={grad_accum_steps}  "
+                f"early_stop_patience={final_early_stop_patience}  "
+                f"curve_every={final_curve_every}  regression_limit=10%"
             )
             rt0 = time.time()
             fr = repair_layers(
                 model=model, tokenizer=tok, texts_train=texts["train"],
-                layers=compressed_so_far, steps=final_repair_steps, lr=REPAIR_LR,
+                layers=compressed_so_far, steps=final_repair_steps, lr=fr_lr,
                 warmup=warmup_final, weight_decay=REPAIR_WEIGHT_DECAY,
                 max_len=MAX_LEN, device=DEVICE, log_every=200,
                 grad_accum_steps=grad_accum_steps,
-                curve_fn=curve_fn, curve_every=curve_every,
-                early_stop_patience=early_stop_patience,
+                curve_fn=curve_fn, curve_every=final_curve_every,
+                early_stop_patience=final_early_stop_patience,
+                regression_limit=0.10,
             )
             repair_wall += time.time() - rt0
             final_steps_used = int(fr["steps"])
@@ -912,6 +919,9 @@ def run_compressed(
         "stage_repair_steps": stage_repair_steps if staged else 0,
         "stage_guardrail": stage_guardrail if staged else 0,
         "final_repair_steps": final_repair_steps if staged else 0,
+        "final_repair_lr": final_repair_lr if staged and final_repair_steps > 0 else 0,
+        "final_early_stop_patience": final_early_stop_patience if staged else 0,
+        "final_curve_every": final_curve_every if staged else 0,
         "stages_completed": stages_completed,
     }
     if save_artifacts:
@@ -1281,8 +1291,11 @@ def _run_strike_gold(
             stage_size=args.stage_size,
             stage_repair_steps=args.stage_repair_steps,
             stage_guardrail=args.stage_guardrail,
-            final_repair_steps=final_steps,
-        )
+                    final_repair_steps=final_steps,
+                    final_repair_lr=args.final_repair_lr,
+                    final_early_stop_patience=args.final_early_stop_patience,
+                    final_curve_every=args.final_curve_every,
+                )
         all_results.append(r)
         run_id += 1
 
@@ -1399,6 +1412,19 @@ def parse_args() -> argparse.Namespace:
              "staged compression completes (default: 0 = none). In strike-gold "
              "mode, auto-computed from remaining budget if not explicitly set.",
     )
+    p.add_argument(
+        "--final-repair-lr", type=float, default=0.0,
+        help="Learning rate for final global repair (default: 0 = use REPAIR_LR). "
+             "Set lower than stage LR to avoid quality regression.",
+    )
+    p.add_argument(
+        "--final-early-stop-patience", type=int, default=1,
+        help="Early-stop patience for final global repair (default: 1).",
+    )
+    p.add_argument(
+        "--final-curve-every", type=int, default=100,
+        help="Curve eval interval for final global repair (default: 100).",
+    )
     # Strike-gold grid filters (debug)
     p.add_argument(
         "--only-layer-desc", type=str, default="",
@@ -1499,11 +1525,15 @@ def main() -> None:
             f"early_stop_patience={args.gold_early_stop_patience}"
         )
     if args.staged:
+        fr_lr_str = f"{args.final_repair_lr:.2e}" if args.final_repair_lr > 0 else f"{REPAIR_LR:.2e}(default)"
         log.info(
             f"[STAGED] stage_size={args.stage_size}  "
             f"stage_repair_steps={args.stage_repair_steps}  "
             f"stage_guardrail={args.stage_guardrail}  "
-            f"final_repair_steps={args.final_repair_steps}"
+            f"final_repair_steps={args.final_repair_steps}  "
+            f"final_lr={fr_lr_str}  "
+            f"final_patience={args.final_early_stop_patience}  "
+            f"final_curve_every={args.final_curve_every}"
         )
 
     # ── Load data once ────────────────────────────────────────────────────────

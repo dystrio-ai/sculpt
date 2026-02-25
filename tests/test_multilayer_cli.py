@@ -44,7 +44,8 @@ def test_help_shows_all_flags():
         "--strike-gold", "--gold-repair-steps", "--gold-ppl-guardrail",
         "--gold-early-stop-patience",
         "--staged", "--stage-size", "--stage-repair-steps", "--stage-guardrail",
-        "--final-repair-steps",
+        "--final-repair-steps", "--final-repair-lr",
+        "--final-early-stop-patience", "--final-curve-every",
         "--only-layer-desc", "--only-keep-frac", "--only-grad-accum",
         "--selector",
     ]:
