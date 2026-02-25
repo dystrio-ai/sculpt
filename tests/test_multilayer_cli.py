@@ -44,6 +44,7 @@ def test_help_shows_all_flags():
         "--strike-gold", "--gold-repair-steps", "--gold-ppl-guardrail",
         "--gold-early-stop-patience",
         "--staged", "--stage-size", "--stage-repair-steps", "--stage-guardrail",
+        "--final-repair-steps",
         "--selector",
     ]:
         assert flag in result.stdout, f"--help missing flag: {flag}"
@@ -107,6 +108,16 @@ def test_selector_flag_in_help():
     assert "--selector" in result.stdout
     assert "swiglu_mag" in result.stdout
     assert "structural" in result.stdout
+
+
+def test_final_repair_steps_in_help():
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--help"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0
+    assert "--final-repair-steps" in result.stdout
+    assert "consolidation" in result.stdout.lower() or "global" in result.stdout.lower()
 
 
 def test_strike_gold_accepts_selector_structural():

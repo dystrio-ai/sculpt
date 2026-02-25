@@ -528,6 +528,7 @@ def run_compressed(
     stage_size: int = 6,
     stage_repair_steps: int = 500,
     stage_guardrail: float = 200.0,
+    final_repair_steps: int = 0,
 ) -> Dict[str, Any]:
     log.info("=" * 70)
     log.info(
@@ -577,6 +578,8 @@ def run_compressed(
             f"  Staged compression: {len(chunks)} stages of up to "
             f"{stage_size} layers each"
         )
+        if final_repair_steps > 0:
+            log.info(f"  Final global repair: {final_repair_steps} steps after all stages")
 
         compile_wall = 0.0
         repair_wall = 0.0
@@ -584,6 +587,7 @@ def run_compressed(
         any_early_stopped = False
         guardrail_failed = False
         all_curve_points: list[dict[str, Any]] = []
+        compressed_so_far: List[int] = []
 
         curve_w2 = eval_w2[:curve_eval_texts]
         curve_w103 = eval_w103[:curve_eval_texts]
@@ -620,6 +624,8 @@ def run_compressed(
                 compile_report[str(li)] = {**info, **rep}
             compile_wall += time.time() - ct0
 
+            compressed_so_far.extend(chunk)
+
             _assert_physical_slicing(model, chunk, original_ffn_dims)
             _assert_no_masking(model, chunk, original_ffn_dims)
             log.info(f"    [OK] Stage {si + 1} physical slicing verified")
@@ -639,14 +645,15 @@ def run_compressed(
 
             warmup_stage = min(REPAIR_WARMUP, stage_repair_steps // 5)
             log.info(
-                f"    Repairing layers {chunk}  steps={stage_repair_steps}  "
+                f"    Repairing layers compressed so far: {compressed_so_far}  "
+                f"steps={stage_repair_steps}  "
                 f"warmup={warmup_stage}  grad_accum={grad_accum_steps}"
             )
 
             rt0 = time.time()
             sr = repair_layers(
                 model=model, tokenizer=tok, texts_train=texts["train"],
-                layers=chunk, steps=stage_repair_steps, lr=REPAIR_LR,
+                layers=compressed_so_far, steps=stage_repair_steps, lr=REPAIR_LR,
                 warmup=warmup_stage, weight_decay=REPAIR_WEIGHT_DECAY,
                 max_len=MAX_LEN, device=DEVICE, log_every=200,
                 grad_accum_steps=grad_accum_steps,
@@ -673,6 +680,40 @@ def run_compressed(
                 f"(steps={stage_steps}, total={total_steps})"
             )
 
+        # ── Final global consolidation repair ─────────────────────────────────
+        if final_repair_steps > 0 and not guardrail_failed and compressed_so_far:
+            warmup_final = min(REPAIR_WARMUP, final_repair_steps // 5)
+            log.info(
+                f"  Final global repair: layers={compressed_so_far}  "
+                f"steps={final_repair_steps}  warmup={warmup_final}  "
+                f"grad_accum={grad_accum_steps}"
+            )
+            rt0 = time.time()
+            fr = repair_layers(
+                model=model, tokenizer=tok, texts_train=texts["train"],
+                layers=compressed_so_far, steps=final_repair_steps, lr=REPAIR_LR,
+                warmup=warmup_final, weight_decay=REPAIR_WEIGHT_DECAY,
+                max_len=MAX_LEN, device=DEVICE, log_every=200,
+                grad_accum_steps=grad_accum_steps,
+                curve_fn=curve_fn, curve_every=curve_every,
+                early_stop_patience=early_stop_patience,
+            )
+            repair_wall += time.time() - rt0
+            final_steps_used = int(fr["steps"])
+            total_steps += final_steps_used
+            if fr.get("early_stopped"):
+                any_early_stopped = True
+            for pt in fr.get("curve", []):
+                pt["stage"] = "final"
+            all_curve_points.extend(fr.get("curve", []))
+            post_final_ppl = eval_perplexity(
+                model, tok, curve_w103, MAX_LEN, DEVICE, curve_max_eval_tokens,
+            )
+            log.info(
+                f"  Final global repair done: ppl_w103={post_final_ppl:.2f}  "
+                f"(steps={final_steps_used}, total={total_steps})"
+            )
+
         repair_result: Dict[str, Any] = {
             "steps": float(total_steps),
             "microsteps": 0.0,
@@ -683,6 +724,7 @@ def run_compressed(
         log.info(
             f"  Staged compression complete: {stages_completed}/{len(chunks)} "
             f"stages, {actual_repair_steps} total repair steps"
+            f"{f', final_repair={final_repair_steps}' if final_repair_steps > 0 else ''}"
         )
 
     else:
@@ -869,6 +911,7 @@ def run_compressed(
         "stage_size": stage_size if staged else 0,
         "stage_repair_steps": stage_repair_steps if staged else 0,
         "stage_guardrail": stage_guardrail if staged else 0,
+        "final_repair_steps": final_repair_steps if staged else 0,
         "stages_completed": stages_completed,
     }
     if save_artifacts:
@@ -1148,6 +1191,8 @@ def _run_strike_gold(
             f"stage_repair_steps={args.stage_repair_steps}  "
             f"stage_guardrail={args.stage_guardrail}"
         )
+        log.info(f"  Final repair:   auto-budget from gold_repair_steps "
+                 f"(override: --final-repair-steps={args.final_repair_steps})")
     log.info(f"  Total runs:     {total_runs} (1 baseline + {total_runs - 1} compressed)")
     log.info("=" * 70)
 
@@ -1173,10 +1218,20 @@ def _run_strike_gold(
     for layer_desc, layers in layer_sets:
         for kf in keep_fracs:
             for ga in grad_accums:
+                # Auto-compute final repair budget for staged runs
+                if args.staged and args.final_repair_steps > 0:
+                    final_steps = args.final_repair_steps
+                elif args.staged and repair_steps > 0:
+                    num_stages = math.ceil(len(layers) / args.stage_size)
+                    final_steps = max(0, repair_steps - args.stage_repair_steps * num_stages)
+                else:
+                    final_steps = 0
+
                 log.info("")
                 log.info(
                     f"STRIKE-GOLD: {layer_desc} keep_frac={kf} "
                     f"grad_accum={ga}"
+                    f"{f'  final_repair={final_steps}' if final_steps > 0 else ''}"
                 )
                 r = run_compressed(
                     run_id=run_id,
@@ -1203,6 +1258,7 @@ def _run_strike_gold(
                     stage_size=args.stage_size,
                     stage_repair_steps=args.stage_repair_steps,
                     stage_guardrail=args.stage_guardrail,
+                    final_repair_steps=final_steps,
                 )
                 all_results.append(r)
                 run_id += 1
@@ -1314,6 +1370,12 @@ def parse_args() -> argparse.Namespace:
         help="Abort staging if post-compile ppl_w103 exceeds this per-stage "
              "threshold (default: 200).",
     )
+    p.add_argument(
+        "--final-repair-steps", type=int, default=0,
+        help="Global consolidation repair steps on all compressed layers after "
+             "staged compression completes (default: 0 = none). In strike-gold "
+             "mode, auto-computed from remaining budget if not explicitly set.",
+    )
     return p.parse_args()
 
 
@@ -1404,7 +1466,8 @@ def main() -> None:
         log.info(
             f"[STAGED] stage_size={args.stage_size}  "
             f"stage_repair_steps={args.stage_repair_steps}  "
-            f"stage_guardrail={args.stage_guardrail}"
+            f"stage_guardrail={args.stage_guardrail}  "
+            f"final_repair_steps={args.final_repair_steps}"
         )
 
     # ── Load data once ────────────────────────────────────────────────────────
