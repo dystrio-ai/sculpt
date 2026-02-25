@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "experiments" / "multilayer_experiment.py"
@@ -43,7 +44,8 @@ def test_help_shows_all_flags():
         "--skip-ablations", "--enable-vllm",
         "--strike-gold", "--gold-repair-steps", "--gold-ppl-guardrail",
         "--gold-early-stop-patience",
-        "--staged", "--stage-size", "--stage-repair-steps", "--stage-guardrail",
+        "--staged", "--stage-size", "--stage-repair-steps", "--stage-repair-lr",
+        "--stage-guardrail", "--stage-regression-limit",
         "--final-repair-steps", "--final-repair-lr",
         "--final-early-stop-patience", "--final-curve-every",
         "--only-layer-desc", "--only-keep-frac", "--only-grad-accum",
@@ -176,79 +178,70 @@ _MLE_GLOBALS = [
 ]
 
 
-def test_staged_phase1_receives_staged_kwargs(tmp_path):
-    """When --staged --phases 0,1 --only-grad-accum 8, run_compressed must
-    receive staged=True, stage_repair_steps from CLI, and grad_accum_steps=8."""
-    from unittest.mock import patch, MagicMock
+_BASELINE_RESULT = {
+    "run_id": 0, "phase": 0, "layer_desc": "baseline",
+    "layers": [], "keep_frac": 1.0, "repair_steps": 0,
+    "actual_repair_steps": 0, "selector_name": "swiglu_mag",
+    "grad_accum_steps": 1, "early_stopped": False,
+    "guardrail_failed": False, "staged": False, "stages_completed": 0,
+    "ppl_w2_test_pre": 10.0, "ppl_w103_valid_pre": 10.0,
+    "ppl_w2_test_post": 10.0, "ppl_w103_valid_post": 10.0,
+    "ppl_ood_pre": None, "ppl_ood_post": None,
+    "prefill_tokens_per_sec_pre": 1000.0,
+    "prefill_tokens_per_sec_post": 1000.0,
+    "decode_tokens_per_sec_pre": 100.0,
+    "decode_tokens_per_sec_post": 100.0,
+    "repair_wall_time_seconds": 0.0, "compile_wall_time_seconds": 0.0,
+    "time_to_recover_90pct": None,
+    "ppl_w103_post_no_repair": 10.0, "ppl_w103_post_random": None,
+    "ppl_ood_post_no_repair": None, "ppl_ood_post_random": None,
+    "prefill_tps_no_repair": 1000.0, "prefill_tps_random": None,
+    "decode_tps_no_repair": 100.0, "decode_tps_random": None,
+    "vllm_metrics": None,
+}
 
-    mle = _import_mle()
-    saved = {k: getattr(mle, k) for k in _MLE_GLOBALS}
+_FAKE_TEXTS = {
+    "cal": ["x"] * 5, "train": ["x"] * 10,
+    "eval_w2": ["x"] * 50, "eval_w103": ["x"] * 50,
+}
 
+
+def _spy_factory():
     captured = []
 
-    def spy_run_compressed(**kw):
+    def spy(**kw):
         captured.append(kw)
         return {
-            "run_id": kw["run_id"],
-            "phase": kw["phase"],
-            "layer_desc": kw["layer_desc"],
-            "layers": kw["layers"],
+            "run_id": kw["run_id"], "phase": kw["phase"],
+            "layer_desc": kw["layer_desc"], "layers": kw["layers"],
             "keep_frac": kw["keep_frac"],
-            "ppl_w2_test_post": 10.0,
-            "ppl_w103_valid_post": 10.0,
+            "ppl_w2_test_post": 10.0, "ppl_w103_valid_post": 10.0,
         }
 
-    baseline_result = {
-        "run_id": 0, "phase": 0, "layer_desc": "baseline",
-        "layers": [], "keep_frac": 1.0, "repair_steps": 0,
-        "actual_repair_steps": 0, "selector_name": "swiglu_mag",
-        "grad_accum_steps": 1, "early_stopped": False,
-        "guardrail_failed": False, "staged": False, "stages_completed": 0,
-        "ppl_w2_test_pre": 10.0, "ppl_w103_valid_pre": 10.0,
-        "ppl_w2_test_post": 10.0, "ppl_w103_valid_post": 10.0,
-        "ppl_ood_pre": None, "ppl_ood_post": None,
-        "prefill_tokens_per_sec_pre": 1000.0,
-        "prefill_tokens_per_sec_post": 1000.0,
-        "decode_tokens_per_sec_pre": 100.0,
-        "decode_tokens_per_sec_post": 100.0,
-        "repair_wall_time_seconds": 0.0, "compile_wall_time_seconds": 0.0,
-        "time_to_recover_90pct": None,
-        "ppl_w103_post_no_repair": 10.0, "ppl_w103_post_random": None,
-        "ppl_ood_post_no_repair": None, "ppl_ood_post_random": None,
-        "prefill_tps_no_repair": 1000.0, "prefill_tps_random": None,
-        "decode_tps_no_repair": 100.0, "decode_tps_random": None,
-        "vllm_metrics": None,
-    }
+    return captured, spy
 
+
+def _run_main_with_args(mle, argv, captured_spy, tmp_path):
+    """Run mle.main() with mocked deps and return captured run_compressed calls."""
+    from unittest.mock import patch, MagicMock
+
+    saved = {k: getattr(mle, k) for k in _MLE_GLOBALS}
     mock_cfg = MagicMock()
     mock_cfg.num_hidden_layers = 24
 
     try:
         with (
-            patch.object(mle, "run_compressed", side_effect=spy_run_compressed),
-            patch.object(mle, "run_baseline", return_value=baseline_result),
-            patch.object(mle, "load_text_sets", return_value={
-                "cal": ["x"] * 5, "train": ["x"] * 10,
-                "eval_w2": ["x"] * 50, "eval_w103": ["x"] * 50,
-            }),
+            patch.object(mle, "run_compressed", side_effect=captured_spy),
+            patch.object(mle, "run_baseline", return_value=dict(_BASELINE_RESULT)),
+            patch.object(mle, "load_text_sets", return_value=dict(_FAKE_TEXTS)),
             patch.object(mle, "load_ood_texts", return_value=[]),
             patch.object(mle, "write_summary"),
             patch(
                 "transformers.AutoConfig.from_pretrained",
                 return_value=mock_cfg,
             ),
-            patch("sys.argv", [
-                "mle",
-                "--phases", "0,1",
-                "--staged",
-                "--stage-repair-steps", "300",
-                "--final-repair-steps", "100",
-                "--final-repair-lr", "0.0001",
-                "--final-early-stop-patience", "2",
-                "--final-curve-every", "50",
-                "--only-grad-accum", "8",
-                "--n-ood-texts", "0",
-                "--skip-ablations",
+            patch("sys.argv", ["mle"] + argv + [
+                "--n-ood-texts", "0", "--skip-ablations",
                 "--outdir", str(tmp_path / "test_runs"),
             ]),
         ):
@@ -257,31 +250,238 @@ def test_staged_phase1_receives_staged_kwargs(tmp_path):
         for k, v in saved.items():
             setattr(mle, k, v)
 
+
+def test_staged_phase1_receives_staged_kwargs(tmp_path):
+    """When --staged --phases 0,1 --only-grad-accum 8, run_compressed must
+    receive staged=True, stage_repair_steps from CLI, and grad_accum_steps=8."""
+    mle = _import_mle()
+    captured, spy = _spy_factory()
+
+    _run_main_with_args(mle, [
+        "--phases", "0,1",
+        "--staged",
+        "--stage-repair-steps", "300",
+        "--stage-repair-lr", "2e-05",
+        "--final-repair-steps", "100",
+        "--final-repair-lr", "2e-05",
+        "--final-early-stop-patience", "2",
+        "--final-curve-every", "50",
+        "--only-grad-accum", "8",
+    ], spy, tmp_path)
+
     assert len(captured) == 3, f"Expected 3 Phase 1 layer configs, got {len(captured)}"
 
     for i, kw in enumerate(captured):
         assert kw["staged"] is True, f"run {i}: staged should be True"
-        assert kw["stage_repair_steps"] == 300, (
-            f"run {i}: stage_repair_steps={kw['stage_repair_steps']}, expected 300"
+        assert kw["stage_repair_steps"] == 300
+        assert abs(kw["stage_repair_lr"] - 2e-05) < 1e-12
+        assert kw["final_repair_steps"] == 100
+        assert abs(kw["final_repair_lr"] - 2e-05) < 1e-12
+        assert kw["final_early_stop_patience"] == 2
+        assert kw["final_curve_every"] == 50
+        assert kw["grad_accum_steps"] == 8
+        assert kw["repair_steps"] == 2000
+
+
+def test_stage_lr_defaults_to_final_lr(tmp_path):
+    """When --stage-repair-lr is NOT provided, it defaults to 0.0 (sentinel),
+    and run_compressed receives stage_repair_lr=0.0 so the staged path
+    resolves it to final_repair_lr internally."""
+    mle = _import_mle()
+    captured, spy = _spy_factory()
+
+    _run_main_with_args(mle, [
+        "--phases", "0,1",
+        "--staged",
+        "--final-repair-lr", "2e-05",
+    ], spy, tmp_path)
+
+    assert len(captured) == 3
+    for kw in captured:
+        assert kw["stage_repair_lr"] == 0.0, (
+            "sentinel 0.0 should be forwarded; resolution happens inside run_compressed"
         )
-        assert kw["final_repair_steps"] == 100, (
-            f"run {i}: final_repair_steps={kw['final_repair_steps']}, expected 100"
+        assert abs(kw["final_repair_lr"] - 2e-05) < 1e-12
+
+
+def test_stage_lr_safety_clamp(tmp_path):
+    """When stage_repair_lr >> final_repair_lr, the staged path clamps it
+    and emits a warning (not a crash)."""
+    import logging
+    from unittest.mock import patch, MagicMock
+
+    mle = _import_mle()
+
+    final_lr = 2e-05
+    dangerous_stage_lr = 3e-04  # 15x final — well above the 5x clamp threshold
+
+    warnings_captured: list[str] = []
+    original_warning = logging.Logger.warning
+
+    def capture_warning(self, msg, *a, **kw):
+        warnings_captured.append(msg % a if a else msg)
+        return original_warning(self, msg, *a, **kw)
+
+    repair_calls: list[dict] = []
+
+    def spy_repair(**kw):
+        repair_calls.append(kw)
+        return {"steps": 0.0, "microsteps": 0.0, "curve": [], "early_stopped": False}
+
+    saved = {k: getattr(mle, k) for k in _MLE_GLOBALS}
+    mle.RUNS_DIR = tmp_path / "clamp_runs"
+
+    try:
+        with (
+            patch.object(mle, "repair_layers", side_effect=spy_repair),
+            patch.object(mle, "_load_fresh_model", return_value=(
+                MagicMock(), MagicMock(),
+            )),
+            patch.object(mle, "_collect_metrics", return_value={
+                "ppl_w2_test": 10.0, "ppl_w103_valid": 10.0,
+                "prefill_tokens_per_sec": 1000.0,
+                "decode_tokens_per_sec": 100.0,
+            }),
+            patch.object(mle, "eval_perplexity", return_value=10.0),
+            patch.object(mle, "_select_for_layer", return_value=(
+                [0, 1], torch.arange(256),
+            )),
+            patch.object(mle, "compress_mlp_layer_swiglu_inplace", return_value={
+                "ffn_kept": 64, "ffn_original": 128,
+            }),
+            patch.object(mle, "_assert_physical_slicing"),
+            patch.object(mle, "_assert_no_masking"),
+            patch.object(logging.Logger, "warning", capture_warning),
+        ):
+            mle.run_compressed(
+                run_id=99, phase=1, layer_desc="test",
+                layers=[0, 1, 2], keep_frac=0.5, repair_steps=2000,
+                texts=dict(_FAKE_TEXTS),
+                staged=True, stage_size=6,
+                stage_repair_steps=50,
+                stage_repair_lr=dangerous_stage_lr,
+                final_repair_lr=final_lr,
+                final_repair_steps=0,
+                grad_accum_steps=1,
+                skip_ablations=True,
+            )
+    finally:
+        for k, v in saved.items():
+            setattr(mle, k, v)
+
+    clamp_warnings = [
+        w for w in warnings_captured
+        if "stage_repair_lr" in w and "clamp" in w.lower()
+    ]
+    assert len(clamp_warnings) >= 1, (
+        f"Expected a clamp warning mentioning stage_repair_lr, got: {warnings_captured}"
+    )
+    assert "3.00e-04" in clamp_warnings[0]
+
+    expected_clamped = final_lr * 5.0
+    for rc in repair_calls:
+        assert rc["lr"] <= expected_clamped + 1e-12, (
+            f"Stage repair lr={rc['lr']:.2e} should be clamped to {expected_clamped:.2e}"
         )
-        assert abs(kw["final_repair_lr"] - 0.0001) < 1e-12, (
-            f"run {i}: final_repair_lr={kw['final_repair_lr']}, expected 0.0001"
-        )
-        assert kw["final_early_stop_patience"] == 2, (
-            f"run {i}: final_early_stop_patience={kw['final_early_stop_patience']}"
-        )
-        assert kw["final_curve_every"] == 50, (
-            f"run {i}: final_curve_every={kw['final_curve_every']}"
-        )
-        assert kw["grad_accum_steps"] == 8, (
-            f"run {i}: grad_accum_steps={kw['grad_accum_steps']}, expected 8"
-        )
-        assert kw["repair_steps"] == 2000, (
-            f"run {i}: Phase 1 repair_steps should be 2000 (staged path handles internally)"
-        )
+
+
+def test_stage_regression_aborts_remaining_stages(tmp_path):
+    """If post-repair PPL exceeds pre-repair PPL by >stage_regression_limit,
+    remaining stages are aborted and final repair still runs."""
+    import logging
+    from unittest.mock import patch, MagicMock
+
+    mle = _import_mle()
+
+    warnings_captured: list[str] = []
+    original_warning = logging.Logger.warning
+
+    def capture_warning(self, msg, *a, **kw):
+        warnings_captured.append(msg % a if a else msg)
+        return original_warning(self, msg, *a, **kw)
+
+    repair_calls: list[dict] = []
+
+    def spy_repair(**kw):
+        repair_calls.append(kw)
+        return {"steps": 10.0, "microsteps": 10.0, "curve": [], "early_stopped": False}
+
+    eval_call_count = [0]
+
+    def mock_eval_ppl(*a, **kw):
+        eval_call_count[0] += 1
+        n = eval_call_count[0]
+        # Stage 1 post-compile: 20.0, post-repair: 30.0 (50% regression > 10% limit)
+        if n == 1:
+            return 20.0   # post-compile stage 1
+        if n == 2:
+            return 30.0   # post-repair stage 1 — triggers regression
+        return 10.0
+
+    saved = {k: getattr(mle, k) for k in _MLE_GLOBALS}
+    mle.RUNS_DIR = tmp_path / "regr_runs"
+
+    try:
+        with (
+            patch.object(mle, "repair_layers", side_effect=spy_repair),
+            patch.object(mle, "_load_fresh_model", return_value=(
+                MagicMock(), MagicMock(),
+            )),
+            patch.object(mle, "_collect_metrics", return_value={
+                "ppl_w2_test": 10.0, "ppl_w103_valid": 10.0,
+                "prefill_tokens_per_sec": 1000.0,
+                "decode_tokens_per_sec": 100.0,
+            }),
+            patch.object(mle, "eval_perplexity", side_effect=mock_eval_ppl),
+            patch.object(mle, "_select_for_layer", return_value=(
+                [0, 1], torch.arange(256),
+            )),
+            patch.object(mle, "compress_mlp_layer_swiglu_inplace", return_value={
+                "ffn_kept": 64, "ffn_original": 128,
+            }),
+            patch.object(mle, "_assert_physical_slicing"),
+            patch.object(mle, "_assert_no_masking"),
+            patch.object(logging.Logger, "warning", capture_warning),
+        ):
+            mle.run_compressed(
+                run_id=99, phase=1, layer_desc="test",
+                layers=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                keep_frac=0.5, repair_steps=2000,
+                texts=dict(_FAKE_TEXTS),
+                staged=True, stage_size=6,
+                stage_repair_steps=50,
+                stage_repair_lr=2e-05,
+                stage_guardrail=200.0,
+                stage_regression_limit=0.10,
+                final_repair_lr=2e-05,
+                final_repair_steps=100,
+                grad_accum_steps=1,
+                skip_ablations=True,
+            )
+    finally:
+        for k, v in saved.items():
+            setattr(mle, k, v)
+
+    regression_warnings = [
+        w for w in warnings_captured if "STAGE REGRESSION" in w
+    ]
+    assert len(regression_warnings) == 1, (
+        f"Expected 1 regression warning, got {len(regression_warnings)}: {regression_warnings}"
+    )
+    assert "30.00" in regression_warnings[0]
+    assert "20.00" in regression_warnings[0]
+
+    # Stage repair ran for stage 1 only (aborted before stage 2)
+    stage_repair_calls = [rc for rc in repair_calls if rc["steps"] == 50]
+    assert len(stage_repair_calls) == 1, (
+        f"Expected 1 stage repair call (stage 2 aborted), got {len(stage_repair_calls)}"
+    )
+
+    # Final global repair still ran (final_repair_steps=100)
+    final_repair_calls = [rc for rc in repair_calls if rc["steps"] == 100]
+    assert len(final_repair_calls) == 1, (
+        f"Expected final global repair to run, got {len(final_repair_calls)}"
+    )
 
 
 # ── Full smoke test (needs model download + inference) ────────────────────────

@@ -613,7 +613,9 @@ def run_compressed(
     staged: bool = False,
     stage_size: int = 6,
     stage_repair_steps: int = 500,
+    stage_repair_lr: float = 0.0,
     stage_guardrail: float = 200.0,
+    stage_regression_limit: float = 0.10,
     final_repair_steps: int = 0,
     final_repair_lr: float = 0.0,
     final_early_stop_patience: int = 1,
@@ -659,6 +661,27 @@ def run_compressed(
     stages_completed = 0
 
     if staged:
+        # ── STAGED: resolve stage LR with safe default + clamp ───────────────
+        _resolved_final_lr = final_repair_lr if final_repair_lr > 0 else REPAIR_LR
+        if stage_repair_lr > 0:
+            _stage_lr = stage_repair_lr
+        else:
+            _stage_lr = _resolved_final_lr
+            log.info(
+                f"  Resolved stage_repair_lr={_stage_lr:.2e} "
+                f"(defaulted from final_repair_lr)"
+            )
+        _STAGE_LR_CLAMP_K = 5.0
+        if _stage_lr > _resolved_final_lr * _STAGE_LR_CLAMP_K:
+            clamped = _resolved_final_lr * _STAGE_LR_CLAMP_K
+            log.warning(
+                f"  stage_repair_lr ({_stage_lr:.2e}) is much larger than "
+                f"final_repair_lr ({_resolved_final_lr:.2e}); this commonly "
+                f"destabilizes large models; clamping to "
+                f"{_resolved_final_lr:.2e}*{_STAGE_LR_CLAMP_K:.0f} = {clamped:.2e}"
+            )
+            _stage_lr = clamped
+
         # ── STAGED: compress + repair in chunks ──────────────────────────────
         metrics_pre = _collect_metrics(
             model, tok, eval_w2, eval_w103, bench_texts, decode_text,
@@ -746,14 +769,14 @@ def run_compressed(
             warmup_stage = min(REPAIR_WARMUP, stage_repair_steps // 5)
             log.info(
                 f"    Repairing layers compressed so far: {compressed_so_far}  "
-                f"steps={stage_repair_steps}  lr={REPAIR_LR:.2e}  "
+                f"steps={stage_repair_steps}  lr={_stage_lr:.2e}  "
                 f"warmup={warmup_stage}  grad_accum={grad_accum_steps}"
             )
 
             rt0 = time.time()
             sr = repair_layers(
                 model=model, tokenizer=tok, texts_train=texts["train"],
-                layers=compressed_so_far, steps=stage_repair_steps, lr=REPAIR_LR,
+                layers=compressed_so_far, steps=stage_repair_steps, lr=_stage_lr,
                 warmup=warmup_stage, weight_decay=REPAIR_WEIGHT_DECAY,
                 max_len=MAX_LEN, device=DEVICE, log_every=200,
                 grad_accum_steps=grad_accum_steps,
@@ -779,6 +802,16 @@ def run_compressed(
                 f"    Post-repair ppl_w103={post_ppl:.2f}  "
                 f"(steps={stage_steps}, total={total_steps})"
             )
+
+            if (stage_regression_limit > 0
+                    and stage_ppl > 0
+                    and post_ppl > stage_ppl * (1.0 + stage_regression_limit)):
+                log.warning(
+                    f"    [STAGE REGRESSION] Post-repair ppl_w103={post_ppl:.2f} "
+                    f"exceeds pre-repair {stage_ppl:.2f} by "
+                    f">{stage_regression_limit*100:.0f}% — aborting remaining stages"
+                )
+                break
 
         # ── Final global consolidation repair ─────────────────────────────────
         if final_repair_steps > 0 and not guardrail_failed and compressed_so_far:
@@ -1020,7 +1053,9 @@ def run_compressed(
         "staged": staged,
         "stage_size": stage_size if staged else 0,
         "stage_repair_steps": stage_repair_steps if staged else 0,
+        "stage_repair_lr": stage_repair_lr if staged else 0,
         "stage_guardrail": stage_guardrail if staged else 0,
+        "stage_regression_limit": stage_regression_limit if staged else 0,
         "final_repair_steps": final_repair_steps if staged else 0,
         "final_repair_lr": final_repair_lr if staged and final_repair_steps > 0 else 0,
         "final_early_stop_patience": final_early_stop_patience if staged else 0,
@@ -1419,7 +1454,9 @@ def _run_strike_gold(
             staged=args.staged,
             stage_size=args.stage_size,
             stage_repair_steps=args.stage_repair_steps,
+            stage_repair_lr=args.stage_repair_lr,
             stage_guardrail=args.stage_guardrail,
+            stage_regression_limit=args.stage_regression_limit,
             final_repair_steps=final_steps,
             final_repair_lr=args.final_repair_lr,
             final_early_stop_patience=args.final_early_stop_patience,
@@ -1537,9 +1574,21 @@ def parse_args() -> argparse.Namespace:
         help="Max repair optimizer steps per stage (default: 250).",
     )
     p.add_argument(
+        "--stage-repair-lr", type=float, default=0.0,
+        help="Learning rate for per-stage repair (default: 0 = use final_repair_lr). "
+             "Clamped to final_repair_lr*5 if much larger, to prevent destabilising "
+             "large models.",
+    )
+    p.add_argument(
         "--stage-guardrail", type=float, default=200.0,
         help="Abort staging if post-compile ppl_w103 exceeds this per-stage "
              "threshold (default: 200).",
+    )
+    p.add_argument(
+        "--stage-regression-limit", type=float, default=0.10,
+        help="Abort remaining stages if post-repair ppl_w103 exceeds pre-repair "
+             "by more than this fraction (default: 0.10 = 10%%). "
+             "Set 0 to disable.",
     )
     p.add_argument(
         "--final-repair-steps", type=int, default=0,
@@ -1684,10 +1733,13 @@ def main() -> None:
         )
     if args.staged:
         fr_lr_str = f"{args.final_repair_lr:.2e}" if args.final_repair_lr > 0 else f"{REPAIR_LR:.2e}(default)"
+        sr_lr_str = f"{args.stage_repair_lr:.2e}" if args.stage_repair_lr > 0 else "=final_lr(default)"
         log.info(
             f"[STAGED] stage_size={args.stage_size}  "
             f"stage_repair_steps={args.stage_repair_steps}  "
+            f"stage_lr={sr_lr_str}  "
             f"stage_guardrail={args.stage_guardrail}  "
+            f"stage_regression_limit={args.stage_regression_limit}  "
             f"final_repair_steps={args.final_repair_steps}  "
             f"final_lr={fr_lr_str}  "
             f"final_patience={args.final_early_stop_patience}  "
@@ -1750,7 +1802,9 @@ def main() -> None:
         "staged": args.staged,
         "stage_size": args.stage_size,
         "stage_repair_steps": args.stage_repair_steps,
+        "stage_repair_lr": args.stage_repair_lr,
         "stage_guardrail": args.stage_guardrail,
+        "stage_regression_limit": args.stage_regression_limit,
         "final_repair_steps": args.final_repair_steps,
         "final_repair_lr": args.final_repair_lr,
         "final_early_stop_patience": args.final_early_stop_patience,
