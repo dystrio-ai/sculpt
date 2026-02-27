@@ -184,6 +184,41 @@ def build_layer_sets(n: int) -> List[Tuple[str, List[int]]]:
     ]
 
 
+# ── Structural prescan ─────────────────────────────────────────────────────────
+
+
+def prescan_structural_artifacts(
+    model, tok, layers: List[int], texts_cal: List[str],
+    block_size: int = BLOCK_SIZE, max_tokens: int = 30_000,
+) -> Dict[int, Dict[str, Any]]:
+    """Pre-scan structural calibration tensors on an uncompressed model.
+
+    Returns a dict mapping layer_idx -> {D, block_energy, block_sensitivity,
+    feature_multiplier}, all on CPU.  These can be injected into
+    ``_select_for_layer`` to remove path dependence.
+    """
+    out: Dict[int, Dict[str, Any]] = {}
+    for li in layers:
+        geom = collect_block_geometry_swiglu(
+            model, tok, li, texts_cal, MAX_LEN, DEVICE,
+            block_size=block_size, max_tokens=max_tokens,
+        )
+        sens = collect_block_operator_sensitivity_swiglu(
+            model, tok, li, texts_cal, MAX_LEN, DEVICE,
+            block_size=block_size, max_tokens=max_tokens,
+        )
+        out[li] = {
+            "D": geom["D"].detach().cpu(),
+            "block_energy": (
+                geom["block_energy"].detach().cpu()
+                if geom.get("block_energy") is not None else None
+            ),
+            "block_sensitivity": sens["block_sensitivity"].detach().cpu(),
+            "feature_multiplier": geom.get("feature_multiplier", 3),
+        }
+    return out
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
@@ -292,29 +327,47 @@ def _select_for_layer(
     kept_indices: Dict[int, torch.Tensor],
     structural_artifacts: Dict[int, Dict[str, Any]],
     keep_frac: float,
+    precomputed: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> Tuple[List[int], torch.Tensor]:
-    """Run calibration + block selection for one layer using the chosen selector."""
+    """Run calibration + block selection for one layer using the chosen selector.
+
+    If *precomputed* contains an entry for *li* (and the selector is
+    ``"structural"``), the cached tensors are used instead of running
+    calibration on the current (possibly partially-compressed) model.
+    """
     if selector == "structural":
-        geom = collect_block_geometry_swiglu(
-            model, tok, li, texts_cal, MAX_LEN, DEVICE,
-            block_size=BLOCK_SIZE, max_tokens=30_000,
-        )
-        sens = collect_block_operator_sensitivity_swiglu(
-            model, tok, li, texts_cal, MAX_LEN, DEVICE,
-            block_size=BLOCK_SIZE, max_tokens=30_000,
-        )
+        if precomputed is not None and li in precomputed:
+            pre = precomputed[li]
+            geom_D = pre["D"]
+            block_energy = pre["block_energy"]
+            block_sensitivity = pre["block_sensitivity"]
+            feature_multiplier = pre.get("feature_multiplier", 3)
+        else:
+            geom = collect_block_geometry_swiglu(
+                model, tok, li, texts_cal, MAX_LEN, DEVICE,
+                block_size=BLOCK_SIZE, max_tokens=30_000,
+            )
+            sens = collect_block_operator_sensitivity_swiglu(
+                model, tok, li, texts_cal, MAX_LEN, DEVICE,
+                block_size=BLOCK_SIZE, max_tokens=30_000,
+            )
+            geom_D = geom["D"]
+            block_energy = geom.get("block_energy")
+            block_sensitivity = sens["block_sensitivity"]
+            feature_multiplier = geom.get("feature_multiplier", 3)
+
         kept_blocks, kept_idx, arts = select_blocks_structural(
-            geom["D"], keep_frac, BLOCK_SIZE, topk_edges=20,
-            block_energy=geom.get("block_energy"),
-            feature_multiplier=geom.get("feature_multiplier", 3),
-            block_sensitivity=sens["block_sensitivity"],
+            geom_D, keep_frac, BLOCK_SIZE, topk_edges=20,
+            block_energy=block_energy,
+            feature_multiplier=feature_multiplier,
+            block_sensitivity=block_sensitivity,
         )
-        importance_vectors[li] = geom["D"].cpu()
+        importance_vectors[li] = geom_D.cpu()
         kept_indices[li] = kept_idx.cpu()
         structural_artifacts[li] = {
-            "D": geom["D"].cpu(),
-            "block_energy": geom["block_energy"].cpu() if geom.get("block_energy") is not None else None,
-            "block_sensitivity": sens["block_sensitivity"].cpu(),
+            "D": geom_D.cpu(),
+            "block_energy": block_energy.cpu() if block_energy is not None else None,
+            "block_sensitivity": block_sensitivity.cpu(),
             "edges": arts["edges"].cpu(),
             "k_edge": arts["k_edge"].cpu(),
             "block_scores": arts["block_scores"].cpu(),
@@ -621,6 +674,7 @@ def run_compressed(
     final_early_stop_patience: int = 1,
     final_curve_every: int = 100,
     keep_schedule: Optional[Dict[int, float]] = None,
+    precomputed_structural: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     # Build per-layer keep_frac map; filter out layers with keep=1.0
     keep_frac_by_layer: Dict[int, float] = {}
@@ -733,6 +787,7 @@ def run_compressed(
                     model, tok, li, texts["cal"], selector,
                     importance_vectors, kept_indices, structural_artifacts,
                     keep_frac_by_layer[li],
+                    precomputed=precomputed_structural,
                 )
                 rep = compress_mlp_layer_swiglu_inplace(
                     model, li, kept_idx, dtype, DEVICE,
@@ -872,6 +927,7 @@ def run_compressed(
                 model, tok, li, texts["cal"], selector,
                 importance_vectors, kept_indices, structural_artifacts,
                 keep_frac_by_layer[li],
+                precomputed=precomputed_structural,
             )
             rep = compress_mlp_layer_swiglu_inplace(model, li, kept_idx, dtype, DEVICE)
             info = {
@@ -1413,6 +1469,28 @@ def _run_strike_gold(
     all_results.append(baseline)
     run_id += 1
 
+    # ── Optional structural prescan (once for all grid runs) ──────────────
+    precomputed_structural: Optional[Dict[int, Dict[str, Any]]] = None
+    if getattr(args, "structural_prescan", False) and args.selector == "structural":
+        _setup_determinism()
+        scan_model, scan_tok = _load_fresh_model()
+        n_layers = scan_model.config.num_hidden_layers
+        prescan_layers = list(range(n_layers))
+        log.info(
+            f"  [STRUCTURAL PRESCAN] Pre-scanning {len(prescan_layers)} layers "
+            f"on uncompressed model..."
+        )
+        precomputed_structural = prescan_structural_artifacts(
+            scan_model, scan_tok, prescan_layers, texts["cal"],
+        )
+        log.info(
+            f"  [STRUCTURAL PRESCAN] Cached tensors for "
+            f"{len(precomputed_structural)} layers"
+        )
+        del scan_model, scan_tok
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     # ── Compressed runs grid ──────────────────────────────────────────────────
     for layer_desc, layers, kf, ga in grid:
         # Auto-compute final repair budget for staged runs
@@ -1462,6 +1540,7 @@ def _run_strike_gold(
             final_early_stop_patience=args.final_early_stop_patience,
             final_curve_every=args.final_curve_every,
             keep_schedule=ks,
+            precomputed_structural=precomputed_structural,
         )
         all_results.append(r)
         run_id += 1
@@ -1639,6 +1718,12 @@ def parse_args() -> argparse.Namespace:
              "Layers not mentioned use the run's default keep_frac. "
              "keep_frac=1.0 means skip compression for that layer.",
     )
+    p.add_argument(
+        "--structural-prescan", action="store_true", default=False,
+        help="Pre-scan structural calibration tensors on the uncompressed model "
+             "and reuse them during selection (removes path dependence). "
+             "No-op when --selector is not 'structural'.",
+    )
     return p.parse_args()
 
 
@@ -1812,6 +1897,29 @@ def main() -> None:
         "early_stop_patience": args.gold_early_stop_patience,
         "keep_schedule": phase_keep_schedule,
     }
+
+    # ── Optional structural prescan (once for all phase-matrix runs) ──────
+    phase_precomputed: Optional[Dict[int, Dict[str, Any]]] = None
+    if getattr(args, "structural_prescan", False) and args.selector == "structural":
+        _setup_determinism()
+        scan_model, scan_tok = _load_fresh_model()
+        n_layers = scan_model.config.num_hidden_layers
+        prescan_layers = list(range(n_layers))
+        log.info(
+            f"  [STRUCTURAL PRESCAN] Pre-scanning {len(prescan_layers)} layers "
+            f"on uncompressed model..."
+        )
+        phase_precomputed = prescan_structural_artifacts(
+            scan_model, scan_tok, prescan_layers, texts["cal"],
+        )
+        log.info(
+            f"  [STRUCTURAL PRESCAN] Cached tensors for "
+            f"{len(phase_precomputed)} layers"
+        )
+        del scan_model, scan_tok
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    compressed_kwargs["precomputed_structural"] = phase_precomputed
 
     # ── Phase 0: Baseline ─────────────────────────────────────────────────────
     baseline: Optional[Dict[str, Any]] = None
