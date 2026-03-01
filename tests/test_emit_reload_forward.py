@@ -65,6 +65,18 @@ class FakeTokenizer:
             json.dump({"model_type": "test"}, f)
 
 
+class TinyCompressedCausalLM(TinyCausalLM):
+    """A TinyCausalLM whose layer-0 MLP has been 'compressed' to a smaller FFN."""
+
+    def __init__(self, dim: int = 16, compressed_ffn: int = 24, n_layers: int = 1, vocab: int = 64):
+        super().__init__(dim=dim, n_layers=n_layers, vocab=vocab)
+        mlp = self.model.layers[0].mlp
+        mlp.gate_proj = nn.Linear(dim, compressed_ffn, bias=False)
+        mlp.up_proj = nn.Linear(dim, compressed_ffn, bias=False)
+        mlp.down_proj = nn.Linear(compressed_ffn, dim, bias=False)
+        self.config.intermediate_size = dim * 2  # stale — original width
+
+
 class TestEmitArtifacts:
     def test_emit_creates_expected_files(self, tmp_path):
         from dystrio_sculpt.emit import emit_frontier_point
@@ -158,3 +170,36 @@ class TestEmitArtifacts:
         )
         assert "policy" in manifest
         assert manifest["policy"]["name"] == "ss4_lr1e-4_p8_s450"
+
+    def test_config_intermediate_size_patched(self, tmp_path):
+        """After emit, saved config.json has the compressed intermediate_size."""
+        from dystrio_sculpt.emit import emit_frontier_point
+
+        compressed_ffn = 24
+        model = TinyCompressedCausalLM(dim=16, compressed_ffn=compressed_ffn)
+        tok = FakeTokenizer()
+
+        point_dir = emit_frontier_point(
+            model=model, tokenizer=tok,
+            outdir=tmp_path, label="frontier_0_conservative",
+            keep_frac=0.75,
+            metrics={
+                "ppl_w2_test": 12.5, "ppl_w103_valid": 14.0,
+                "prefill_tokens_per_sec": 1000.0, "decode_tokens_per_sec": 500.0,
+            },
+            baseline_metrics={
+                "ppl_w103_valid": 10.0, "prefill_tokens_per_sec": 800.0,
+                "decode_tokens_per_sec": 400.0,
+            },
+            compile_report={},
+            config={"model_id": "test", "keep_frac": 0.75, "seed": 0},
+            wall_time_s=10.0,
+        )
+
+        # Config on the in-memory model was patched
+        assert model.config.intermediate_size == compressed_ffn
+
+        # Manifest records both old and new
+        manifest = json.loads((point_dir / "manifest.json").read_text())
+        assert manifest["old_intermediate_size"] == 32  # dim * 2
+        assert manifest["new_intermediate_size"] == compressed_ffn

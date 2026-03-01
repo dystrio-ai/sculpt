@@ -92,6 +92,23 @@ def emit_frontier_point(
     model_dir = point_dir / "model"
     model_dir.mkdir(parents=True, exist_ok=True)
 
+    # Patch config.intermediate_size to match actual (compressed) FFN width.
+    # Without this, from_pretrained reconstructs the original (wider) shapes
+    # and crashes on weight size mismatch.
+    old_intermediate = getattr(model.config, "intermediate_size", None)
+    new_intermediate = None
+    if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
+        gate = model.model.layers[0].mlp.gate_proj
+        new_intermediate = gate.out_features if hasattr(gate, "out_features") else gate.weight.shape[0]
+    if new_intermediate is not None and old_intermediate != new_intermediate:
+        _log.info(
+            "patching config.intermediate_size: %s -> %s",
+            old_intermediate, new_intermediate,
+        )
+        model.config.intermediate_size = int(new_intermediate)
+        if hasattr(model.config, "text_config") and model.config.text_config is not None:
+            model.config.text_config.intermediate_size = int(new_intermediate)
+
     _log.info("saving model to %s", model_dir)
     model.save_pretrained(str(model_dir))
     tokenizer.save_pretrained(str(model_dir))
@@ -141,6 +158,8 @@ def emit_frontier_point(
         "layers_compressed": config.get("layers_compressed", 0),
         "policy": config.get("policy", {}),
         "total_repair_steps": config.get("total_repair_steps", 0),
+        "old_intermediate_size": old_intermediate,
+        "new_intermediate_size": new_intermediate if new_intermediate is not None else old_intermediate,
         "compile_wall_time_s": round(wall_time_s, 2),
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda if torch.cuda.is_available() else None,
