@@ -3,13 +3,13 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pnn-compiler"
-version = "0.1.0"
-description = "Demand-aware FFN block compression + fast repair for HF Transformers (Qwen2-style SwiGLU MLPs)"
+name = "dystrio-sculpt"
+version = "1.0.0"
+description = "Structural FFN compiler for decoder-only transformer LLMs"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
-authors = [{ name = "BumbleB Team" }]
+authors = [{ name = "Dystrio" }]
 
 dependencies = [
     "torch>=2.1",
@@ -30,7 +30,7 @@ dev = [
 ]
 
 [project.scripts]
-pnn = "pnn_compiler.cli:app"
+dystrio = "dystrio_sculpt.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]

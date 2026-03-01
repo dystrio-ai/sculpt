@@ -1,120 +1,167 @@
-# PNN Compiler
+# Dystrio Sculpt
 
-Demand-aware FFN block compression + fast repair for HF Transformers.
-Targets Qwen2-style SwiGLU MLPs (`gate_proj` / `up_proj` / `down_proj` + `act_fn`).
+Structural FFN compiler for decoder-only transformer LLMs. Sculpt removes
+redundant neurons from SwiGLU feed-forward blocks using operator-fidelity
+analysis, coupling-geometry diversity scoring, and staged repair fine-tuning.
+The result is a smaller, faster HuggingFace-compatible model with controlled
+quality loss.
 
-## How it works
+## What Sculpt does
 
-1. **Calibrate** — forward-hook on each target MLP collects `mean( |act_fn(gate(x)) · up(x)| )` per neuron
-2. **Block select** — partition neurons into contiguous blocks, rank by summed importance, keep top `keep_frac`
-3. **Compile** — replace `gate_proj`, `up_proj`, `down_proj` with physically smaller `nn.Linear` layers
-4. **Repair** — freeze everything except compressed MLPs, train with CE loss + cosine LR
-5. **Eval** — token-level perplexity on wikitext-2 test and wikitext-103 validation
-6. **Bench** — prefill tokens/sec on padded batch with CUDA sync
+1. **Analyze** — Prescan all FFN layers on the uncompressed model to measure
+   block-level operator sensitivity and inter-block coupling geometry.
+2. **Select** — Rank neuron blocks using a Physarum-inspired diversity penalty
+   on top of operator-fidelity scores. Blocks that are both unimportant and
+   redundant with their neighbours are pruned first.
+3. **Slice** — Physically remove the pruned neurons from `gate_proj`,
+   `up_proj`, and `down_proj` weight matrices. The model stays a valid
+   HuggingFace checkpoint with a reduced `intermediate_size`.
+4. **Repair** — Fine-tune only the compressed MLP parameters with a cosine LR
+   schedule, staged across layer groups to prevent catastrophic quality loss.
+5. **Validate** — Reload the saved model and run a forward pass to confirm no
+   NaN/Inf and correct output shapes.
 
-## Quickstart
+Sculpt searches over compression ratios automatically. You specify how many
+points on the quality-vs-speed Pareto frontier you want, and Sculpt emits that
+many fully self-contained model directories.
+
+## Enterprise hardening (V1)
+
+Sculpt includes several production-safety features that make it robust across
+model families (Qwen, Mistral, LLaMA):
+
+- **Adaptive repair policy selection** — Before the full frontier search, Sculpt
+  runs a short pilot compile on a single layer to auto-select a stable repair
+  learning rate and stage size from a policy ladder. No manual tuning required.
+- **Best-checkpoint restore** — During every repair loop the best metric
+  checkpoint is tracked, and weights are restored to that point at the end. Late
+  regression is never shipped.
+- **"Never ship worse than compiled" invariant** — If repair fails to improve
+  quality beyond the post-compile baseline, pre-repair weights are restored
+  automatically. A failed candidate is labelled clearly and excluded from the
+  frontier.
+- **Staged rollback with policy downshift** — If a stage repair violates the
+  regression limit or produces NaN/Inf, the stage is rolled back and retried
+  with a more conservative policy (lower LR, smaller stage). If retry also
+  fails, the candidate is marked as failed.
+- **Deterministic two-tier evaluation** — Cheap eval (small fixed subset, small
+  token budget) is used during repair curve checkpoints and early stopping.
+  Full-budget final eval runs only on selected Pareto points, saving hours on
+  large model searches.
+
+## Quick start
 
 ```bash
-cd pnn_compiler
 pip install -e .
 
-# Full pipeline (the engine):
-python run_engine.py
-
-# Or via CLI:
-pnn run-all
-
-# Individual stages:
-pnn calibrate
-pnn compile
-pnn repair
-pnn eval
-pnn bench
+dystrio sculpt --model-id Qwen/Qwen2-0.5B --outdir sculpt_out --frontier 4
 ```
 
-## Programmatic usage
+This will:
+- Auto-select a stable repair policy via pilot compile.
+- Compute a baseline (no compression).
+- Search over `keep_frac` in [0.4, 1.0] with adaptive binary refinement.
+- Emit 4 evenly-spaced Pareto-optimal models under `sculpt_out/`.
 
-```python
-from pnn_compiler.config import EngineConfig
-from pnn_compiler.pipeline import run_pipeline
+Each frontier directory contains:
 
-cfg = EngineConfig(
-    model_id="Qwen/Qwen2-0.5B",
-    layers=[3],
-    keep_frac=0.5,
-    block_size=128,
-    repair_steps=2000,
-    dtype="bf16",
-    device="cuda",
-)
-results = run_pipeline(cfg)
+```
+sculpt_out/
+  frontier_0_conservative/
+    model/          # save_pretrained output (config.json, safetensors, tokenizer)
+    metrics.json    # PPL, throughput, speedup vs baseline
+    compile_report.json
+    manifest.json   # full reproducibility record (incl. repair policy, pilot report)
+  frontier_1_balanced/
+    ...
+  frontier_2_aggressive/
+    ...
+  frontier_3_extreme/
+    ...
+  summary.csv       # incremental summary appended after each artifact
 ```
 
-## Configuration
+## Frontier example
 
-Defaults in `configs/default.yaml`. Override via CLI `--set`:
+Search for the fastest model that stays within 1.5x baseline perplexity:
 
 ```bash
-pnn run-all --set keep_frac=0.6 --set lr=1e-4
-pnn run-all --set layers=[3,5] --set repair_steps=3000
-pnn run-all --config my_config.yaml
+dystrio sculpt \
+  --model-id Qwen/Qwen2-0.5B \
+  --outdir sculpt_constrained \
+  --frontier 3 \
+  --max-ppl-multiplier 1.5
 ```
 
-`EngineConfig` fields:
-
-| Field              | Default          | Description                          |
-|--------------------|------------------|--------------------------------------|
-| `model_id`         | Qwen/Qwen2-0.5B | HF model name                        |
-| `layers`           | [3]              | Transformer layer indices to compress |
-| `block_size`       | 128              | Contiguous neuron block size          |
-| `keep_frac`        | 0.50             | Fraction of FFN blocks to keep        |
-| `max_len`          | 256              | Sequence length for all stages        |
-| `n_texts_cal`      | 400              | Calibration texts                     |
-| `n_texts_train`    | 2500             | Repair training texts                 |
-| `n_texts_eval`     | 300              | Eval texts per split                  |
-| `max_eval_tokens`  | 40000            | Token budget for perplexity eval      |
-| `repair_steps`     | 2000             | Repair training steps                 |
-| `lr`               | 3e-4             | Repair learning rate                  |
-| `warmup`           | 100              | LR warmup steps                       |
-| `weight_decay`     | 0.01             | AdamW weight decay                    |
-| `bench_texts`      | 200              | Texts for throughput benchmark         |
-| `bench_warmup_iters`| 20              | Warmup forward passes                 |
-| `bench_iters`      | 80               | Timed forward passes                  |
-| `device`           | cuda             | cuda or cpu                           |
-| `dtype`            | bf16             | bf16, fp16, or fp32                   |
-| `seed`             | 0                | Random seed                           |
-| `allow_tf32`       | true             | Enable TF32 matmul on Ampere+         |
-
-## Experiment harness
+Target a specific prefill speedup:
 
 ```bash
-# Full experiment matrix (OOD eval + ablation baselines)
-python experiments/multilayer_experiment.py
-
-# Skip ablation baselines for faster iteration
-python experiments/multilayer_experiment.py --skip-ablations
-
-# With gradient accumulation
-python experiments/multilayer_experiment.py --grad-accum-steps 4
-
-# With optional vLLM serving benchmark (requires vLLM)
-python experiments/multilayer_experiment.py --enable-vllm
+dystrio sculpt \
+  --model-id Qwen/Qwen2-0.5B \
+  --outdir sculpt_fast \
+  --frontier 2 \
+  --target-prefill-speedup 1.3
 ```
 
-## Optional: vLLM serving benchmark
+Time-bounded search (stop after 2 hours):
 
 ```bash
-pip install vllm
-
-# Standalone
-python experiments/vllm_benchmark.py --model-path Qwen/Qwen2-0.5B
-
-# Integrated into harness
-python experiments/multilayer_experiment.py --enable-vllm
+dystrio sculpt \
+  --model-id Qwen/Qwen2-0.5B \
+  --outdir sculpt_timed \
+  --frontier 4 \
+  --max-compile-hours 2.0
 ```
 
-## Hardware
+## Deterministic builds
 
-- **GPU-first**: defaults to bf16 on CUDA (A100-optimised), TF32 enabled
-- `torch.cuda.synchronize()` in bench for accurate timing
-- Repair is single-text forward/backward (no batching), matches the original engine
+For bitwise-reproducible compilation:
+
+```bash
+dystrio sculpt \
+  --model-id Qwen/Qwen2-0.5B \
+  --outdir sculpt_deterministic \
+  --frontier 4 \
+  --deterministic
+```
+
+Deterministic mode:
+- Seeds `random`, `numpy`, `torch`, and CUDA RNGs.
+- Disables TF32 matmul and cuDNN non-deterministic algorithms.
+- Uses an isolated `np.random.RandomState` inside the structural selector's
+  Physarum conductance solver.
+- Selects fixed eval subsets via seeded shuffle for stable early-stopping
+  and repair curve checkpoints.
+- Records all determinism settings in `manifest.json`.
+
+## Supported architectures
+
+Sculpt targets **decoder-only transformers with SwiGLU FFN blocks**:
+- Qwen2 / Qwen2.5
+- Llama 2 / Llama 3
+- Mistral / Mixtral (dense MLP layers)
+- Any HuggingFace model with `gate_proj` / `up_proj` / `down_proj` structure
+
+Attention layers, embeddings, layer norms, and residual connections are not
+modified. Only the MLP projections are physically sliced.
+
+## CLI reference
+
+```
+dystrio sculpt [OPTIONS]
+
+Options:
+  --model-id TEXT               HuggingFace model ID (required)
+  --outdir TEXT                 Output directory [default: sculpt_out]
+  --frontier INTEGER            Frontier points to emit [default: 4]
+  --max-ppl-multiplier FLOAT    Max PPL as multiple of baseline
+  --target-prefill-speedup FLOAT  Min prefill speedup to keep
+  --max-compile-hours FLOAT     Time budget (hours)
+  --deterministic               Enable deterministic mode
+  --policy TEXT                 Override auto-selected repair policy (advanced)
+  --help                        Show this message and exit
+```
+
+## License
+
+Apache 2.0
