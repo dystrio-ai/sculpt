@@ -120,6 +120,39 @@ def build_policy_ladder(param_b: float) -> List[RepairPolicy]:
     ]
 
 
+def _risk_aware_ladder_start(ladder: List[RepairPolicy], risk: float) -> int:
+    """Return the index into *ladder* at which the pilot should begin.
+
+    High risk => skip aggressive policies and start conservative.
+    """
+    if risk >= 0.65:
+        return min(2, len(ladder) - 1)  # start at ss2_lr5e-5
+    if risk <= 0.35:
+        return 0  # start at ss4_lr1e-4
+    return min(1, len(ladder) - 1)  # start at ss4_lr5e-5
+
+
+def risk_scale_policy(policy: RepairPolicy, risk: float) -> RepairPolicy:
+    """Return a copy of *policy* with steps/eval budget scaled by risk."""
+    if risk < 0.55:
+        return policy
+    scale = 1.0 + (risk - 0.55) * 0.6  # up to ~1.3x at risk=1.0
+    return RepairPolicy(
+        name=policy.name,
+        stage_size=policy.stage_size,
+        lr=policy.lr,
+        steps=int(policy.steps * scale),
+        early_stop_patience=policy.early_stop_patience,
+        regression_limit=policy.regression_limit,
+        curve_every=policy.curve_every + (25 if risk >= 0.65 else 0),
+        cheap_eval_texts=min(256, policy.cheap_eval_texts + (64 if risk >= 0.65 else 0)),
+        cheap_eval_max_tokens=policy.cheap_eval_max_tokens,
+        final_eval_max_tokens=policy.final_eval_max_tokens,
+        grad_accum_steps=policy.grad_accum_steps,
+        max_grad_norm=policy.max_grad_norm,
+    )
+
+
 def auto_select_policy(
     model_id: str,
     selector: str,
@@ -131,8 +164,12 @@ def auto_select_policy(
     dtype_str: str,
     seed: int = 0,
     prescan_cache: Optional[Dict[int, Dict[str, Any]]] = None,
+    risk_score: float = 0.5,
 ) -> tuple[RepairPolicy, Dict[str, Any]]:
     """Run short pilot compiles to choose the most aggressive stable policy.
+
+    When *risk_score* is provided, the pilot starts further down the ladder
+    for high-risk models (skipping aggressive policies that are likely to fail).
 
     Returns (chosen_policy, pilot_report).
     """
@@ -147,25 +184,28 @@ def auto_select_policy(
     num_layers = probe_model.config.num_hidden_layers
     pilot_layer = num_layers // 2
     _log.info(
-        "policy pilot: %.2fB params, %d layers, pilot_layer=%d",
-        param_b, num_layers, pilot_layer,
+        "policy pilot: %.2fB params, %d layers, pilot_layer=%d, risk=%.3f",
+        param_b, num_layers, pilot_layer, risk_score,
     )
     del probe_model, probe_tok
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     ladder = build_policy_ladder(param_b)
+    start_idx = _risk_aware_ladder_start(ladder, risk_score)
     pilot_report: Dict[str, Any] = {
         "param_billions": round(param_b, 3),
         "pilot_layer": pilot_layer,
         "pilot_keep_frac": PILOT_KEEP_FRAC,
+        "risk_score": round(risk_score, 4),
+        "ladder_start_idx": start_idx,
         "trials": [],
     }
 
     pilot_steps = min(200, ladder[0].steps // 2)
     eval_subset = list(texts_eval[:64])
 
-    for policy in ladder:
+    for policy in ladder[start_idx:]:
         _log.info("pilot trial: %s", policy.name)
 
         model, tok = load_model_and_tokenizer(model_id, device, dtype)
@@ -240,12 +280,13 @@ def auto_select_policy(
             torch.cuda.empty_cache()
 
         if passed:
-            _log.info("policy selected: %s", policy.name)
-            pilot_report["selected"] = policy.name
-            return policy, pilot_report
+            chosen = risk_scale_policy(policy, risk_score)
+            _log.info("policy selected: %s (risk-scaled)", chosen.name)
+            pilot_report["selected"] = chosen.name
+            return chosen, pilot_report
 
-    # All failed — return most conservative
-    fallback = ladder[-1]
+    # All failed — return most conservative, risk-scaled
+    fallback = risk_scale_policy(ladder[-1], risk_score)
     _log.warning("all pilot trials failed; falling back to %s", fallback.name)
     pilot_report["selected"] = fallback.name
     pilot_report["fallback"] = True

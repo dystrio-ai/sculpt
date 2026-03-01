@@ -140,6 +140,7 @@ def compile_model(
     max_eval_tokens: int = 40_000,
     selector: str = "structural",
     failure_dir: Optional[Path] = None,
+    layer_order: Optional[List[int]] = None,
 ) -> CompileResult:
     """Compile a model at a specific keep_frac.
 
@@ -185,7 +186,10 @@ def compile_model(
     for li in layers:
         original_ffn_dims[li] = model.model.layers[li].mlp.gate_proj.out_features
 
-    compressible = [li for li in layers if keep_frac < 1.0]
+    if layer_order is not None and keep_frac < 1.0:
+        compressible = [li for li in layer_order if li in set(layers)]
+    else:
+        compressible = [li for li in layers if keep_frac < 1.0]
     if not compressible:
         metrics = _collect_metrics(model, tok, texts, device, max_eval_tokens)
         return CompileResult(
@@ -376,6 +380,7 @@ def compile_model(
         "layers_compressed": len(compressed_so_far),
         "selector": selector,
         "policy": current_policy.to_dict(),
+        "layer_order": compressible if layer_order is not None else None,
     }
 
     return CompileResult(

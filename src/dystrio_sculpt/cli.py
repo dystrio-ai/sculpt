@@ -20,9 +20,10 @@ def _print_summary_table(selected, baseline_metrics) -> None:
     """Print a compact summary table that users screenshot."""
     base_ppl = baseline_metrics.get("ppl_w103_valid", 1.0)
 
+    _up = "\u2191"
     header = (
         f"{'Name':<30} {'keep_frac':>9} {'PPL ratio':>9} "
-        f"{'Prefill↑':>9} {'Decode↑':>9} {'Time(s)':>8}"
+        f"{'Prefill' + _up:>9} {'Decode' + _up:>9} {'Risk':>6} {'Time(s)':>8}"
     )
     sep = "-" * len(header)
     lines = [sep, header, sep]
@@ -31,7 +32,7 @@ def _print_summary_table(selected, baseline_metrics) -> None:
         lines.append(
             f"{pt.label:<30} {pt.keep_frac:>9.3f} {ppl_ratio:>9.4f} "
             f"{pt.prefill_speedup:>8.2f}x {pt.decode_speedup:>8.2f}x "
-            f"{pt.wall_time_s:>8.0f}"
+            f"{pt.risk_score:>6.3f} {pt.wall_time_s:>8.0f}"
         )
     lines.append(sep)
 
@@ -47,7 +48,7 @@ def sculpt(
     frontier: int = typer.Option(4, "--frontier", help="Number of frontier points to emit."),
     max_ppl_multiplier: Optional[float] = typer.Option(
         None, "--max-ppl-multiplier",
-        help="Discard points where PPL > baseline * multiplier.",
+        help="Quality ceiling: PPL <= baseline * multiplier. [default: 2.0]",
     ),
     target_prefill_speedup: Optional[float] = typer.Option(
         None, "--target-prefill-speedup",
@@ -86,8 +87,7 @@ def sculpt(
     log.info("  frontier:      %d", frontier)
     log.info("  deterministic: %s", deterministic)
     log.info("  device:        %s", device)
-    if max_ppl_multiplier is not None:
-        log.info("  max_ppl_mult:  %.2f", max_ppl_multiplier)
+    log.info("  ppl_ceiling:   %s", max_ppl_multiplier if max_ppl_multiplier else "2.0 (default)")
     if target_prefill_speedup is not None:
         log.info("  target_speed:  %.2fx", target_prefill_speedup)
     if max_compile_hours is not None:
@@ -158,6 +158,7 @@ def sculpt(
             config=cr.config,
             wall_time_s=cr.wall_time_s,
             pilot_report=cr.pilot_report,
+            risk_score=pt.risk_score,
         )
 
         model_dir = point_dir / "model"
@@ -171,7 +172,10 @@ def sculpt(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    log.info("=" * 70)
-    log.info("Sculpt complete: %d frontier points emitted to %s", len(selected), outpath)
+    log.info("=" * 80)
+    log.info(
+        "Sculpt complete: %d points emitted to %s  (risk=%.3f, ceiling=%.2fx)",
+        len(selected), outpath, search.risk_score, search.max_ppl_multiplier,
+    )
     _print_summary_table(selected, search.baseline_metrics or {})
-    log.info("=" * 70)
+    log.info("=" * 80)

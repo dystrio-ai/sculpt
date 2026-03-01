@@ -36,7 +36,7 @@ def _write_json(path: Path, data: Any) -> None:
 
 _SUMMARY_COLUMNS = [
     "name", "keep_frac", "ppl_w103", "ppl_ratio",
-    "prefill_speedup", "decode_speedup", "compile_time_s",
+    "prefill_speedup", "decode_speedup", "risk_score", "compile_time_s",
 ]
 
 
@@ -49,6 +49,7 @@ def append_summary_csv(
     prefill_speedup: float,
     decode_speedup: float,
     compile_time_s: float,
+    risk_score: float = 0.0,
 ) -> None:
     """Append one row to the root-level summary.csv (creates header on first call)."""
     csv_path = outdir / "summary.csv"
@@ -66,6 +67,7 @@ def append_summary_csv(
             "ppl_ratio": f"{ppl_ratio:.4f}",
             "prefill_speedup": f"{prefill_speedup:.3f}",
             "decode_speedup": f"{decode_speedup:.3f}",
+            "risk_score": f"{risk_score:.4f}",
             "compile_time_s": f"{compile_time_s:.1f}",
         })
 
@@ -82,6 +84,7 @@ def emit_frontier_point(
     config: Dict[str, Any],
     wall_time_s: float,
     pilot_report: Optional[Dict[str, Any]] = None,
+    risk_score: float = 0.0,
 ) -> Path:
     """Save a single frontier point: model weights, metrics, and manifest.
 
@@ -133,6 +136,7 @@ def emit_frontier_point(
         "baseline_ppl_w103": round(base_ppl, 4),
         "baseline_prefill_tps": round(base_prefill, 1),
         "baseline_decode_tps": round(base_decode, 1),
+        "risk_score": round(risk_score, 4),
     }
     _write_json(point_dir / "metrics.json", metrics_out)
     _write_json(point_dir / "compile_report.json", compile_report)
@@ -158,6 +162,7 @@ def emit_frontier_point(
         "layers_compressed": config.get("layers_compressed", 0),
         "policy": config.get("policy", {}),
         "total_repair_steps": config.get("total_repair_steps", 0),
+        "risk_score": round(risk_score, 4),
         "old_intermediate_size": old_intermediate,
         "new_intermediate_size": new_intermediate if new_intermediate is not None else old_intermediate,
         "compile_wall_time_s": round(wall_time_s, 2),
@@ -185,6 +190,7 @@ def emit_frontier_point(
         prefill_speedup=prefill_speedup,
         decode_speedup=decode_speedup,
         compile_time_s=wall_time_s,
+        risk_score=risk_score,
     )
 
     _log.info(

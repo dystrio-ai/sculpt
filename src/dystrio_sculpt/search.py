@@ -1,7 +1,10 @@
-"""Frontier search: adaptive binary refinement over uniform keep_frac.
+"""Frontier search: SLO-driven Safe Bracket Search (SBS) over uniform keep_frac.
 
-Integrates RepairPolicy auto-selection. Uses cheap eval during search
-and only runs final eval on selected Pareto points.
+Default objective: find the **fastest safe keep_frac** under a quality ceiling,
+then emit up to N named points around the safe optimum.
+
+Uses structural risk score from prescan artifacts to steer the initial bracket,
+repair policy selection, and stage ordering.
 """
 
 from __future__ import annotations
@@ -19,19 +22,13 @@ from ._model import load_model_and_tokenizer, resolve_dtype
 from ._data import load_text_sets
 from .engine import CompileResult, compile_model, _collect_metrics, setup_determinism, MAX_LEN
 from .policy import RepairPolicy, auto_select_policy
+from .risk import model_risk_score, risk_aware_keep_candidates, layer_compressibility_order
 from .selectors import BLOCK_SIZE
 from .selectors.structural import prescan_structural_artifacts
 
 _log = logging.getLogger(__name__)
 
-FRONTIER_LABELS = ["conservative", "balanced", "aggressive", "extreme"]
-
-
-def frontier_label(index: int, total: int) -> str:
-    """Return a human-friendly label for a frontier point."""
-    if total <= len(FRONTIER_LABELS):
-        return FRONTIER_LABELS[index] if index < len(FRONTIER_LABELS) else f"point{index}"
-    return f"point{index}"
+DEFAULT_PPL_CEILING = 2.0
 
 
 @dataclass
@@ -46,51 +43,79 @@ class FrontierPoint:
     prefill_speedup: float
     decode_speedup: float
     wall_time_s: float
+    ppl_ratio: float = 0.0
     compile_result: Optional[CompileResult] = field(default=None, repr=False)
     label: str = ""
     failed: bool = False
     failure_reason: str = ""
+    risk_score: float = 0.0
 
 
-def pareto_front(points: List[FrontierPoint]) -> List[FrontierPoint]:
-    """Non-dominated sort: minimize PPL, maximize prefill speedup.
-
-    Returns points sorted by ascending PPL where each successive point
-    has strictly higher speedup than all predecessors.
-    """
-    viable = [p for p in points if not p.failed]
-    if not viable:
-        return []
-    sorted_pts = sorted(viable, key=lambda p: p.ppl_w103)
-    front = [sorted_pts[0]]
-    max_speedup = sorted_pts[0].prefill_speedup
-    for p in sorted_pts[1:]:
-        if p.prefill_speedup > max_speedup:
-            front.append(p)
-            max_speedup = p.prefill_speedup
-    return front
+def _is_safe(pt: FrontierPoint, ceiling: float) -> bool:
+    return not pt.failed and pt.ppl_ratio <= ceiling
 
 
-def select_evenly_spaced(front: List[FrontierPoint], n: int) -> List[FrontierPoint]:
-    """Pick n evenly-spaced points from the sorted Pareto front."""
-    if len(front) <= n:
-        return list(front)
-    indices = sorted(set(
-        int(round(i * (len(front) - 1) / (n - 1))) for i in range(n)
-    ))
-    return [front[i] for i in indices]
+def _assign_labels(
+    selected: List[FrontierPoint], ceiling: Optional[float],
+) -> None:
+    """Assign semantic labels based on role, not index."""
+    if not selected:
+        return
+
+    if len(selected) == 1:
+        pt = selected[0]
+        if ceiling and _is_safe(pt, ceiling):
+            pt.label = "frontier_0_balanced"
+        else:
+            pt.label = "frontier_0_conservative"
+        return
+
+    # Sort by keep_frac descending (most conservative first)
+    selected.sort(key=lambda p: -p.keep_frac)
+
+    selected[0].label = "frontier_0_conservative"
+
+    if len(selected) >= 2:
+        # The fastest safe point is "balanced"
+        safe_sorted = sorted(
+            [p for p in selected if ceiling is None or _is_safe(p, ceiling)],
+            key=lambda p: -p.prefill_speedup,
+        )
+        if safe_sorted:
+            fastest_safe = safe_sorted[0]
+            if fastest_safe is not selected[0]:
+                fastest_safe.label = f"frontier_1_balanced"
+
+    # Label remaining unlabeled points
+    idx = 2
+    for pt in selected:
+        if pt.label:
+            continue
+        if ceiling and not _is_safe(pt, ceiling):
+            continue
+        if idx == 2:
+            pt.label = f"frontier_{idx}_aggressive"
+        else:
+            pt.label = f"frontier_{idx}_point{idx}"
+        idx += 1
+
+    # Ensure all have labels
+    for i, pt in enumerate(selected):
+        if not pt.label:
+            pt.label = f"frontier_{i}_point{i}"
 
 
 class FrontierSearch:
-    """Adaptive frontier search over uniform keep_frac in [0.4, 1.0].
+    """Safe Bracket Search (SBS) over uniform keep_frac in [0.4, 1.0].
 
     Algorithm:
-      1. Auto-select a stable RepairPolicy via pilot compile.
-      2. Evaluate an initial grid of keep_frac values.
-      3. Build Pareto front.
-      4. Bisect the largest gap on the front until resolution < 3% or time runs out.
-      5. Apply user constraints (max PPL, target speedup).
-      6. Select n_frontier evenly-spaced non-dominated points.
+      1. Compute baseline and structural prescan.
+      2. Derive model risk score from prescan artifacts.
+      3. Choose initial keep candidates based on risk.
+      4. Auto-select repair policy (risk-aware).
+      5. Evaluate candidates in descending order; track safe/unsafe bracket.
+      6. Bisect the bracket to find the fastest safe keep_frac.
+      7. Emit up to n_frontier named points under the quality ceiling.
     """
 
     def __init__(
@@ -115,7 +140,13 @@ class FrontierSearch:
     ):
         self.model_id = model_id
         self.n_frontier = n_frontier
-        self.max_ppl_multiplier = max_ppl_multiplier
+        # Default quality ceiling
+        if max_ppl_multiplier is None or max_ppl_multiplier <= 0:
+            self.max_ppl_multiplier = DEFAULT_PPL_CEILING
+            self._ceiling_is_default = True
+        else:
+            self.max_ppl_multiplier = max_ppl_multiplier
+            self._ceiling_is_default = False
         self.target_prefill_speedup = target_prefill_speedup
         self.max_compile_hours = max_compile_hours
         self.deterministic = deterministic
@@ -135,6 +166,9 @@ class FrontierSearch:
         self.baseline_metrics: Optional[Dict[str, float]] = None
         self.policy: Optional[RepairPolicy] = None
         self.pilot_report: Optional[Dict[str, Any]] = None
+        self.risk_score: float = 0.5
+        self.risk_detail: Optional[Dict[str, Any]] = None
+        self.layer_order: Optional[List[int]] = None
         self.evaluated: List[FrontierPoint] = []
         self._start_time: float = 0.0
 
@@ -147,7 +181,6 @@ class FrontierSearch:
     def _setup(self) -> None:
         self._start_time = time.time()
         setup_determinism(self.seed, self.deterministic)
-
         _log.info("loading datasets")
         self.texts = load_text_sets(self.n_texts_cal, self.n_texts_train, self.n_texts_eval)
 
@@ -188,6 +221,16 @@ class FrontierSearch:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def _compute_risk(self) -> None:
+        if self.prescan_cache:
+            self.risk_score, self.risk_detail = model_risk_score(self.prescan_cache)
+            self.layer_order = layer_compressibility_order(self.prescan_cache)
+        else:
+            self.risk_score = 0.5
+            self.risk_detail = {"aggregate": 0.5, "source": "no_prescan"}
+            self.layer_order = None
+        _log.info("structural risk score: %.3f", self.risk_score)
+
     def _select_policy(self) -> None:
         if self.policy_override is not None:
             self.policy = self.policy_override
@@ -195,7 +238,7 @@ class FrontierSearch:
             return
 
         assert self.texts is not None
-        _log.info("running policy auto-selection pilot")
+        _log.info("running policy auto-selection pilot (risk=%.3f)", self.risk_score)
         self.policy, self.pilot_report = auto_select_policy(
             model_id=self.model_id,
             selector=self.selector,
@@ -207,6 +250,7 @@ class FrontierSearch:
             dtype_str=self.dtype_str,
             seed=self.seed,
             prescan_cache=self.prescan_cache,
+            risk_score=self.risk_score,
         )
         _log.info("policy auto-selected: %s", self.policy.name)
 
@@ -217,6 +261,7 @@ class FrontierSearch:
         assert self.policy is not None
 
         failure_subdir = (self.outdir / f"_failed_kf{keep_frac:.3f}") if self.outdir else None
+        base_ppl = self.baseline_metrics["ppl_w103_valid"]
 
         try:
             result = compile_model(
@@ -237,14 +282,16 @@ class FrontierSearch:
                 max_eval_tokens=self.max_eval_tokens,
                 selector=self.selector,
                 failure_dir=failure_subdir,
+                layer_order=self.layer_order,
             )
         except Exception as exc:
             _log.error("compile_model failed for kf=%.3f: %s", keep_frac, exc)
             point = FrontierPoint(
                 keep_frac=keep_frac, ppl_w103=float("inf"), ppl_w2=float("inf"),
                 prefill_tps=0.0, decode_tps=0.0, prefill_speedup=0.0,
-                decode_speedup=0.0, wall_time_s=0.0, failed=True,
-                failure_reason=str(exc),
+                decode_speedup=0.0, wall_time_s=0.0, ppl_ratio=float("inf"),
+                failed=True, failure_reason=str(exc),
+                risk_score=self.risk_score,
             )
             self.evaluated.append(point)
             return point
@@ -253,6 +300,7 @@ class FrontierSearch:
         base = self.baseline_metrics
         prefill_speedup = m["prefill_tokens_per_sec"] / max(1e-9, base["prefill_tokens_per_sec"])
         decode_speedup = m["decode_tokens_per_sec"] / max(1e-9, base["decode_tokens_per_sec"])
+        ppl_ratio = m["ppl_w103_valid"] / max(1e-9, base_ppl)
 
         failed = result.guardrail_failed or result.failure is not None
         point = FrontierPoint(
@@ -264,84 +312,152 @@ class FrontierSearch:
             prefill_speedup=prefill_speedup,
             decode_speedup=decode_speedup,
             wall_time_s=result.wall_time_s,
+            ppl_ratio=ppl_ratio,
             compile_result=result,
             failed=failed,
             failure_reason=result.failure["reason"] if result.failure else "",
+            risk_score=self.risk_score,
         )
         self.evaluated.append(point)
 
+        safe_str = "SAFE" if _is_safe(point, self.max_ppl_multiplier) else "OVER_CEILING"
         _log.info(
-            "keep_frac=%.3f  ppl_w103=%.2f  prefill_speedup=%.2fx  (%.0fs)%s",
-            keep_frac, point.ppl_w103, prefill_speedup, result.wall_time_s,
-            " [FAILED]" if failed else "",
+            "keep_frac=%.3f  ppl_ratio=%.3f  prefill_speedup=%.2fx  [%s]  (%.0fs)",
+            keep_frac, ppl_ratio, prefill_speedup, safe_str, result.wall_time_s,
         )
         return point
 
-    def _apply_constraints(self, points: List[FrontierPoint]) -> List[FrontierPoint]:
-        filtered = list(points)
-        if self.max_ppl_multiplier is not None and self.baseline_metrics is not None:
-            max_ppl = self.baseline_metrics["ppl_w103_valid"] * self.max_ppl_multiplier
-            filtered = [p for p in filtered if p.ppl_w103 <= max_ppl]
-        if self.target_prefill_speedup is not None:
-            filtered = [p for p in filtered if p.prefill_speedup >= self.target_prefill_speedup]
-        return filtered
+    def _safe_points(self) -> List[FrontierPoint]:
+        return [p for p in self.evaluated if _is_safe(p, self.max_ppl_multiplier)]
+
+    def _fastest_safe(self) -> Optional[FrontierPoint]:
+        safe = self._safe_points()
+        if not safe:
+            return None
+        return max(safe, key=lambda p: p.prefill_speedup)
+
+    def _best_quality(self) -> Optional[FrontierPoint]:
+        safe = self._safe_points()
+        if not safe:
+            viable = [p for p in self.evaluated if not p.failed]
+            if not viable:
+                return None
+            return min(viable, key=lambda p: p.ppl_ratio)
+        return min(safe, key=lambda p: p.ppl_ratio)
 
     def run(self) -> List[FrontierPoint]:
-        """Execute the full frontier search. Returns selected frontier points."""
+        """Execute the Safe Bracket Search. Returns selected frontier points."""
         self._setup()
         self._compute_baseline()
         self._compute_prescan()
+        self._compute_risk()
         self._select_policy()
 
-        # Initial grid
-        initial_grid = [0.40, 0.55, 0.70, 0.85]
-        for kf in initial_grid:
-            if self._time_exceeded():
-                _log.info("time budget reached during initial grid")
-                break
-            self._evaluate(kf)
+        ceiling = self.max_ppl_multiplier
+        reject_margin = ceiling * 1.05
 
-        # Adaptive binary refinement
+        # Risk-aware initial candidates (descending keep_frac = conservative first)
+        candidates = risk_aware_keep_candidates(self.risk_score)
+        candidates.sort(reverse=True)
+        _log.info("initial candidates (risk=%.3f): %s", self.risk_score, candidates)
+
+        # Phase 1: Evaluate candidates in descending order
+        k_safe_best: Optional[float] = None
+        k_unsafe: Optional[float] = None
+
+        for kf in candidates:
+            if self._time_exceeded():
+                _log.info("time budget reached during initial sweep")
+                break
+            pt = self._evaluate(kf)
+
+            if _is_safe(pt, ceiling):
+                if k_safe_best is None or pt.prefill_speedup > self._fastest_safe().prefill_speedup:
+                    k_safe_best = kf
+            else:
+                if not pt.failed and pt.ppl_ratio <= reject_margin * 1.5:
+                    k_unsafe = kf
+
+            # Early reject: if ppl_ratio way above ceiling, don't go lower
+            if not pt.failed and pt.ppl_ratio > reject_margin and kf < 0.80:
+                _log.info("ppl_ratio=%.3f >> ceiling=%.2f at kf=%.3f; stopping sweep", pt.ppl_ratio, ceiling, kf)
+                k_unsafe = kf
+                break
+
+        # Phase 2: Bisect bracket [k_unsafe, k_safe_best] to refine boundary
         min_resolution = 0.03
-        max_refinements = 8
-        for _ in range(max_refinements):
-            if self._time_exceeded():
-                _log.info("time budget reached during refinement")
-                break
-            front = pareto_front(self.evaluated)
-            if len(front) < 2:
-                break
-            front.sort(key=lambda p: p.keep_frac)
-            max_gap = 0.0
-            best_pair = None
-            for i in range(len(front) - 1):
-                gap = front[i + 1].keep_frac - front[i].keep_frac
-                if gap > max_gap:
-                    max_gap = gap
-                    best_pair = (front[i].keep_frac, front[i + 1].keep_frac)
-            if best_pair is None or max_gap < min_resolution:
-                break
-            midpoint = round((best_pair[0] + best_pair[1]) / 2, 3)
-            already = any(abs(p.keep_frac - midpoint) < 0.005 for p in self.evaluated)
-            if already:
-                break
-            self._evaluate(midpoint)
+        max_bisections = 6
 
-        # Select frontier
-        front = pareto_front(self.evaluated)
-        constrained = self._apply_constraints(front)
-        if not constrained:
-            _log.warning("no points satisfy constraints; using full Pareto front")
-            constrained = front
+        if k_safe_best is not None and k_unsafe is not None:
+            lo, hi = k_unsafe, k_safe_best
+            for _ in range(max_bisections):
+                if self._time_exceeded():
+                    _log.info("time budget reached during bisection")
+                    break
+                if hi - lo < min_resolution:
+                    break
+                mid = round((lo + hi) / 2, 3)
+                already = any(abs(p.keep_frac - mid) < 0.005 for p in self.evaluated)
+                if already:
+                    break
+                pt = self._evaluate(mid)
+                if _is_safe(pt, ceiling):
+                    hi = mid
+                else:
+                    lo = mid
 
-        selected = select_evenly_spaced(constrained, self.n_frontier)
+        # Phase 3: Select points to emit
+        safe = self._safe_points()
+        viable = [p for p in self.evaluated if not p.failed]
 
-        # Assign human-friendly labels
-        for i, pt in enumerate(selected):
-            pt.label = f"frontier_{i}_{frontier_label(i, len(selected))}"
+        if not safe:
+            _log.warning(
+                "no point met quality ceiling (%.2fx) within budget; "
+                "emitting conservative only",
+                ceiling,
+            )
+            if viable:
+                best_viable = min(viable, key=lambda p: p.ppl_ratio)
+                best_viable.label = "frontier_0_conservative"
+                return [best_viable]
+            _log.error("no viable points at all")
+            return []
+
+        # Build selection: best quality, fastest safe, then fill
+        best_q = self._best_quality()
+        fastest_s = self._fastest_safe()
+        selected_set: Dict[float, FrontierPoint] = {}
+
+        if best_q is not None:
+            selected_set[best_q.keep_frac] = best_q
+        if fastest_s is not None and fastest_s.keep_frac not in selected_set:
+            selected_set[fastest_s.keep_frac] = fastest_s
+
+        # Fill remaining slots from safe points sorted by descending speedup
+        safe_by_speed = sorted(safe, key=lambda p: -p.prefill_speedup)
+        for pt in safe_by_speed:
+            if len(selected_set) >= self.n_frontier:
+                break
+            if pt.keep_frac not in selected_set:
+                selected_set[pt.keep_frac] = pt
+
+        selected = sorted(selected_set.values(), key=lambda p: -p.keep_frac)
+
+        # Apply target_prefill_speedup filter if set
+        if self.target_prefill_speedup is not None:
+            filtered = [p for p in selected if p.prefill_speedup >= self.target_prefill_speedup]
+            if filtered:
+                selected = filtered
+
+        selected = selected[:self.n_frontier]
+
+        # Assign semantic labels (never label above-ceiling as "balanced")
+        _assign_labels(selected, ceiling)
 
         _log.info(
-            "frontier search complete: %d evaluated, %d on Pareto front, %d selected",
-            len(self.evaluated), len(front), len(selected),
+            "SBS complete: %d evaluated, %d safe, %d selected  "
+            "(risk=%.3f, ceiling=%.2fx)",
+            len(self.evaluated), len(safe), len(selected),
+            self.risk_score, ceiling,
         )
         return selected
