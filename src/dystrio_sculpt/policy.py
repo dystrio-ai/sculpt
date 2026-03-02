@@ -415,6 +415,7 @@ def _run_pilot_stages(
                 "stage": si, "layers": chunk,
                 "ppl_pre_repair": float("inf"), "ppl_best": float("inf"),
                 "improve_frac": 0.0, "regression_stop": False, "nan_inf": True,
+                "early_stop": False,
                 "repair_fail": True, "repair_helpful": False,
             })
             break
@@ -422,6 +423,7 @@ def _run_pilot_stages(
         Pbest = P0
         reg_stop = False
         nan_inf = False
+        early_stop = False
 
         if steps > 0:
             def _curve(step, _model=model, _tok=tok, _es=eval_subset):
@@ -442,8 +444,12 @@ def _run_pilot_stages(
             )
 
             Pbest = sr.get("best_metric", P0)
-            reg_stop = sr.get("regression_stop_triggered", False)
-            nan_inf = sr.get("nan_inf_detected", False) or math.isnan(Pbest) or math.isinf(Pbest)
+            reg_stop = sr.get(
+                "regression_tripwire_triggered",
+                sr.get("regression_stop_triggered", False),
+            )
+            nan_inf = sr.get("nan_inf_detected", False)
+            early_stop = sr.get("early_stop_triggered", False)
             if math.isnan(Pbest) or math.isinf(Pbest):
                 Pbest = P0
 
@@ -457,6 +463,7 @@ def _run_pilot_stages(
             "ppl_best": round(Pbest, 4),
             "improve_frac": round(improve, 6),
             "regression_stop": reg_stop, "nan_inf": nan_inf,
+            "early_stop": early_stop,
             "repair_fail": fail, "repair_helpful": helpful,
         })
 

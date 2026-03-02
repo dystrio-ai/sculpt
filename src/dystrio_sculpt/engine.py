@@ -309,6 +309,7 @@ def compile_model(
         # Stage repair with best-checkpoint + never-worse invariant
         stage_regression_stop = False
         stage_nan_inf = False
+        stage_early_stop = False
         ppl_best_stage = stage_ppl
         if current_policy.steps > 0:
             warmup_stage = min(100, current_policy.steps // 5)
@@ -329,11 +330,12 @@ def compile_model(
                 any_early_stopped = True
 
             ppl_best_stage = sr.get("best_metric", float("inf"))
-            stage_regression_stop = sr.get("regression_stop_triggered", False)
-            stage_nan_inf = (
-                sr.get("nan_inf_detected", False)
-                or math.isnan(ppl_best_stage) or math.isinf(ppl_best_stage)
+            stage_regression_stop = sr.get(
+                "regression_tripwire_triggered",
+                sr.get("regression_stop_triggered", False),
             )
+            stage_nan_inf = sr.get("nan_inf_detected", False)
+            stage_early_stop = sr.get("early_stop_triggered", False)
 
             post_ppl = cheap_eval(model, tok, cheap_w103, device, current_policy.cheap_eval_max_tokens)
 
@@ -415,6 +417,7 @@ def compile_model(
             "improve_frac": round(improve_frac, 6),
             "regression_stop": stage_regression_stop,
             "nan_inf": stage_nan_inf,
+            "early_stop": stage_early_stop,
         })
 
         # Mid-compile escalation: only on true instability (consecutive repair_fail)

@@ -106,8 +106,9 @@ def repair_layers(
     accum_loss_sum = 0.0
     curve_points: list[dict[str, Any]] = []
     early_stopped = False
-    _regression_stopped = False
+    _regression_tripwire = False
     _nan_inf_detected = False
+    _early_stop_triggered = False
 
     best_metric: float = float("inf")
     best_step: int = 0
@@ -204,9 +205,10 @@ def repair_layers(
 
             if early_stop_patience > 0 and _es_no_improve >= early_stop_patience:
                 _log.info(
-                    "early stop at step %d: %s no improvement for %d checkpoints",
+                    "early stop (patience) at step %d: %s no improvement for %d checkpoints",
                     opt_step, early_stop_key, early_stop_patience,
                 )
+                _early_stop_triggered = True
                 early_stopped = True
                 break
 
@@ -216,14 +218,15 @@ def repair_layers(
                 and val > best_metric * (1.0 + regression_limit)
             ):
                 _log.info(
-                    "regression stop at step %d: %s=%.2f exceeds best %.2f by >%.0f%%",
+                    "regression tripwire at step %d: %s=%.2f exceeds best %.2f by >%.0f%%",
                     opt_step, early_stop_key, val, best_metric, regression_limit * 100,
                 )
-                _regression_stopped = True
+                _regression_tripwire = True
                 early_stopped = True
                 break
 
         if opt_step >= steps:
+            _early_stop_triggered = True
             break
 
     # Final curve point
@@ -268,6 +271,8 @@ def repair_layers(
         "best_metric": best_metric,
         "best_step": best_step,
         "repaired_ok": repaired_ok,
-        "regression_stop_triggered": _regression_stopped,
+        "regression_tripwire_triggered": _regression_tripwire,
+        "regression_stop_triggered": _regression_tripwire,  # backward compat
         "nan_inf_detected": _nan_inf_detected,
+        "early_stop_triggered": _early_stop_triggered,
     }

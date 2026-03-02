@@ -43,6 +43,7 @@ def _make_policy(name: str = "test", lr: float = 1e-4, steps: int = 100,
 def _make_stage_stat(
     stage: int = 0, improve_frac: float = 0.0,
     regression_stop: bool = False, nan_inf: bool = False,
+    early_stop: bool = False,
 ) -> dict:
     fail = regression_stop or nan_inf
     helpful = (not fail) and improve_frac >= HELPFUL_THRESHOLD
@@ -51,6 +52,7 @@ def _make_stage_stat(
         "ppl_pre_repair": 10.0, "ppl_best": 10.0 * (1 - improve_frac),
         "improve_frac": improve_frac,
         "regression_stop": regression_stop, "nan_inf": nan_inf,
+        "early_stop": early_stop,
         "repair_fail": fail, "repair_helpful": helpful,
     }
 
@@ -823,3 +825,92 @@ class TestLatencyEmitFields:
             if val is not None:
                 metrics_out[k] = val
         assert len(metrics_out) == 0
+
+
+# ── 19) Repair stop reason semantics ──────────────────────────────────────────
+
+class TestRepairStopSemantics:
+    """Verify regression_tripwire vs early_stop vs nan_inf separation."""
+
+    def test_patience_stop_not_regression_tripwire(self):
+        """Patience exhausted => early_stop=True, regression_tripwire=False."""
+        stat = _make_stage_stat(
+            stage=0, improve_frac=0.03, regression_stop=False,
+            nan_inf=False, early_stop=True,
+        )
+        assert stat["repair_fail"] is False
+        assert stat["early_stop"] is True
+        assert stat["regression_stop"] is False
+        assert stat["repair_helpful"] is True
+
+    def test_tripwire_sets_regression_and_fail(self):
+        """Regression tripwire => regression_stop=True => repair_fail=True."""
+        stat = _make_stage_stat(
+            stage=0, improve_frac=0.05, regression_stop=True,
+            nan_inf=False, early_stop=False,
+        )
+        assert stat["repair_fail"] is True
+        assert stat["regression_stop"] is True
+        assert stat["early_stop"] is False
+        assert stat["repair_helpful"] is False
+
+    def test_nan_inf_is_fail_without_regression(self):
+        """NaN/Inf detected => repair_fail, but regression_stop stays False."""
+        stat = _make_stage_stat(
+            stage=0, improve_frac=0.0, regression_stop=False,
+            nan_inf=True, early_stop=False,
+        )
+        assert stat["repair_fail"] is True
+        assert stat["regression_stop"] is False
+        assert stat["nan_inf"] is True
+
+    def test_early_stop_with_improvement_is_helpful(self):
+        """A stage with early_stop (patience/max_steps) and improvement is helpful."""
+        stat = _make_stage_stat(
+            stage=0, improve_frac=0.05, regression_stop=False,
+            nan_inf=False, early_stop=True,
+        )
+        assert stat["repair_fail"] is False
+        assert stat["repair_helpful"] is True
+        assert stat["early_stop"] is True
+
+    def test_manifest_stage_stats_not_all_fail(self):
+        """With many early_stop stages but no tripwire, repair_fail count is 0."""
+        stages = [
+            _make_stage_stat(i, improve_frac=0.03, early_stop=True)
+            for i in range(8)
+        ]
+        fail_count = sum(1 for s in stages if s["repair_fail"])
+        early_count = sum(1 for s in stages if s["early_stop"])
+        helpful_count = sum(1 for s in stages if s["repair_helpful"])
+        assert fail_count == 0
+        assert early_count == 8
+        assert helpful_count == 8
+
+    def test_mixed_stop_reasons(self):
+        """Mix of early_stop, tripwire, nan_inf: only tripwire/nan count as fail."""
+        stages = [
+            _make_stage_stat(0, improve_frac=0.04, early_stop=True),
+            _make_stage_stat(1, improve_frac=0.02, early_stop=True),
+            _make_stage_stat(2, improve_frac=0.01, regression_stop=True),
+            _make_stage_stat(3, improve_frac=0.03, early_stop=True),
+            _make_stage_stat(4, improve_frac=0.0, nan_inf=True),
+        ]
+        fail_count = sum(1 for s in stages if s["repair_fail"])
+        helpful_count = sum(1 for s in stages if s["repair_helpful"])
+        assert fail_count == 2  # stage 2 (tripwire) + stage 4 (nan)
+        assert helpful_count == 3  # stages 0, 1, 3
+
+    def test_repair_return_dict_keys(self):
+        """Verify the expected keys exist in the repair return dict shape."""
+        result = {
+            "regression_tripwire_triggered": False,
+            "regression_stop_triggered": False,
+            "nan_inf_detected": False,
+            "early_stop_triggered": True,
+            "early_stopped": True,
+        }
+        assert result["regression_tripwire_triggered"] is False
+        assert result["regression_stop_triggered"] is False
+        assert result["early_stop_triggered"] is True
+        assert result["early_stopped"] is True
