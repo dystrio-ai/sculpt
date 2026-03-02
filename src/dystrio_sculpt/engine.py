@@ -25,7 +25,7 @@ from ._compile import compress_mlp_layer_swiglu_inplace
 from .selectors import select_for_layer, BLOCK_SIZE
 from .selectors.structural import prescan_structural_artifacts
 from .repair import repair_layers, _snapshot_trainable, _restore_trainable
-from .policy import RepairPolicy, auto_select_policy, build_policy_ladder
+from .policy import RepairPolicy, auto_select_policy, build_policy_ladder, escalate_policy
 
 _log = logging.getLogger(__name__)
 
@@ -58,6 +58,9 @@ class CompileResult:
     policy_name: str = ""
     pilot_report: Optional[Dict[str, Any]] = None
     failure: Optional[Dict[str, Any]] = None
+    stage_stats: List[Dict[str, Any]] = field(default_factory=list)
+    escalation_applied: bool = False
+    escalation_details: Optional[Dict[str, Any]] = None
 
 
 def _collect_metrics(
@@ -141,6 +144,7 @@ def compile_model(
     selector: str = "structural",
     failure_dir: Optional[Path] = None,
     layer_order: Optional[List[int]] = None,
+    allow_escalation: bool = True,
 ) -> CompileResult:
     """Compile a model at a specific keep_frac.
 
@@ -213,12 +217,16 @@ def compile_model(
     any_early_stopped = False
     total_repair_steps = 0
     current_policy = policy
+    stage_stats_list: List[Dict[str, Any]] = []
+    _escalation_applied = False
+    _escalation_details: Optional[Dict[str, Any]] = None
+    _consec_fail_count = 0
 
     def _curve_fn(opt_step: int) -> Dict[str, float]:
         return {
-            "ppl_w2_test": cheap_eval(model, tok, cheap_w2, device, policy.cheap_eval_max_tokens),
+            "ppl_w2_test": cheap_eval(model, tok, cheap_w2, device, current_policy.cheap_eval_max_tokens),
             "ppl_w103_valid": cheap_eval(
-                model, tok, cheap_w103, device, policy.cheap_eval_max_tokens,
+                model, tok, cheap_w103, device, current_policy.cheap_eval_max_tokens,
             ),
         }
 
@@ -248,7 +256,7 @@ def compile_model(
             }
         compressed_so_far.extend(chunk)
 
-        stage_ppl = cheap_eval(model, tok, cheap_w103, device, policy.cheap_eval_max_tokens)
+        stage_ppl = cheap_eval(model, tok, cheap_w103, device, current_policy.cheap_eval_max_tokens)
         _log.info("stage %d post-compile ppl_w103=%.2f", si + 1, stage_ppl)
 
         if STAGE_GUARDRAIL > 0 and stage_ppl > STAGE_GUARDRAIL:
@@ -262,6 +270,10 @@ def compile_model(
             break
 
         # Stage repair with best-checkpoint + never-worse invariant
+        stage_fail = False
+        stage_regression_stop = False
+        stage_nan_inf = False
+        ppl_best_stage = stage_ppl
         if current_policy.steps > 0:
             warmup_stage = min(100, current_policy.steps // 5)
             sr = repair_layers(
@@ -280,8 +292,23 @@ def compile_model(
             if sr.get("early_stopped"):
                 any_early_stopped = True
 
-            # Check if repair succeeded
-            post_ppl = cheap_eval(model, tok, cheap_w103, device, policy.cheap_eval_max_tokens)
+            ppl_best_stage = sr.get("best_metric", float("inf"))
+            stage_regression_stop = sr.get("early_stopped", False) and not sr.get("repaired_ok", True)
+            stage_nan_inf = math.isnan(ppl_best_stage) or math.isinf(ppl_best_stage)
+
+            # Failure detection uses best checkpoint metric (B1):
+            # - regression stop or never-worse rollback
+            # - nan/inf best metric
+            # - negligible improvement: Pbest >= P0 * (1 - 0.002)
+            _negligible = (
+                not stage_nan_inf
+                and stage_ppl > 0
+                and ppl_best_stage >= stage_ppl * (1.0 - 0.002)
+            )
+            if not sr.get("repaired_ok", True) or stage_nan_inf or _negligible:
+                stage_fail = True
+
+            post_ppl = cheap_eval(model, tok, cheap_w103, device, current_policy.cheap_eval_max_tokens)
 
             if not sr.get("repaired_ok", True) or math.isnan(post_ppl) or math.isinf(post_ppl):
                 _log.warning(
@@ -289,7 +316,6 @@ def compile_model(
                     "attempting downshift",
                     si + 1, sr.get("repaired_ok"), post_ppl,
                 )
-                # Rollback and try more conservative policy
                 if pre_stage_snap is not None:
                     _restore_trainable(model, compressed_so_far, pre_stage_snap)
 
@@ -323,7 +349,6 @@ def compile_model(
                 else:
                     _log.warning("no more conservative policy available")
             else:
-                # Check stage regression
                 if (
                     current_policy.regression_limit > 0
                     and stage_ppl > 0
@@ -333,7 +358,53 @@ def compile_model(
                         "stage regression: post-repair ppl=%.2f > pre-repair %.2f",
                         post_ppl, stage_ppl,
                     )
+                    improve_frac = (stage_ppl - ppl_best_stage) / stage_ppl if stage_ppl > 0 else 0.0
+                    stage_stats_list.append({
+                        "stage": si, "layers": chunk, "repair_fail": True,
+                        "ppl_pre_repair": round(stage_ppl, 4),
+                        "ppl_best": round(ppl_best_stage, 4),
+                        "improve_frac": round(improve_frac, 6),
+                        "regression_stop": stage_regression_stop,
+                        "nan_inf": stage_nan_inf,
+                    })
                     break
+
+        # Log failures for observability (only on failure to avoid spam)
+        improve_frac = (stage_ppl - ppl_best_stage) / stage_ppl if stage_ppl > 0 else 0.0
+        if stage_fail:
+            _log.info(
+                "[engine] stage_fail stage=%d layers=%s pre=%.2f best=%.2f improve=%.2f%% "
+                "regression_stop=%s",
+                si, chunk, stage_ppl, ppl_best_stage, improve_frac * 100,
+                stage_regression_stop,
+            )
+
+        stage_stats_list.append({
+            "stage": si,
+            "layers": chunk,
+            "repair_fail": stage_fail,
+            "ppl_pre_repair": round(stage_ppl, 4),
+            "ppl_best": round(ppl_best_stage, 4),
+            "improve_frac": round(improve_frac, 6),
+            "regression_stop": stage_regression_stop,
+            "nan_inf": stage_nan_inf,
+        })
+
+        # Mid-compile escalation: consecutive failure tracking (A2)
+        if stage_fail:
+            _consec_fail_count += 1
+        else:
+            _consec_fail_count = 0
+
+        if (
+            _consec_fail_count >= 2
+            and not _escalation_applied
+            and allow_escalation
+        ):
+            current_policy, _escalation_details = escalate_policy(
+                current_policy, keep_frac=keep_frac, trigger_stage=si,
+            )
+            _escalation_applied = True
 
     # Final global repair
     if current_policy.steps > 0 and not guardrail_failed and compressed_so_far:
@@ -366,6 +437,11 @@ def compile_model(
         failure_info = {"reason": "guardrail", "detail": "stage guardrail exceeded"}
         _write_failure(failure_dir, keep_frac, "guardrail", "stage guardrail exceeded")
 
+    _log.info(
+        "[engine] compile done keep=%.3f escalation_applied=%s stages=%d",
+        keep_frac, _escalation_applied, len(stage_stats_list),
+    )
+
     config = {
         "model_id": model_id,
         "keep_frac": keep_frac,
@@ -381,6 +457,11 @@ def compile_model(
         "selector": selector,
         "policy": current_policy.to_dict(),
         "layer_order": compressible if layer_order is not None else None,
+        "stage_stats": stage_stats_list,
+        "escalation": {
+            "applied": _escalation_applied,
+            "details": _escalation_details,
+        },
     }
 
     return CompileResult(
@@ -399,4 +480,7 @@ def compile_model(
         policy_name=current_policy.name,
         pilot_report=pilot_report,
         failure=failure_info,
+        stage_stats=stage_stats_list,
+        escalation_applied=_escalation_applied,
+        escalation_details=_escalation_details,
     )

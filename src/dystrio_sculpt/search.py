@@ -171,6 +171,8 @@ class FrontierSearch:
         self.layer_order: Optional[List[int]] = None
         self.evaluated: List[FrontierPoint] = []
         self._start_time: float = 0.0
+        self._escalation_applied: bool = False
+        self._tuning_report: Optional[Dict[str, Any]] = None
 
     def _time_exceeded(self) -> bool:
         if self.max_compile_hours is None:
@@ -238,7 +240,13 @@ class FrontierSearch:
             return
 
         assert self.texts is not None
-        _log.info("running policy auto-selection pilot (risk=%.3f)", self.risk_score)
+        candidates = risk_aware_keep_candidates(self.risk_score)
+        pilot_kf = 0.85 if 0.70 <= 0.85 <= 0.95 else (candidates[0] if candidates else 0.85)
+
+        _log.info(
+            "running policy auto-selection pilot (risk=%.3f, budget_hours=%s, pilot_kf=%.2f)",
+            self.risk_score, self.max_compile_hours, pilot_kf,
+        )
         self.policy, self.pilot_report = auto_select_policy(
             model_id=self.model_id,
             selector=self.selector,
@@ -251,14 +259,22 @@ class FrontierSearch:
             seed=self.seed,
             prescan_cache=self.prescan_cache,
             risk_score=self.risk_score,
+            enable_pilot_tuner=True,
+            max_compile_hours=self.max_compile_hours,
+            pilot_keep_frac=pilot_kf,
         )
+        self._tuning_report = self.pilot_report
         _log.info("policy auto-selected: %s", self.policy.name)
 
     def _evaluate(self, keep_frac: float) -> FrontierPoint:
-        _log.info("evaluating keep_frac=%.3f", keep_frac)
         assert self.texts is not None
         assert self.baseline_metrics is not None
         assert self.policy is not None
+
+        _log.info(
+            "[search] evaluating keep_frac=%.3f policy=%s",
+            keep_frac, self.policy.name,
+        )
 
         failure_subdir = (self.outdir / f"_failed_kf{keep_frac:.3f}") if self.outdir else None
         base_ppl = self.baseline_metrics["ppl_w103_valid"]
@@ -283,6 +299,7 @@ class FrontierSearch:
                 selector=self.selector,
                 failure_dir=failure_subdir,
                 layer_order=self.layer_order,
+                allow_escalation=not self._escalation_applied,
             )
         except Exception as exc:
             _log.error("compile_model failed for kf=%.3f: %s", keep_frac, exc)
@@ -295,6 +312,21 @@ class FrontierSearch:
             )
             self.evaluated.append(point)
             return point
+
+        # Persist escalated policy for subsequent keep_frac evaluations
+        if result.escalation_applied and not self._escalation_applied:
+            self._escalation_applied = True
+            # Adopt the escalated policy (stored as current_policy in config)
+            esc_cfg = result.config.get("policy", {})
+            if esc_cfg and esc_cfg.get("name", "").endswith("_esc"):
+                self.policy = RepairPolicy(**{
+                    k: v for k, v in esc_cfg.items()
+                    if k in RepairPolicy.__dataclass_fields__
+                })
+            _log.info(
+                "[search] escalation persisted: policy=%s (from keep=%.3f)",
+                self.policy.name, keep_frac,
+            )
 
         m = result.metrics_post
         base = self.baseline_metrics
