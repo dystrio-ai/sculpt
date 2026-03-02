@@ -106,6 +106,8 @@ def repair_layers(
     accum_loss_sum = 0.0
     curve_points: list[dict[str, Any]] = []
     early_stopped = False
+    _regression_stopped = False
+    _nan_inf_detected = False
 
     best_metric: float = float("inf")
     best_step: int = 0
@@ -145,6 +147,7 @@ def repair_layers(
 
         if torch.isnan(loss) or torch.isinf(loss):
             _log.warning("NaN/Inf loss at microstep %d — stopping repair", microstep)
+            _nan_inf_detected = True
             early_stopped = True
             break
 
@@ -186,6 +189,7 @@ def repair_layers(
             val = pt.get(early_stop_key, float("inf"))
             if math.isnan(val) or math.isinf(val):
                 _log.warning("NaN/Inf metric at step %d — stopping", opt_step)
+                _nan_inf_detected = True
                 early_stopped = True
                 break
 
@@ -215,6 +219,7 @@ def repair_layers(
                     "regression stop at step %d: %s=%.2f exceeds best %.2f by >%.0f%%",
                     opt_step, early_stop_key, val, best_metric, regression_limit * 100,
                 )
+                _regression_stopped = True
                 early_stopped = True
                 break
 
@@ -263,4 +268,6 @@ def repair_layers(
         "best_metric": best_metric,
         "best_step": best_step,
         "repaired_ok": repaired_ok,
+        "regression_stop_triggered": _regression_stopped,
+        "nan_inf_detected": _nan_inf_detected,
     }

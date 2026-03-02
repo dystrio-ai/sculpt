@@ -159,6 +159,12 @@ def sculpt(
             wall_time_s=cr.wall_time_s,
             pilot_report=cr.pilot_report,
             risk_score=pt.risk_score,
+            peak_cuda_allocated_compile_bytes=cr.peak_cuda_allocated_compile_bytes,
+            peak_cuda_reserved_compile_bytes=cr.peak_cuda_reserved_compile_bytes,
+            peak_cuda_allocated_bench_bytes=cr.peak_cuda_allocated_bench_bytes,
+            peak_cuda_reserved_bench_bytes=cr.peak_cuda_reserved_bench_bytes,
+            cuda_allocated_end_bytes=cr.cuda_allocated_end_bytes,
+            cuda_reserved_end_bytes=cr.cuda_reserved_end_bytes,
         )
 
         model_dir = point_dir / "model"

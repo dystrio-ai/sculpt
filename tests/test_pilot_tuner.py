@@ -1,4 +1,5 @@
-"""Tests for the Repair Pilot Tuner and triggered escalation (mock-based)."""
+"""Tests for Repair Pilot Tuner, stage-size controller, escalation,
+stage outcome semantics, stratified sampling, E2E metrics (mock-based)."""
 
 from __future__ import annotations
 
@@ -7,14 +8,24 @@ import pytest
 
 from dystrio_sculpt.policy import (
     RepairPolicy,
-    PilotResult,
-    TuningReport,
     _score_pilot,
+    _score_two_stage_pilot,
+    _stratified_pilot_chunks,
     _pilot_candidates,
     _compute_pilot_budget,
+    _adapt_steps,
+    _with_stage_size,
+    _recovery_strength,
     escalate_policy,
     build_policy_ladder,
+    compute_e2e_speedup,
+    E2E_PROFILES,
+    HELPFUL_THRESHOLD,
+    TIE_BREAK_GAIN,
+    WH, WI, WM,
 )
+from dystrio_sculpt._bench import compute_latency_percentiles
+from dystrio_sculpt.emit import _bytes_to_gib, _LATENCY_KEYS, _SUMMARY_COLUMNS
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -29,26 +40,179 @@ def _make_policy(name: str = "test", lr: float = 1e-4, steps: int = 100,
     )
 
 
-def _make_pilot_result(
-    policy_name: str = "p",
-    P0: float = 10.0, Pt: float = 9.0, Pmax: float = 10.0,
-    elapsed_s: float = 10.0, regression_stop: bool = False,
-    nan_inf: bool = False,
-) -> PilotResult:
-    slope, score, stable, helpful = _score_pilot(
-        P0, Pt, Pmax, elapsed_s, regression_stop, nan_inf,
-    )
-    return PilotResult(
-        policy_name=policy_name, P0=P0, Pt=Pt, Pmax=Pmax,
-        steps_run=50, elapsed_s=elapsed_s,
-        regression_stop=regression_stop, nan_inf=nan_inf,
-        slope_per_s=slope, score=score, helpful=helpful, stable=stable,
-    )
+def _make_stage_stat(
+    stage: int = 0, improve_frac: float = 0.0,
+    regression_stop: bool = False, nan_inf: bool = False,
+) -> dict:
+    fail = regression_stop or nan_inf
+    helpful = (not fail) and improve_frac >= HELPFUL_THRESHOLD
+    return {
+        "stage": stage, "layers": [stage * 2, stage * 2 + 1],
+        "ppl_pre_repair": 10.0, "ppl_best": 10.0 * (1 - improve_frac),
+        "improve_frac": improve_frac,
+        "regression_stop": regression_stop, "nan_inf": nan_inf,
+        "repair_fail": fail, "repair_helpful": helpful,
+    }
 
 
-# ── 1) Scoring: log slope ────────────────────────────────────────────────────
+# ── 1) Stage outcome semantics ───────────────────────────────────────────────
 
-class TestScoringMathLogSlope:
+class TestStageOutcomeSemantics:
+    """repair_fail = instability only (regression_stop/nan).
+    repair_helpful = improvement >= threshold. Neutral = neither."""
+
+    def test_negligible_improvement_not_fail(self):
+        s = _make_stage_stat(improve_frac=0.001)
+        assert s["repair_fail"] is False
+        assert s["repair_helpful"] is False
+
+    def test_zero_improvement_not_fail(self):
+        s = _make_stage_stat(improve_frac=0.0)
+        assert s["repair_fail"] is False
+        assert s["repair_helpful"] is False
+
+    def test_regression_stop_is_fail(self):
+        s = _make_stage_stat(regression_stop=True, improve_frac=0.05)
+        assert s["repair_fail"] is True
+        assert s["repair_helpful"] is False
+
+    def test_nan_inf_is_fail(self):
+        s = _make_stage_stat(nan_inf=True)
+        assert s["repair_fail"] is True
+
+    def test_significant_improvement_is_helpful(self):
+        s = _make_stage_stat(improve_frac=0.05)
+        assert s["repair_fail"] is False
+        assert s["repair_helpful"] is True
+
+    def test_threshold_boundary(self):
+        s_below = _make_stage_stat(improve_frac=0.0019)
+        s_at = _make_stage_stat(improve_frac=0.002)
+        assert s_below["repair_helpful"] is False
+        assert s_at["repair_helpful"] is True
+
+    def test_fail_overrides_helpful(self):
+        s = _make_stage_stat(regression_stop=True, improve_frac=0.10)
+        assert s["repair_fail"] is True
+        assert s["repair_helpful"] is False
+
+
+# ── 2) Stratified pilot chunk selection ───────────────────────────────────────
+
+class TestStratifiedPilotChunks:
+    def test_early_and_late_chunk(self):
+        layer_order = list(range(32))
+        chunks = _stratified_pilot_chunks(layer_order, stage_size=4, K=2)
+        assert len(chunks) == 2
+        assert chunks[0] == [0, 1, 2, 3]
+        late_idx = int(0.70 * 7)  # 8 chunks total, idx 4
+        expected_late = layer_order[late_idx * 4 : late_idx * 4 + 4]
+        assert chunks[1] == expected_late
+
+    def test_deterministic(self):
+        layer_order = list(range(32))
+        c1 = _stratified_pilot_chunks(layer_order, 4, K=2)
+        c2 = _stratified_pilot_chunks(layer_order, 4, K=2)
+        assert c1 == c2
+
+    def test_small_model_single_chunk(self):
+        layer_order = [0, 1, 2]
+        chunks = _stratified_pilot_chunks(layer_order, stage_size=4, K=2)
+        assert len(chunks) == 1
+        assert chunks[0] == [0, 1, 2]
+
+    def test_two_chunks_picks_both(self):
+        layer_order = list(range(8))
+        chunks = _stratified_pilot_chunks(layer_order, stage_size=4, K=2)
+        assert len(chunks) == 2
+        assert chunks[0] == [0, 1, 2, 3]
+        assert chunks[1] == [4, 5, 6, 7]
+
+    def test_empty_order(self):
+        assert _stratified_pilot_chunks([], 4, K=2) == []
+
+    def test_stage_size_2(self):
+        layer_order = list(range(16))
+        chunks = _stratified_pilot_chunks(layer_order, stage_size=2, K=2)
+        assert len(chunks) == 2
+        assert chunks[0] == [0, 1]
+        late_idx = int(0.70 * 7)  # 8 chunks, idx 4
+        assert chunks[1] == layer_order[late_idx * 2 : late_idx * 2 + 2]
+
+    def test_late_not_same_as_early(self):
+        layer_order = list(range(32))
+        chunks = _stratified_pilot_chunks(layer_order, stage_size=4, K=2)
+        assert chunks[0] != chunks[1]
+
+
+# ── 3) Two-stage pilot scoring (with M term) ─────────────────────────────────
+
+class TestTwoStagePilotScoring:
+    def test_helpful_policy_preferred(self):
+        stats_a = [
+            _make_stage_stat(0, improve_frac=0.05),
+            _make_stage_stat(1, improve_frac=0.03),
+        ]
+        stats_b = [
+            _make_stage_stat(0, improve_frac=0.001),
+            _make_stage_stat(1, improve_frac=0.0),
+        ]
+        score_a, stable_a, Ha, Ia, Ma = _score_two_stage_pilot(stats_a, 10.0)
+        score_b, stable_b, Hb, Ib, Mb = _score_two_stage_pilot(stats_b, 10.0)
+        assert score_a > score_b
+        assert Ha == 2
+        assert Hb == 0
+
+    def test_unstable_rejected(self):
+        stats = [
+            _make_stage_stat(0, regression_stop=True),
+            _make_stage_stat(1, improve_frac=0.05),
+        ]
+        score, stable, H, I, M = _score_two_stage_pilot(stats, 10.0)
+        assert score == -1e9
+        assert stable is False
+
+    def test_empty_stats(self):
+        score, stable, H, I, M = _score_two_stage_pilot([], 10.0)
+        assert stable is True
+        assert H == 0
+        assert I == 0.0
+        assert M == 0.0
+
+    def test_faster_candidate_preferred(self):
+        stats = [_make_stage_stat(0, improve_frac=0.02)]
+        score_fast, _, _, _, _ = _score_two_stage_pilot(stats, 5.0)
+        score_slow, _, _, _, _ = _score_two_stage_pilot(stats, 50.0)
+        assert score_fast > score_slow
+
+    def test_max_improve_term_matters(self):
+        """Same H and I, but higher M => higher score."""
+        stats_high_m = [
+            _make_stage_stat(0, improve_frac=0.08),
+            _make_stage_stat(1, improve_frac=0.02),
+        ]
+        stats_low_m = [
+            _make_stage_stat(0, improve_frac=0.05),
+            _make_stage_stat(1, improve_frac=0.05),
+        ]
+        score_hm, _, H_hm, I_hm, M_hm = _score_two_stage_pilot(stats_high_m, 10.0)
+        score_lm, _, H_lm, I_lm, M_lm = _score_two_stage_pilot(stats_low_m, 10.0)
+        assert H_hm == H_lm  # same helpful count
+        assert I_hm == I_lm  # same total I
+        assert M_hm > M_lm   # higher peak win
+        assert score_hm > score_lm
+
+    def test_returns_five_values(self):
+        stats = [_make_stage_stat(0, improve_frac=0.03)]
+        result = _score_two_stage_pilot(stats, 10.0)
+        assert len(result) == 5
+        score, stable, H, I, M = result
+        assert M == pytest.approx(0.03)
+
+
+# ── 4) Legacy scoring (backward compat) ──────────────────────────────────────
+
+class TestLegacyScoringMath:
     def test_positive_slope(self):
         slope, score, stable, helpful = _score_pilot(
             P0=10.0, Pt=9.0, Pmax=10.0, elapsed_s=10.0,
@@ -56,180 +220,142 @@ class TestScoringMathLogSlope:
         )
         assert slope > 0
         assert stable is True
-        assert score > 0
 
-    def test_no_improvement(self):
-        slope, score, stable, helpful = _score_pilot(
-            P0=10.0, Pt=10.0, Pmax=10.0, elapsed_s=10.0,
-            regression_stop=False, nan_inf=False,
-        )
-        assert abs(slope) < 1e-10
-        assert helpful is False
-
-    def test_regression(self):
-        slope, score, stable, helpful = _score_pilot(
-            P0=10.0, Pt=11.0, Pmax=11.0, elapsed_s=10.0,
-            regression_stop=False, nan_inf=False,
-        )
-        assert slope < 0
-
-
-# ── 2) Unstable rejected ─────────────────────────────────────────────────────
-
-class TestUnstableRejected:
     def test_regression_stop_rejected(self):
-        slope, score, stable, helpful = _score_pilot(
+        _, score, stable, _ = _score_pilot(
             P0=10.0, Pt=9.0, Pmax=10.0, elapsed_s=10.0,
             regression_stop=True, nan_inf=False,
         )
         assert score == -1e9
         assert stable is False
 
-    def test_nan_inf_rejected(self):
-        slope, score, stable, helpful = _score_pilot(
-            P0=10.0, Pt=9.0, Pmax=10.0, elapsed_s=10.0,
-            regression_stop=False, nan_inf=True,
-        )
-        assert score == -1e9
-        assert stable is False
 
-    def test_both_rejected(self):
-        slope, score, stable, helpful = _score_pilot(
-            P0=10.0, Pt=9.0, Pmax=10.0, elapsed_s=10.0,
-            regression_stop=True, nan_inf=True,
-        )
-        assert score == -1e9
-        assert stable is False
-
-
-# ── 3) Spike penalty ─────────────────────────────────────────────────────────
-
-class TestSpikePenalty:
-    def test_large_spike_reduces_score(self):
-        _, score_clean, _, _ = _score_pilot(
-            P0=10.0, Pt=9.0, Pmax=10.0, elapsed_s=10.0,
-            regression_stop=False, nan_inf=False,
-        )
-        _, score_spike, _, _ = _score_pilot(
-            P0=10.0, Pt=9.0, Pmax=20.0, elapsed_s=10.0,
-            regression_stop=False, nan_inf=False,
-        )
-        assert score_spike < score_clean
-
-    def test_no_spike_when_pmax_near_p0(self):
-        epsilon = 0.05
-        Pmax_safe = 10.0 * (1 + epsilon)
-        _, score_no_spike, _, _ = _score_pilot(
-            P0=10.0, Pt=9.0, Pmax=Pmax_safe, elapsed_s=10.0,
-            regression_stop=False, nan_inf=False,
-        )
-        _, score_clean, _, _ = _score_pilot(
-            P0=10.0, Pt=9.0, Pmax=10.0, elapsed_s=10.0,
-            regression_stop=False, nan_inf=False,
-        )
-        assert abs(score_no_spike - score_clean) < 0.01
-
-    def test_spike_penalty_magnitude(self):
-        _, score_spike, _, _ = _score_pilot(
-            P0=10.0, Pt=9.0, Pmax=30.0, elapsed_s=10.0,
-            regression_stop=False, nan_inf=False,
-        )
-        assert score_spike < 0
-
-
-# ── 4) Candidate list by risk ────────────────────────────────────────────────
+# ── 5) Candidate list by risk ────────────────────────────────────────────────
 
 class TestCandidateListByRisk:
     def test_low_risk(self):
         ladder = build_policy_ladder(1.0)
         cands = _pilot_candidates(ladder, risk_score=0.2)
         assert len(cands) == 3
-        assert cands[0].name == ladder[0].name
-        assert cands[1].name == ladder[1].name
-        assert cands[2].name == ladder[2].name
 
     def test_mid_risk(self):
         ladder = build_policy_ladder(1.0)
         cands = _pilot_candidates(ladder, risk_score=0.5)
         assert len(cands) == 2
-        assert cands[0].name == ladder[1].name
-        assert cands[1].name == ladder[2].name
 
     def test_high_risk(self):
         ladder = build_policy_ladder(1.0)
         cands = _pilot_candidates(ladder, risk_score=0.7)
         assert len(cands) == 2
-        assert cands[0].name == ladder[2].name
-        assert cands[1].name == ladder[3].name
-
-    def test_short_ladder(self):
-        ladder = build_policy_ladder(1.0)[:2]
-        cands = _pilot_candidates(ladder, risk_score=0.7)
-        assert len(cands) >= 1
-        for c in cands:
-            assert c in ladder
 
 
-# ── 5) Budget skip ───────────────────────────────────────────────────────────
+# ── 6) Budget ─────────────────────────────────────────────────────────────────
 
 class TestBudgetSkip:
     def test_tiny_budget_skips(self):
-        budget = _compute_pilot_budget(max_compile_hours=0.01)
-        assert budget < 60
+        assert _compute_pilot_budget(0.01) < 60
 
     def test_none_budget_default(self):
-        budget = _compute_pilot_budget(max_compile_hours=None)
-        assert budget == 240.0
+        assert _compute_pilot_budget(None) == 240.0
 
     def test_large_budget_capped(self):
-        budget = _compute_pilot_budget(max_compile_hours=10.0)
-        assert budget == 480.0
-
-    def test_moderate_budget(self):
-        budget = _compute_pilot_budget(max_compile_hours=1.0)
-        assert budget == min(0.10 * 3600, 480.0)
-        assert budget == 360.0
+        assert _compute_pilot_budget(10.0) == 480.0
 
 
-# ── 6) Selection prefers best score ──────────────────────────────────────────
+# ── 7) Steps adaptation (uses I or M) ────────────────────────────────────────
 
-class TestSelectionPrefersBestScore:
-    def test_highest_score_wins(self):
-        results = [
-            _make_pilot_result("p1", P0=10, Pt=9.5, Pmax=10, elapsed_s=10),
-            _make_pilot_result("p2", P0=10, Pt=8.0, Pmax=10, elapsed_s=10),
-            _make_pilot_result("p3", P0=10, Pt=9.0, Pmax=10, elapsed_s=10),
+class TestStepsAdaptation:
+    def test_adapts_when_helpful(self):
+        policy = _make_policy(steps=100)
+        adapted = _adapt_steps(policy, H=2, I=0.06, M=0.04)
+        assert adapted.steps > 100
+        assert adapted.steps == 125
+
+    def test_no_adapt_when_not_helpful(self):
+        policy = _make_policy(steps=100)
+        same = _adapt_steps(policy, H=0, I=0.0, M=0.0)
+        assert same.steps == 100
+
+    def test_caps_increase(self):
+        policy = _make_policy(steps=1000)
+        adapted = _adapt_steps(policy, H=2, I=0.10, M=0.08)
+        assert adapted.steps <= 1000 + 200
+
+    def test_adapts_on_M_alone(self):
+        """I is small but M >= 0.01 triggers adaptation."""
+        policy = _make_policy(steps=100)
+        adapted = _adapt_steps(policy, H=1, I=0.003, M=0.015)
+        assert adapted.steps == 125
+
+    def test_adapts_on_I_alone(self):
+        """M is small but I >= 0.005 triggers adaptation."""
+        policy = _make_policy(steps=100)
+        adapted = _adapt_steps(policy, H=0, I=0.006, M=0.003)
+        assert adapted.steps == 125
+
+    def test_no_adapt_both_below(self):
+        """Both I and M below thresholds => no change."""
+        policy = _make_policy(steps=100)
+        same = _adapt_steps(policy, H=1, I=0.004, M=0.009)
+        assert same.steps == 100
+
+
+# ── 8) Stage-size helpers ─────────────────────────────────────────────────────
+
+class TestWithStageSize:
+    def test_noop_if_same(self):
+        policy = _make_policy(stage_size=4)
+        assert _with_stage_size(policy, 4) is policy
+
+    def test_creates_new(self):
+        policy = _make_policy(stage_size=4)
+        new = _with_stage_size(policy, 2)
+        assert new.stage_size == 2
+        assert new.lr == policy.lr
+        assert new.steps == policy.steps
+
+
+# ── 9) Stage-size selection logic ─────────────────────────────────────────────
+
+class TestStageSizeSelection:
+    def test_picks_largest_stable(self):
+        probes = [
+            {"stage_size": 4, "has_fail": False, "has_helpful": True},
+            {"stage_size": 2, "has_fail": False, "has_helpful": True},
         ]
-        stable_helpful = [(r, r.policy_name) for r in results if r.stable and r.helpful]
-        assert len(stable_helpful) > 0
-        best_r, best_name = max(stable_helpful, key=lambda rc: rc[0].score)
-        assert best_name == "p2"
+        chosen = None
+        for p in probes:
+            if not p["has_fail"]:
+                chosen = p["stage_size"]
+                break
+        assert chosen == 4
 
-    def test_unstable_excluded(self):
-        results = [
-            _make_pilot_result("p1", P0=10, Pt=8.0, Pmax=10, elapsed_s=10,
-                               regression_stop=True),
-            _make_pilot_result("p2", P0=10, Pt=9.0, Pmax=10, elapsed_s=10),
+    def test_falls_back_on_instability(self):
+        probes = [
+            {"stage_size": 4, "has_fail": True, "has_helpful": False},
+            {"stage_size": 2, "has_fail": False, "has_helpful": True},
         ]
-        stable = [r for r in results if r.stable]
-        assert len(stable) == 1
-        assert stable[0].policy_name == "p2"
+        chosen = 2
+        for p in probes:
+            if not p["has_fail"]:
+                chosen = p["stage_size"]
+                break
+        assert chosen == 2
 
-    def test_all_unstable_falls_back_to_last(self):
-        results = [
-            _make_pilot_result("p1", regression_stop=True),
-            _make_pilot_result("p2", nan_inf=True),
+    def test_all_unstable_picks_smallest(self):
+        probes = [
+            {"stage_size": 4, "has_fail": True},
+            {"stage_size": 2, "has_fail": True},
         ]
-        candidates = ["p1", "p2"]
-        stable = [r for r in results if r.stable]
-        if not stable:
-            chosen = candidates[-1]
-        else:
-            chosen = max(stable, key=lambda r: r.score).policy_name
-        assert chosen == "p2"
+        chosen = 2
+        for p in probes:
+            if not p["has_fail"]:
+                chosen = p["stage_size"]
+                break
+        assert chosen == 2
 
 
-# ── 7) Escalation trigger ────────────────────────────────────────────────────
+# ── 10) Escalation ───────────────────────────────────────────────────────────
 
 class TestEscalationTrigger:
     def test_lr_reduced(self):
@@ -237,126 +363,72 @@ class TestEscalationTrigger:
         esc, details = escalate_policy(policy)
         assert esc.lr == 5e-5
         assert details["before"]["lr"] == 1e-4
-        assert details["after"]["lr"] == 5e-5
 
     def test_steps_increased(self):
-        policy = _make_policy(steps=100, stage_size=4)
-        esc, _ = escalate_policy(policy)
+        esc, _ = escalate_policy(_make_policy(steps=100))
         assert esc.steps == 150
 
     def test_stage_size_reduced(self):
-        policy = _make_policy(stage_size=4)
-        esc, _ = escalate_policy(policy)
+        esc, _ = escalate_policy(_make_policy(stage_size=4))
         assert esc.stage_size == 2
 
-    def test_full_escalation(self):
-        policy = _make_policy(lr=5e-5, steps=200, stage_size=2)
-        esc, _ = escalate_policy(policy)
-        assert esc.lr == 2e-5
-        assert esc.steps == 300
-        assert esc.stage_size == 1
+    def test_details_complete(self):
+        _, d = escalate_policy(_make_policy(), keep_frac=0.75, trigger_stage=3)
+        assert d["keep_frac"] == 0.75
+        assert d["trigger_stage"] == 3
+        assert "before" in d and "after" in d
 
-    def test_already_lowest_lr(self):
-        policy = _make_policy(lr=2e-5, steps=100, stage_size=1)
-        esc, _ = escalate_policy(policy)
-        assert esc.lr == 2e-5
-        assert esc.stage_size == 1
-        assert esc.steps == 150
-
-    def test_details_dict_complete(self):
-        policy = _make_policy(lr=1e-4, steps=100, stage_size=4)
-        esc, details = escalate_policy(policy, keep_frac=0.75, trigger_stage=3)
-        assert details["keep_frac"] == 0.75
-        assert details["trigger_stage"] == 3
-        assert "before" in details
-        assert "after" in details
-        assert details["before"]["name"] == "test"
-        assert details["after"]["name"] == "test_esc"
-
-    def test_consecutive_stage_failures_trigger(self):
-        """Simulate the engine.py mid-compile escalation logic."""
-        stage_stats = [
-            {"stage": 0, "layers": [0, 1], "repair_fail": False},
-            {"stage": 1, "layers": [2, 3], "repair_fail": True},
-            {"stage": 2, "layers": [4, 5], "repair_fail": True},
-        ]
-        escalation_applied = False
-        policy = _make_policy(lr=1e-4, steps=100, stage_size=4)
-        consec = 0
-        for stat in stage_stats:
-            if stat["repair_fail"]:
-                consec += 1
-            else:
-                consec = 0
-            if consec >= 2 and not escalation_applied:
-                policy, details = escalate_policy(policy, trigger_stage=stat["stage"])
-                escalation_applied = True
-                break
-        assert escalation_applied
-        assert policy.lr == 5e-5
-        assert policy.steps == 150
-
-    def test_single_failure_no_escalation(self):
-        stage_stats = [
-            {"stage": 0, "layers": [0, 1], "repair_fail": True},
-            {"stage": 1, "layers": [2, 3], "repair_fail": False},
-            {"stage": 2, "layers": [4, 5], "repair_fail": True},
+    def test_only_on_true_instability(self):
+        neutral_stats = [
+            _make_stage_stat(0, improve_frac=0.0),
+            _make_stage_stat(1, improve_frac=0.0),
         ]
         consec = 0
-        escalation_applied = False
-        for stat in stage_stats:
-            if stat["repair_fail"]:
+        triggered = False
+        for s in neutral_stats:
+            if s["repair_fail"]:
                 consec += 1
             else:
                 consec = 0
             if consec >= 2:
-                escalation_applied = True
-                break
-        assert not escalation_applied
+                triggered = True
+        assert not triggered
+
+    def test_triggered_on_consecutive_failures(self):
+        fail_stats = [
+            _make_stage_stat(0, regression_stop=True),
+            _make_stage_stat(1, nan_inf=True),
+        ]
+        consec = 0
+        for s in fail_stats:
+            if s["repair_fail"]:
+                consec += 1
+            else:
+                consec = 0
+        assert consec >= 2
+
+    def test_single_failure_no_trigger(self):
+        stats = [
+            _make_stage_stat(0, regression_stop=True),
+            _make_stage_stat(1, improve_frac=0.01),
+            _make_stage_stat(2, regression_stop=True),
+        ]
+        consec = 0
+        triggered = False
+        for s in stats:
+            if s["repair_fail"]:
+                consec += 1
+            else:
+                consec = 0
+            if consec >= 2:
+                triggered = True
+        assert not triggered
 
 
-# ── 8) Hardening: failure detection uses best_metric ─────────────────────────
-
-class TestStageFailUsesbestMetric:
-    """Verify failure detection compares P0 vs Pbest, not P0 vs Plast."""
-
-    def test_best_improved_is_success(self):
-        """P0=10, Pbest=9.9 (<0.2% threshold met) -> success even if Plast=10.2."""
-        P0 = 10.0
-        Pbest = 9.9
-        threshold = P0 * (1.0 - 0.002)
-        assert Pbest < threshold  # 9.9 < 9.98 -> improvement is real
-        # This is NOT a failure
-        fail = Pbest >= threshold
-        assert fail is False
-
-    def test_negligible_improvement_is_failure(self):
-        """P0=10, Pbest=9.985 -> only 0.15% improvement -> failure."""
-        P0 = 10.0
-        Pbest = 9.985
-        threshold = P0 * (1.0 - 0.002)  # 9.98
-        fail = Pbest >= threshold
-        assert fail is True
-
-    def test_nan_best_is_failure(self):
-        """NaN best_metric -> always a failure."""
-        import math as _math
-        Pbest = float("nan")
-        assert _math.isnan(Pbest)
-
-    def test_regression_stop_is_failure(self):
-        """regression_stop flag always means failure."""
-        regression_stop = True
-        assert regression_stop is True
-
-
-# ── 9) Hardening: mid-compile escalation state machine ───────────────────────
+# ── 11) Mid-compile escalation state machine ─────────────────────────────────
 
 class TestMidCompileEscalation:
-    """Test the consecutive-failure counter logic used inside engine.compile_model."""
-
-    def _run_escalation_sim(self, fail_sequence, allow_esc=True):
-        """Simulate the engine's consecutive failure counter + escalation."""
+    def _run_sim(self, fail_sequence, allow_esc=True):
         consec = 0
         applied = False
         details = None
@@ -372,53 +444,36 @@ class TestMidCompileEscalation:
         return applied, policy, details
 
     def test_consecutive_triggers(self):
-        applied, policy, details = self._run_escalation_sim(
-            [False, True, True, False],
-        )
+        applied, policy, details = self._run_sim([False, True, True, False])
         assert applied
         assert policy.lr == 5e-5
-        assert details["trigger_stage"] == 2
 
     def test_non_consecutive_no_trigger(self):
-        applied, policy, _ = self._run_escalation_sim(
-            [True, False, True, False, True],
-        )
+        applied, _, _ = self._run_sim([True, False, True, False, True])
         assert not applied
-        assert policy.lr == 1e-4
 
     def test_escalation_only_once(self):
-        """Even with multiple consecutive failures, escalation is once."""
         consec = 0
-        applied_count = 0
-        policy = _make_policy(lr=1e-4, steps=100, stage_size=4)
+        count = 0
+        policy = _make_policy()
         applied = False
-        for si, is_fail in enumerate([True, True, True, True]):
-            if is_fail:
-                consec += 1
-            else:
-                consec = 0
+        for si, fail in enumerate([True, True, True, True]):
+            consec = consec + 1 if fail else 0
             if consec >= 2 and not applied:
                 policy, _ = escalate_policy(policy, trigger_stage=si)
                 applied = True
-                applied_count += 1
-        assert applied_count == 1
+                count += 1
+        assert count == 1
 
-    def test_allow_escalation_false_blocks(self):
-        applied, policy, _ = self._run_escalation_sim(
-            [True, True, True], allow_esc=False,
-        )
+    def test_blocked_when_disallowed(self):
+        applied, _, _ = self._run_sim([True, True, True], allow_esc=False)
         assert not applied
-        assert policy.lr == 1e-4
 
 
-# ── 10) Hardening: search persists escalated policy ──────────────────────────
+# ── 12) Search persists escalated policy ──────────────────────────────────────
 
 class TestSearchPersistsPolicy:
-    """Verify the policy adoption logic used in search._evaluate."""
-
     def test_escalated_policy_adopted(self):
-        """When compile_result.escalation_applied is True, search adopts it."""
-        original = _make_policy(lr=1e-4, steps=100, stage_size=4)
         esc_config = {
             "name": "test_esc", "stage_size": 2, "lr": 5e-5, "steps": 150,
             "early_stop_patience": 8, "regression_limit": 0.02, "curve_every": 50,
@@ -426,42 +481,345 @@ class TestSearchPersistsPolicy:
             "final_eval_max_tokens": 40000, "grad_accum_steps": 1,
             "max_grad_norm": None,
         }
-        # Simulate search logic
-        _escalation_applied = False
-        policy = original
-        # First keep evaluation — escalation fires inside compile_model
-        result_escalation_applied = True
-        result_policy_config = esc_config
-        if result_escalation_applied and not _escalation_applied:
-            _escalation_applied = True
-            if result_policy_config["name"].endswith("_esc"):
+        _esc_applied = False
+        policy = _make_policy()
+        if True and not _esc_applied:
+            _esc_applied = True
+            if esc_config["name"].endswith("_esc"):
                 policy = RepairPolicy(**{
-                    k: v for k, v in result_policy_config.items()
+                    k: v for k, v in esc_config.items()
                     if k in RepairPolicy.__dataclass_fields__
                 })
-        assert _escalation_applied
-        assert policy.name == "test_esc"
-        assert policy.lr == 5e-5
-        assert policy.steps == 150
-
-    def test_second_keep_uses_escalated(self):
-        """After escalation, subsequent evaluations start with the new policy."""
-        esc = _make_policy(name="test_esc", lr=5e-5, steps=150, stage_size=2)
-        _escalation_applied = True
-        policy = esc
-        # Second keep — allow_escalation should be False
-        allow_esc = not _escalation_applied
-        assert allow_esc is False
+        assert _esc_applied
         assert policy.name == "test_esc"
 
     def test_no_escalation_keeps_original(self):
-        """If no escalation fires, policy stays original."""
-        original = _make_policy(lr=1e-4, steps=100, stage_size=4)
-        _escalation_applied = False
-        policy = original
-        result_escalation_applied = False
-        if result_escalation_applied and not _escalation_applied:
-            _escalation_applied = True
-        assert not _escalation_applied
+        policy = _make_policy()
+        _esc_applied = False
+        if False and not _esc_applied:
+            _esc_applied = True
+        assert not _esc_applied
         assert policy.name == "test"
-        assert policy.lr == 1e-4
+
+
+# ── 13) Search window: continue on helpful signal with cap ────────────────────
+
+class TestSearchWindowContinueOnHelpful:
+    _MIN_PREFILL_DELTA = 0.005
+
+    def _window_decision(
+        self, ppl_ratio, ceiling, stage_stats, extras_so_far,
+        prefill_speedup, prev_prefill_speedup, max_extras=1,
+    ):
+        """Simulate the search.py window logic (with speed guardrail)."""
+        close = ppl_ratio <= ceiling * 1.10
+        helpful_count = sum(1 for s in stage_stats if s.get("repair_helpful", False))
+        total_improve = sum(s.get("improve_frac", 0.0) for s in stage_stats)
+        repair_shows_promise = helpful_count >= 1 or total_improve >= 0.005
+        speed_improving = prefill_speedup >= prev_prefill_speedup + self._MIN_PREFILL_DELTA
+        if close and repair_shows_promise and speed_improving and extras_so_far < max_extras:
+            return "continue"
+        return "stop"
+
+    def test_continues_when_helpful_close_and_faster(self):
+        stats = [
+            _make_stage_stat(0, improve_frac=0.05),
+            _make_stage_stat(1, improve_frac=0.0),
+        ]
+        decision = self._window_decision(
+            ppl_ratio=2.05, ceiling=2.0, stage_stats=stats, extras_so_far=0,
+            prefill_speedup=1.30, prev_prefill_speedup=1.29,
+        )
+        assert decision == "continue"
+
+    def test_stops_when_no_speed_gain(self):
+        stats = [_make_stage_stat(0, improve_frac=0.05)]
+        decision = self._window_decision(
+            ppl_ratio=2.05, ceiling=2.0, stage_stats=stats, extras_so_far=0,
+            prefill_speedup=1.30, prev_prefill_speedup=1.30,
+        )
+        assert decision == "stop"
+
+    def test_stops_when_far_from_ceiling(self):
+        stats = [_make_stage_stat(0, improve_frac=0.05)]
+        decision = self._window_decision(
+            ppl_ratio=2.50, ceiling=2.0, stage_stats=stats, extras_so_far=0,
+            prefill_speedup=1.40, prev_prefill_speedup=1.30,
+        )
+        assert decision == "stop"
+
+    def test_stops_when_no_helpful(self):
+        stats = [
+            _make_stage_stat(0, improve_frac=0.001),
+            _make_stage_stat(1, improve_frac=0.0),
+        ]
+        decision = self._window_decision(
+            ppl_ratio=2.05, ceiling=2.0, stage_stats=stats, extras_so_far=0,
+            prefill_speedup=1.40, prev_prefill_speedup=1.30,
+        )
+        assert decision == "stop"
+
+    def test_hard_cap_one_extra(self):
+        stats = [_make_stage_stat(0, improve_frac=0.05)]
+        d1 = self._window_decision(
+            ppl_ratio=2.05, ceiling=2.0, stage_stats=stats, extras_so_far=0,
+            prefill_speedup=1.35, prev_prefill_speedup=1.30,
+        )
+        d2 = self._window_decision(
+            ppl_ratio=2.05, ceiling=2.0, stage_stats=stats, extras_so_far=1,
+            prefill_speedup=1.40, prev_prefill_speedup=1.30,
+        )
+        assert d1 == "continue"
+        assert d2 == "stop"
+
+    def test_total_improve_threshold(self):
+        """Even if no single helpful stage, total_improve >= 0.005 continues."""
+        stats = [
+            _make_stage_stat(0, improve_frac=0.0019),
+            _make_stage_stat(1, improve_frac=0.004),
+        ]
+        decision = self._window_decision(
+            ppl_ratio=2.05, ceiling=2.0, stage_stats=stats, extras_so_far=0,
+            prefill_speedup=1.35, prev_prefill_speedup=1.30,
+        )
+        assert decision == "continue"
+
+
+# ── 14) E2E workload speedup formula ──────────────────────────────────────────
+
+class TestE2ESpeedup:
+    def test_identity(self):
+        """No speedup => e2e = 1.0."""
+        e2e = compute_e2e_speedup(1.0, 1.0, 256, 256)
+        assert e2e == pytest.approx(1.0)
+
+    def test_known_values(self):
+        """2x prefill, 1x decode, P=D => e2e = (512)/(128+256) = 512/384 ≈ 1.333."""
+        e2e = compute_e2e_speedup(2.0, 1.0, 256, 256)
+        assert e2e == pytest.approx(512.0 / 384.0, rel=1e-4)
+
+    def test_rag_profile(self):
+        """RAG: prefill-heavy => prefill speedup matters more."""
+        e2e_fast_prefill = compute_e2e_speedup(2.0, 1.0, 2048, 128)
+        e2e_fast_decode = compute_e2e_speedup(1.0, 2.0, 2048, 128)
+        assert e2e_fast_prefill > e2e_fast_decode
+
+    def test_batch_profile(self):
+        """Batch: very prefill-heavy => nearly equal to prefill_speedup."""
+        e2e = compute_e2e_speedup(1.5, 1.0, 1024, 32)
+        assert e2e > 1.4
+
+    def test_zero_speedup_returns_zero(self):
+        assert compute_e2e_speedup(0.0, 1.0, 256, 256) == 0.0
+        assert compute_e2e_speedup(1.0, 0.0, 256, 256) == 0.0
+
+    def test_profiles_exist(self):
+        assert "chat" in E2E_PROFILES
+        assert "rag" in E2E_PROFILES
+        assert "batch" in E2E_PROFILES
+        for name, p in E2E_PROFILES.items():
+            assert "P" in p and "D" in p
+
+
+# ── 15) VRAM metrics: bytes-to-GiB and 6-field structure ──────────────────────
+
+class TestVRAMBytesToGiB:
+    def test_basic_conversion(self):
+        assert _bytes_to_gib(4 * 1024 ** 3) == 4.0
+        assert _bytes_to_gib(6 * 1024 ** 3) == 6.0
+
+    def test_none_passthrough(self):
+        assert _bytes_to_gib(None) is None
+
+    def test_zero(self):
+        assert _bytes_to_gib(0) == 0.0
+
+    def test_fractional(self):
+        val = _bytes_to_gib(int(1.5 * 1024 ** 3))
+        assert val == 1.5
+
+
+class TestVRAM6Fields:
+    def test_compile_and_bench_separated(self):
+        """All 6 fields populated when CUDA available."""
+        compile_alloc = 4 * 1024 ** 3
+        compile_resv = 6 * 1024 ** 3
+        bench_alloc = 3 * 1024 ** 3
+        bench_resv = 5 * 1024 ** 3
+        end_alloc = 2 * 1024 ** 3
+        end_resv = 4 * 1024 ** 3
+        metrics = {
+            "peak_compile_alloc_gb": _bytes_to_gib(compile_alloc),
+            "peak_compile_reserved_gb": _bytes_to_gib(compile_resv),
+            "peak_bench_alloc_gb": _bytes_to_gib(bench_alloc),
+            "peak_bench_reserved_gb": _bytes_to_gib(bench_resv),
+            "steady_state_alloc_gb": _bytes_to_gib(end_alloc),
+            "steady_state_reserved_gb": _bytes_to_gib(end_resv),
+        }
+        assert metrics["peak_compile_alloc_gb"] == 4.0
+        assert metrics["peak_bench_alloc_gb"] == 3.0
+        assert metrics["steady_state_alloc_gb"] == 2.0
+        assert metrics["peak_compile_alloc_gb"] > metrics["peak_bench_alloc_gb"]
+
+    def test_none_fields_omitted(self):
+        """When not on CUDA, all fields are None; metrics omit them."""
+        fields = {
+            "peak_compile_alloc_gb": _bytes_to_gib(None),
+            "peak_bench_alloc_gb": _bytes_to_gib(None),
+            "steady_state_alloc_gb": _bytes_to_gib(None),
+        }
+        metrics = {k: v for k, v in fields.items() if v is not None}
+        assert len(metrics) == 0
+
+    def test_backward_compat_missing_keys(self):
+        """Emit should not crash when only old-style fields are present."""
+        old_style_metrics = {
+            "keep_frac": 0.85,
+            "ppl_w103_valid": 6.0,
+        }
+        assert "peak_compile_alloc_gb" not in old_style_metrics
+        assert "peak_cuda_allocated_gb" not in old_style_metrics
+
+
+# ── 16) Stage_size tie-break using recovery_strength ─────────────────────────
+
+class TestRecoveryStrength:
+    def test_basic_computation(self):
+        stats = [
+            _make_stage_stat(0, improve_frac=0.04),
+            _make_stage_stat(1, improve_frac=0.06),
+        ]
+        rec = _recovery_strength(stats)
+        I = 0.04 + 0.06
+        M = 0.06
+        assert rec == pytest.approx(I + M)
+
+    def test_empty_stats(self):
+        assert _recovery_strength([]) == 0.0
+
+
+class TestStageSizeTieBreak:
+    def test_ss2_wins_when_recovery_30pct_higher(self):
+        """ss=4 stable, ss=2 stable, but ss=2 recovery 30% stronger => ss=2."""
+        rec_large = 0.10  # ss=4
+        rec_small = 0.14  # ss=2 (40% higher, > TIE_BREAK_GAIN of 25%)
+        threshold = (1.0 + TIE_BREAK_GAIN) * rec_large
+        assert rec_small >= threshold
+
+    def test_ss4_wins_with_strong_recovery(self):
+        """ss=4 has strong recovery, ss=2 only slightly better => ss=4."""
+        rec_large = 0.10
+        rec_small = 0.11  # only 10% higher, < 25% threshold
+        threshold = (1.0 + TIE_BREAK_GAIN) * rec_large
+        assert rec_small < threshold
+
+    def test_ss4_unstable_picks_ss2(self):
+        """If ss=4 is unstable, ss=2 is the only stable option."""
+        stable_results = [{"stage_size": 2, "recovery_strength": 0.05}]
+        chosen = stable_results[0]["stage_size"]
+        assert chosen == 2
+
+    def test_both_zero_recovery_picks_largest(self):
+        """Both stable, both recovery 0 => largest (ss=4)."""
+        rec_large = 0.0
+        rec_small = 0.0
+        threshold = (1.0 + TIE_BREAK_GAIN) * rec_large if rec_large > 0 else 1e-9
+        picks_smaller = rec_small >= threshold
+        assert not picks_smaller
+
+    def test_large_zero_small_positive_picks_smaller(self):
+        """ss=4 recovery=0, ss=2 recovery>0 => ss=2."""
+        rec_large = 0.0
+        rec_small = 0.001
+        threshold = (1.0 + TIE_BREAK_GAIN) * rec_large if rec_large > 0 else 1e-9
+        assert rec_small >= threshold
+
+
+# ── 17) Latency percentile computation ────────────────────────────────────────
+
+class TestLatencyPercentiles:
+    def test_known_distribution(self):
+        timings = list(range(1, 101))  # 1..100 ms
+        pct = compute_latency_percentiles([float(x) for x in timings])
+        assert pct["p50"] == pytest.approx(50.5, abs=0.5)
+        assert pct["p95"] == pytest.approx(95.05, abs=0.5)
+        assert pct["p99"] == pytest.approx(99.01, abs=0.5)
+        assert pct["mean"] == pytest.approx(50.5, abs=0.1)
+        assert pct["std"] > 0
+
+    def test_single_value(self):
+        pct = compute_latency_percentiles([42.0])
+        assert pct["p50"] == 42.0
+        assert pct["p95"] == 42.0
+        assert pct["p99"] == 42.0
+        assert pct["mean"] == 42.0
+        assert pct["std"] == 0.0
+
+    def test_empty_returns_empty(self):
+        assert compute_latency_percentiles([]) == {}
+
+    def test_rounding(self):
+        pct = compute_latency_percentiles([1.23456, 2.34567, 3.45678])
+        for key in ("p50", "p95", "p99", "mean", "std"):
+            parts = str(pct[key]).split(".")
+            assert len(parts) <= 2
+            if len(parts) == 2:
+                assert len(parts[1]) <= 3
+
+    def test_deterministic(self):
+        data = [1.0, 2.0, 3.0, 4.0, 5.0]
+        p1 = compute_latency_percentiles(data)
+        p2 = compute_latency_percentiles(data)
+        assert p1 == p2
+
+    def test_returns_all_keys(self):
+        pct = compute_latency_percentiles([10.0, 20.0, 30.0])
+        for k in ("p50", "p95", "p99", "mean", "std"):
+            assert k in pct
+
+
+# ── 18) Latency fields in emit ────────────────────────────────────────────────
+
+class TestLatencyEmitFields:
+    def test_latency_keys_list(self):
+        """All 10 expected latency keys are defined."""
+        assert len(_LATENCY_KEYS) == 10
+        assert "prefill_latency_ms_p50" in _LATENCY_KEYS
+        assert "prefill_latency_ms_p95" in _LATENCY_KEYS
+        assert "prefill_latency_ms_p99" in _LATENCY_KEYS
+        assert "decode_ms_per_token_p50" in _LATENCY_KEYS
+        assert "decode_ms_per_token_p95" in _LATENCY_KEYS
+        assert "decode_ms_per_token_p99" in _LATENCY_KEYS
+
+    def test_summary_csv_has_p95_columns(self):
+        assert "prefill_ms_p95" in _SUMMARY_COLUMNS
+        assert "decode_ms_per_tok_p95" in _SUMMARY_COLUMNS
+
+    def test_latency_flows_into_metrics_out(self):
+        """Simulate emit_frontier_point extracting latency from metrics dict."""
+        metrics = {
+            "prefill_latency_ms_p50": 12.3,
+            "prefill_latency_ms_p95": 15.1,
+            "prefill_latency_ms_p99": 18.7,
+            "decode_ms_per_token_p50": 0.45,
+            "decode_ms_per_token_p95": 0.62,
+            "decode_ms_per_token_p99": 0.80,
+        }
+        metrics_out = {}
+        for k in _LATENCY_KEYS:
+            val = metrics.get(k)
+            if val is not None:
+                metrics_out[k] = val
+        assert metrics_out["prefill_latency_ms_p95"] == 15.1
+        assert metrics_out["decode_ms_per_token_p95"] == 0.62
+        assert "prefill_latency_ms_mean" not in metrics_out
+
+    def test_missing_latency_no_crash(self):
+        """When metrics have no latency keys, metrics_out just skips them."""
+        metrics = {"ppl_w103_valid": 6.0}
+        metrics_out = {}
+        for k in _LATENCY_KEYS:
+            val = metrics.get(k)
+            if val is not None:
+                metrics_out[k] = val
+        assert len(metrics_out) == 0

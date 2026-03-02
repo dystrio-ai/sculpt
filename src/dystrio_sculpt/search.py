@@ -262,6 +262,7 @@ class FrontierSearch:
             enable_pilot_tuner=True,
             max_compile_hours=self.max_compile_hours,
             pilot_keep_frac=pilot_kf,
+            layer_order=self.layer_order,
         )
         self._tuning_report = self.pilot_report
         _log.info("policy auto-selected: %s", self.policy.name)
@@ -396,6 +397,10 @@ class FrontierSearch:
         # Phase 1: Evaluate candidates in descending order
         k_safe_best: Optional[float] = None
         k_unsafe: Optional[float] = None
+        _over_ceiling_extras = 0
+        _MAX_OVER_CEILING_EXTRAS = 1
+        _MIN_PREFILL_DELTA_FOR_EXTRA = 0.005
+        _prev_prefill_speedup: float = 0.0
 
         for kf in candidates:
             if self._time_exceeded():
@@ -410,11 +415,51 @@ class FrontierSearch:
                 if not pt.failed and pt.ppl_ratio <= reject_margin * 1.5:
                     k_unsafe = kf
 
-            # Early reject: if ppl_ratio way above ceiling, don't go lower
+            # Early reject: if ppl_ratio way above ceiling, don't go lower.
+            # Exception: continue if close to ceiling, repair is helpful, AND
+            # speed is improving.  Hard-capped at 1 extra candidate.
             if not pt.failed and pt.ppl_ratio > reject_margin and kf < 0.80:
-                _log.info("ppl_ratio=%.3f >> ceiling=%.2f at kf=%.3f; stopping sweep", pt.ppl_ratio, ceiling, kf)
-                k_unsafe = kf
-                break
+                close_to_ceiling = pt.ppl_ratio <= ceiling * 1.10
+                helpful_count = 0
+                total_improve = 0.0
+                if pt.compile_result is not None:
+                    for s in pt.compile_result.stage_stats:
+                        if s.get("repair_helpful", False):
+                            helpful_count += 1
+                        total_improve += s.get("improve_frac", 0.0)
+                repair_shows_promise = helpful_count >= 1 or total_improve >= 0.005
+                speed_improving = pt.prefill_speedup >= _prev_prefill_speedup + _MIN_PREFILL_DELTA_FOR_EXTRA
+
+                if (
+                    close_to_ceiling
+                    and repair_shows_promise
+                    and speed_improving
+                    and _over_ceiling_extras < _MAX_OVER_CEILING_EXTRAS
+                ):
+                    _over_ceiling_extras += 1
+                    _log.info(
+                        "[search] window: continue over-ceiling "
+                        "(ratio=%.3f, helpful=%d, improve=%.3f, "
+                        "prefill_delta=%.3f) at kf=%.3f (%d/%d extra)",
+                        pt.ppl_ratio, helpful_count, total_improve,
+                        pt.prefill_speedup - _prev_prefill_speedup, kf,
+                        _over_ceiling_extras, _MAX_OVER_CEILING_EXTRAS,
+                    )
+                    k_unsafe = kf
+                else:
+                    reason = "far_from_ceiling" if not close_to_ceiling else (
+                        "no_helpful_repair" if not repair_shows_promise else (
+                            "no_speed_gain" if not speed_improving else "cap_reached"
+                        )
+                    )
+                    _log.info(
+                        "[search] window: stop (reason=%s, ratio=%.3f, kf=%.3f)",
+                        reason, pt.ppl_ratio, kf,
+                    )
+                    k_unsafe = kf
+                    break
+
+            _prev_prefill_speedup = pt.prefill_speedup
 
         # Phase 2: Bisect bracket [k_unsafe, k_safe_best] to refine boundary
         min_resolution = 0.03

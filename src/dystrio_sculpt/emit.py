@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from . import __version__
+from .policy import E2E_PROFILES, compute_e2e_speedup
 
 _log = logging.getLogger(__name__)
 
@@ -34,9 +35,26 @@ def _write_json(path: Path, data: Any) -> None:
         json.dump(data, f, indent=2, default=str)
 
 
+def _bytes_to_gib(b: Optional[int]) -> Optional[float]:
+    """Convert bytes to GiB, returning None if input is None."""
+    if b is None:
+        return None
+    return round(b / (1024 ** 3), 2)
+
+
+_LATENCY_KEYS = [
+    "prefill_latency_ms_p50", "prefill_latency_ms_p95", "prefill_latency_ms_p99",
+    "prefill_latency_ms_mean", "prefill_latency_ms_std",
+    "decode_ms_per_token_p50", "decode_ms_per_token_p95", "decode_ms_per_token_p99",
+    "decode_ms_per_token_mean", "decode_ms_per_token_std",
+]
+
 _SUMMARY_COLUMNS = [
     "name", "keep_frac", "ppl_w103", "ppl_ratio",
     "prefill_speedup", "decode_speedup", "risk_score", "compile_time_s",
+    "e2e_speedup_chat", "e2e_speedup_rag", "e2e_speedup_batch",
+    "prefill_ms_p95", "decode_ms_per_tok_p95",
+    "peak_compile_alloc_gb", "peak_bench_alloc_gb", "steady_state_alloc_gb",
 ]
 
 
@@ -50,11 +68,23 @@ def append_summary_csv(
     decode_speedup: float,
     compile_time_s: float,
     risk_score: float = 0.0,
+    e2e_speedup_chat: Optional[float] = None,
+    e2e_speedup_rag: Optional[float] = None,
+    e2e_speedup_batch: Optional[float] = None,
+    prefill_ms_p95: Optional[float] = None,
+    decode_ms_per_tok_p95: Optional[float] = None,
+    peak_compile_alloc_gb: Optional[float] = None,
+    peak_bench_alloc_gb: Optional[float] = None,
+    steady_state_alloc_gb: Optional[float] = None,
 ) -> None:
     """Append one row to the root-level summary.csv (creates header on first call)."""
     csv_path = outdir / "summary.csv"
     write_header = not csv_path.exists()
     outdir.mkdir(parents=True, exist_ok=True)
+
+    def _fmt(val, fmt_str):
+        return fmt_str.format(val) if val is not None else ""
+
     with open(csv_path, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=_SUMMARY_COLUMNS)
         if write_header:
@@ -69,6 +99,14 @@ def append_summary_csv(
             "decode_speedup": f"{decode_speedup:.3f}",
             "risk_score": f"{risk_score:.4f}",
             "compile_time_s": f"{compile_time_s:.1f}",
+            "e2e_speedup_chat": _fmt(e2e_speedup_chat, "{:.3f}"),
+            "e2e_speedup_rag": _fmt(e2e_speedup_rag, "{:.3f}"),
+            "e2e_speedup_batch": _fmt(e2e_speedup_batch, "{:.3f}"),
+            "prefill_ms_p95": _fmt(prefill_ms_p95, "{:.1f}"),
+            "decode_ms_per_tok_p95": _fmt(decode_ms_per_tok_p95, "{:.3f}"),
+            "peak_compile_alloc_gb": _fmt(peak_compile_alloc_gb, "{:.2f}"),
+            "peak_bench_alloc_gb": _fmt(peak_bench_alloc_gb, "{:.2f}"),
+            "steady_state_alloc_gb": _fmt(steady_state_alloc_gb, "{:.2f}"),
         })
 
 
@@ -85,6 +123,12 @@ def emit_frontier_point(
     wall_time_s: float,
     pilot_report: Optional[Dict[str, Any]] = None,
     risk_score: float = 0.0,
+    peak_cuda_allocated_compile_bytes: Optional[int] = None,
+    peak_cuda_reserved_compile_bytes: Optional[int] = None,
+    peak_cuda_allocated_bench_bytes: Optional[int] = None,
+    peak_cuda_reserved_bench_bytes: Optional[int] = None,
+    cuda_allocated_end_bytes: Optional[int] = None,
+    cuda_reserved_end_bytes: Optional[int] = None,
 ) -> Path:
     """Save a single frontier point: model weights, metrics, and manifest.
 
@@ -96,8 +140,6 @@ def emit_frontier_point(
     model_dir.mkdir(parents=True, exist_ok=True)
 
     # Patch config.intermediate_size to match actual (compressed) FFN width.
-    # Without this, from_pretrained reconstructs the original (wider) shapes
-    # and crashes on weight size mismatch.
     old_intermediate = getattr(model.config, "intermediate_size", None)
     new_intermediate = None
     if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
@@ -123,6 +165,24 @@ def emit_frontier_point(
     prefill_speedup = metrics.get("prefill_tokens_per_sec", 0.0) / max(1e-9, base_prefill)
     decode_speedup = metrics.get("decode_tokens_per_sec", 0.0) / max(1e-9, base_decode)
 
+    # E2E workload-modeled speedups
+    e2e_speedups = {}
+    for profile_name, profile in E2E_PROFILES.items():
+        e2e_speedups[profile_name] = round(
+            compute_e2e_speedup(prefill_speedup, decode_speedup, profile["P"], profile["D"]),
+            3,
+        )
+
+    # VRAM: compile peaks, bench peaks, steady-state (bytes -> GiB)
+    vram = {
+        "peak_compile_alloc_gb": _bytes_to_gib(peak_cuda_allocated_compile_bytes),
+        "peak_compile_reserved_gb": _bytes_to_gib(peak_cuda_reserved_compile_bytes),
+        "peak_bench_alloc_gb": _bytes_to_gib(peak_cuda_allocated_bench_bytes),
+        "peak_bench_reserved_gb": _bytes_to_gib(peak_cuda_reserved_bench_bytes),
+        "steady_state_alloc_gb": _bytes_to_gib(cuda_allocated_end_bytes),
+        "steady_state_reserved_gb": _bytes_to_gib(cuda_reserved_end_bytes),
+    }
+
     metrics_out = {
         "keep_frac": keep_frac,
         "label": label,
@@ -137,7 +197,18 @@ def emit_frontier_point(
         "baseline_prefill_tps": round(base_prefill, 1),
         "baseline_decode_tps": round(base_decode, 1),
         "risk_score": round(risk_score, 4),
+        "e2e_speedup_chat": e2e_speedups.get("chat"),
+        "e2e_speedup_rag": e2e_speedups.get("rag"),
+        "e2e_speedup_batch": e2e_speedups.get("batch"),
     }
+    for k in _LATENCY_KEYS:
+        val = metrics.get(k)
+        if val is not None:
+            metrics_out[k] = val
+    for k, v in vram.items():
+        if v is not None:
+            metrics_out[k] = v
+
     _write_json(point_dir / "metrics.json", metrics_out)
     _write_json(point_dir / "compile_report.json", compile_report)
 
@@ -191,11 +262,20 @@ def emit_frontier_point(
         decode_speedup=decode_speedup,
         compile_time_s=wall_time_s,
         risk_score=risk_score,
+        e2e_speedup_chat=e2e_speedups.get("chat"),
+        e2e_speedup_rag=e2e_speedups.get("rag"),
+        e2e_speedup_batch=e2e_speedups.get("batch"),
+        prefill_ms_p95=metrics.get("prefill_latency_ms_p95"),
+        decode_ms_per_tok_p95=metrics.get("decode_ms_per_token_p95"),
+        peak_compile_alloc_gb=vram["peak_compile_alloc_gb"],
+        peak_bench_alloc_gb=vram["peak_bench_alloc_gb"],
+        steady_state_alloc_gb=vram["steady_state_alloc_gb"],
     )
 
     _log.info(
-        "emitted %s: keep_frac=%.2f  ppl_w103=%.2f  speedup=%.2fx",
+        "emitted %s: keep_frac=%.2f  ppl_w103=%.2f  speedup=%.2fx  e2e_rag=%.2fx",
         label, keep_frac,
         metrics_out["ppl_w103_valid"], metrics_out["prefill_speedup"],
+        e2e_speedups.get("rag", 0.0),
     )
     return point_dir

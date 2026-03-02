@@ -20,12 +20,16 @@ import torch
 from ._model import load_model_and_tokenizer, resolve_dtype
 from ._data import load_text_sets, deterministic_subset
 from ._eval import eval_perplexity
-from ._bench import bench_prefill_tps, bench_decode_tps
+from ._bench import (
+    bench_prefill_tps, bench_decode_tps,
+    bench_prefill_latency_ms, bench_decode_latency_ms,
+    compute_latency_percentiles,
+)
 from ._compile import compress_mlp_layer_swiglu_inplace
 from .selectors import select_for_layer, BLOCK_SIZE
 from .selectors.structural import prescan_structural_artifacts
 from .repair import repair_layers, _snapshot_trainable, _restore_trainable
-from .policy import RepairPolicy, auto_select_policy, build_policy_ladder, escalate_policy
+from .policy import RepairPolicy, auto_select_policy, build_policy_ladder, escalate_policy, HELPFUL_THRESHOLD
 
 _log = logging.getLogger(__name__)
 
@@ -61,12 +65,18 @@ class CompileResult:
     stage_stats: List[Dict[str, Any]] = field(default_factory=list)
     escalation_applied: bool = False
     escalation_details: Optional[Dict[str, Any]] = None
+    peak_cuda_allocated_compile_bytes: Optional[int] = None
+    peak_cuda_reserved_compile_bytes: Optional[int] = None
+    peak_cuda_allocated_bench_bytes: Optional[int] = None
+    peak_cuda_reserved_bench_bytes: Optional[int] = None
+    cuda_allocated_end_bytes: Optional[int] = None
+    cuda_reserved_end_bytes: Optional[int] = None
 
 
 def _collect_metrics(
     model, tokenizer, texts: Dict[str, List[str]], device: str,
     max_eval_tokens: int = 40_000,
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
     eval_w2 = texts["eval_w2"]
     eval_w103 = texts["eval_w103"]
     ppl_w2 = eval_perplexity(model, tokenizer, eval_w2, MAX_LEN, device, max_eval_tokens)
@@ -80,12 +90,36 @@ def _collect_metrics(
         model, tokenizer, decode_text, MAX_LEN, device,
         DECODE_STEPS, DECODE_WARMUP, DECODE_ITERS,
     )
-    return {
+    out: Dict[str, Any] = {
         "ppl_w2_test": ppl_w2,
         "ppl_w103_valid": ppl_w103,
         "prefill_tokens_per_sec": prefill,
         "decode_tokens_per_sec": decode,
     }
+
+    # Latency percentiles (bounded: small warmup + measure iterations)
+    prefill_ms = bench_prefill_latency_ms(
+        model, tokenizer, bench_texts, MAX_LEN, device,
+    )
+    decode_ms = bench_decode_latency_ms(
+        model, tokenizer, decode_text, MAX_LEN, device,
+    )
+    pf_pct = compute_latency_percentiles(prefill_ms)
+    dc_pct = compute_latency_percentiles(decode_ms)
+    for k, v in pf_pct.items():
+        out[f"prefill_latency_ms_{k}"] = v
+    for k, v in dc_pct.items():
+        out[f"decode_ms_per_token_{k}"] = v
+
+    if pf_pct and dc_pct:
+        _log.info(
+            "[bench] prefill_ms p50=%.1f p95=%.1f p99=%.1f | "
+            "decode_ms_per_tok p50=%.2f p95=%.2f p99=%.2f",
+            pf_pct["p50"], pf_pct["p95"], pf_pct["p99"],
+            dc_pct["p50"], dc_pct["p95"], dc_pct["p99"],
+        )
+
+    return out
 
 
 def cheap_eval(
@@ -230,6 +264,9 @@ def compile_model(
             ),
         }
 
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
     _log.info(
         "staged compression: %d stages of up to %d layers  policy=%s",
         len(chunks), stage_size, current_policy.name,
@@ -270,7 +307,6 @@ def compile_model(
             break
 
         # Stage repair with best-checkpoint + never-worse invariant
-        stage_fail = False
         stage_regression_stop = False
         stage_nan_inf = False
         ppl_best_stage = stage_ppl
@@ -293,20 +329,11 @@ def compile_model(
                 any_early_stopped = True
 
             ppl_best_stage = sr.get("best_metric", float("inf"))
-            stage_regression_stop = sr.get("early_stopped", False) and not sr.get("repaired_ok", True)
-            stage_nan_inf = math.isnan(ppl_best_stage) or math.isinf(ppl_best_stage)
-
-            # Failure detection uses best checkpoint metric (B1):
-            # - regression stop or never-worse rollback
-            # - nan/inf best metric
-            # - negligible improvement: Pbest >= P0 * (1 - 0.002)
-            _negligible = (
-                not stage_nan_inf
-                and stage_ppl > 0
-                and ppl_best_stage >= stage_ppl * (1.0 - 0.002)
+            stage_regression_stop = sr.get("regression_stop_triggered", False)
+            stage_nan_inf = (
+                sr.get("nan_inf_detected", False)
+                or math.isnan(ppl_best_stage) or math.isinf(ppl_best_stage)
             )
-            if not sr.get("repaired_ok", True) or stage_nan_inf or _negligible:
-                stage_fail = True
 
             post_ppl = cheap_eval(model, tok, cheap_w103, device, current_policy.cheap_eval_max_tokens)
 
@@ -358,31 +385,31 @@ def compile_model(
                         "stage regression: post-repair ppl=%.2f > pre-repair %.2f",
                         post_ppl, stage_ppl,
                     )
-                    improve_frac = (stage_ppl - ppl_best_stage) / stage_ppl if stage_ppl > 0 else 0.0
-                    stage_stats_list.append({
-                        "stage": si, "layers": chunk, "repair_fail": True,
-                        "ppl_pre_repair": round(stage_ppl, 4),
-                        "ppl_best": round(ppl_best_stage, 4),
-                        "improve_frac": round(improve_frac, 6),
-                        "regression_stop": stage_regression_stop,
-                        "nan_inf": stage_nan_inf,
-                    })
                     break
 
-        # Log failures for observability (only on failure to avoid spam)
+        # Outcome semantics: repair_fail = true instability only
+        repair_fail = stage_regression_stop or stage_nan_inf
         improve_frac = (stage_ppl - ppl_best_stage) / stage_ppl if stage_ppl > 0 else 0.0
-        if stage_fail:
+        repair_helpful = (not repair_fail) and improve_frac >= HELPFUL_THRESHOLD
+
+        if repair_fail:
             _log.info(
-                "[engine] stage_fail stage=%d layers=%s pre=%.2f best=%.2f improve=%.2f%% "
-                "regression_stop=%s",
-                si, chunk, stage_ppl, ppl_best_stage, improve_frac * 100,
-                stage_regression_stop,
+                "[engine] stage_fail stage=%d layers=%s pre=%.2f best=%.2f "
+                "regression_stop=%s nan_inf=%s",
+                si, chunk, stage_ppl, ppl_best_stage,
+                stage_regression_stop, stage_nan_inf,
+            )
+        elif repair_helpful:
+            _log.debug(
+                "[engine] stage_help stage=%d improve=%.2f%%",
+                si, improve_frac * 100,
             )
 
         stage_stats_list.append({
             "stage": si,
             "layers": chunk,
-            "repair_fail": stage_fail,
+            "repair_fail": repair_fail,
+            "repair_helpful": repair_helpful,
             "ppl_pre_repair": round(stage_ppl, 4),
             "ppl_best": round(ppl_best_stage, 4),
             "improve_frac": round(improve_frac, 6),
@@ -390,8 +417,8 @@ def compile_model(
             "nan_inf": stage_nan_inf,
         })
 
-        # Mid-compile escalation: consecutive failure tracking (A2)
-        if stage_fail:
+        # Mid-compile escalation: only on true instability (consecutive repair_fail)
+        if repair_fail:
             _consec_fail_count += 1
         else:
             _consec_fail_count = 0
@@ -428,8 +455,27 @@ def compile_model(
         if fr.get("early_stopped"):
             any_early_stopped = True
 
-    # Final evaluation (full token budget)
+    # Compile-phase VRAM peaks (covers staging + repair)
+    peak_alloc_compile: Optional[int] = None
+    peak_resv_compile: Optional[int] = None
+    if torch.cuda.is_available():
+        peak_alloc_compile = torch.cuda.max_memory_allocated()
+        peak_resv_compile = torch.cuda.max_memory_reserved()
+        torch.cuda.reset_peak_memory_stats()
+
+    # Final evaluation + benchmark (full token budget)
     metrics_post = _collect_metrics(model, tok, texts, device, policy.final_eval_max_tokens)
+
+    # Benchmark-phase VRAM peaks + steady-state
+    peak_alloc_bench: Optional[int] = None
+    peak_resv_bench: Optional[int] = None
+    end_alloc: Optional[int] = None
+    end_resv: Optional[int] = None
+    if torch.cuda.is_available():
+        peak_alloc_bench = torch.cuda.max_memory_allocated()
+        peak_resv_bench = torch.cuda.max_memory_reserved()
+        end_alloc = torch.cuda.memory_allocated()
+        end_resv = torch.cuda.memory_reserved()
 
     # Never-ship-worse: compare final PPL to baseline
     failure_info: Optional[Dict[str, Any]] = None
@@ -483,4 +529,10 @@ def compile_model(
         stage_stats=stage_stats_list,
         escalation_applied=_escalation_applied,
         escalation_details=_escalation_details,
+        peak_cuda_allocated_compile_bytes=peak_alloc_compile,
+        peak_cuda_reserved_compile_bytes=peak_resv_compile,
+        peak_cuda_allocated_bench_bytes=peak_alloc_bench,
+        peak_cuda_reserved_bench_bytes=peak_resv_bench,
+        cuda_allocated_end_bytes=end_alloc,
+        cuda_reserved_end_bytes=end_resv,
     )
