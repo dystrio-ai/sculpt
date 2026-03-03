@@ -389,17 +389,16 @@ def compile_model(
                     )
                     break
 
-        # Outcome semantics: repair_fail = true instability only
-        repair_fail = stage_regression_stop or stage_nan_inf
+        # Outcome semantics: repair_fail = hard failure (nan/inf) only;
+        # regression tripwire is a soft stop (best checkpoint restored).
+        repair_fail = stage_nan_inf
         improve_frac = (stage_ppl - ppl_best_stage) / stage_ppl if stage_ppl > 0 else 0.0
         repair_helpful = (not repair_fail) and improve_frac >= HELPFUL_THRESHOLD
 
         if repair_fail:
             _log.info(
-                "[engine] stage_fail stage=%d layers=%s pre=%.2f best=%.2f "
-                "regression_stop=%s nan_inf=%s",
-                si, chunk, stage_ppl, ppl_best_stage,
-                stage_regression_stop, stage_nan_inf,
+                "[engine] stage_fail stage=%d layers=%s pre=%.2f best=%.2f nan_inf=%s",
+                si, chunk, stage_ppl, ppl_best_stage, stage_nan_inf,
             )
         elif repair_helpful:
             _log.debug(
@@ -407,7 +406,7 @@ def compile_model(
                 si, improve_frac * 100,
             )
 
-        stage_stats_list.append({
+        _stage_stat = {
             "stage": si,
             "layers": chunk,
             "repair_fail": repair_fail,
@@ -415,12 +414,17 @@ def compile_model(
             "ppl_pre_repair": round(stage_ppl, 4),
             "ppl_best": round(ppl_best_stage, 4),
             "improve_frac": round(improve_frac, 6),
-            "regression_stop": stage_regression_stop,
+            "regression_tripwire": stage_regression_stop,
             "nan_inf": stage_nan_inf,
             "early_stop": stage_early_stop,
-        })
+        }
+        assert not (
+            _stage_stat["regression_tripwire"] and _stage_stat["repair_fail"]
+            and not _stage_stat["nan_inf"]
+        ), "regression_tripwire must NOT cause repair_fail without nan_inf"
+        stage_stats_list.append(_stage_stat)
 
-        # Mid-compile escalation: only on true instability (consecutive repair_fail)
+        # Mid-compile escalation: only on hard failure (nan/inf), not tripwire
         if repair_fail:
             _consec_fail_count += 1
         else:

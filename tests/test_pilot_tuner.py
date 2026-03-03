@@ -42,16 +42,16 @@ def _make_policy(name: str = "test", lr: float = 1e-4, steps: int = 100,
 
 def _make_stage_stat(
     stage: int = 0, improve_frac: float = 0.0,
-    regression_stop: bool = False, nan_inf: bool = False,
+    regression_tripwire: bool = False, nan_inf: bool = False,
     early_stop: bool = False,
 ) -> dict:
-    fail = regression_stop or nan_inf
+    fail = nan_inf
     helpful = (not fail) and improve_frac >= HELPFUL_THRESHOLD
     return {
         "stage": stage, "layers": [stage * 2, stage * 2 + 1],
         "ppl_pre_repair": 10.0, "ppl_best": 10.0 * (1 - improve_frac),
         "improve_frac": improve_frac,
-        "regression_stop": regression_stop, "nan_inf": nan_inf,
+        "regression_tripwire": regression_tripwire, "nan_inf": nan_inf,
         "early_stop": early_stop,
         "repair_fail": fail, "repair_helpful": helpful,
     }
@@ -60,8 +60,8 @@ def _make_stage_stat(
 # ── 1) Stage outcome semantics ───────────────────────────────────────────────
 
 class TestStageOutcomeSemantics:
-    """repair_fail = instability only (regression_stop/nan).
-    repair_helpful = improvement >= threshold. Neutral = neither."""
+    """repair_fail = nan_inf only (tripwire is soft stop).
+    repair_helpful = improvement >= threshold and no nan_inf."""
 
     def test_negligible_improvement_not_fail(self):
         s = _make_stage_stat(improve_frac=0.001)
@@ -73,10 +73,11 @@ class TestStageOutcomeSemantics:
         assert s["repair_fail"] is False
         assert s["repair_helpful"] is False
 
-    def test_regression_stop_is_fail(self):
-        s = _make_stage_stat(regression_stop=True, improve_frac=0.05)
-        assert s["repair_fail"] is True
-        assert s["repair_helpful"] is False
+    def test_regression_tripwire_is_not_fail(self):
+        s = _make_stage_stat(regression_tripwire=True, improve_frac=0.05)
+        assert s["repair_fail"] is False
+        assert s["regression_tripwire"] is True
+        assert s["repair_helpful"] is True
 
     def test_nan_inf_is_fail(self):
         s = _make_stage_stat(nan_inf=True)
@@ -93,10 +94,15 @@ class TestStageOutcomeSemantics:
         assert s_below["repair_helpful"] is False
         assert s_at["repair_helpful"] is True
 
-    def test_fail_overrides_helpful(self):
-        s = _make_stage_stat(regression_stop=True, improve_frac=0.10)
+    def test_nan_inf_overrides_helpful(self):
+        s = _make_stage_stat(nan_inf=True, improve_frac=0.10)
         assert s["repair_fail"] is True
         assert s["repair_helpful"] is False
+
+    def test_tripwire_with_improvement_is_helpful(self):
+        s = _make_stage_stat(regression_tripwire=True, improve_frac=0.10)
+        assert s["repair_fail"] is False
+        assert s["repair_helpful"] is True
 
 
 # ── 2) Stratified pilot chunk selection ───────────────────────────────────────
@@ -165,9 +171,19 @@ class TestTwoStagePilotScoring:
         assert Ha == 2
         assert Hb == 0
 
-    def test_unstable_rejected(self):
+    def test_tripwire_not_rejected(self):
         stats = [
-            _make_stage_stat(0, regression_stop=True),
+            _make_stage_stat(0, regression_tripwire=True, improve_frac=0.03),
+            _make_stage_stat(1, improve_frac=0.05),
+        ]
+        score, stable, H, I, M = _score_two_stage_pilot(stats, 10.0)
+        assert score > -1e9
+        assert stable is True
+        assert H == 2
+
+    def test_nan_inf_rejected(self):
+        stats = [
+            _make_stage_stat(0, nan_inf=True),
             _make_stage_stat(1, improve_frac=0.05),
         ]
         score, stable, H, I, M = _score_two_stage_pilot(stats, 10.0)
@@ -223,10 +239,18 @@ class TestLegacyScoringMath:
         assert slope > 0
         assert stable is True
 
-    def test_regression_stop_rejected(self):
-        _, score, stable, _ = _score_pilot(
+    def test_regression_tripwire_not_rejected(self):
+        slope, score, stable, _ = _score_pilot(
             P0=10.0, Pt=9.0, Pmax=10.0, elapsed_s=10.0,
             regression_stop=True, nan_inf=False,
+        )
+        assert score > -1e9
+        assert stable is True
+
+    def test_nan_inf_rejected(self):
+        _, score, stable, _ = _score_pilot(
+            P0=10.0, Pt=9.0, Pmax=10.0, elapsed_s=10.0,
+            regression_stop=False, nan_inf=True,
         )
         assert score == -1e9
         assert stable is False
@@ -396,9 +420,9 @@ class TestEscalationTrigger:
                 triggered = True
         assert not triggered
 
-    def test_triggered_on_consecutive_failures(self):
+    def test_triggered_on_consecutive_nan_inf(self):
         fail_stats = [
-            _make_stage_stat(0, regression_stop=True),
+            _make_stage_stat(0, nan_inf=True),
             _make_stage_stat(1, nan_inf=True),
         ]
         consec = 0
@@ -411,9 +435,9 @@ class TestEscalationTrigger:
 
     def test_single_failure_no_trigger(self):
         stats = [
-            _make_stage_stat(0, regression_stop=True),
+            _make_stage_stat(0, nan_inf=True),
             _make_stage_stat(1, improve_frac=0.01),
-            _make_stage_stat(2, regression_stop=True),
+            _make_stage_stat(2, nan_inf=True),
         ]
         consec = 0
         triggered = False
@@ -835,39 +859,39 @@ class TestRepairStopSemantics:
     def test_patience_stop_not_regression_tripwire(self):
         """Patience exhausted => early_stop=True, regression_tripwire=False."""
         stat = _make_stage_stat(
-            stage=0, improve_frac=0.03, regression_stop=False,
+            stage=0, improve_frac=0.03, regression_tripwire=False,
             nan_inf=False, early_stop=True,
         )
         assert stat["repair_fail"] is False
         assert stat["early_stop"] is True
-        assert stat["regression_stop"] is False
+        assert stat["regression_tripwire"] is False
         assert stat["repair_helpful"] is True
 
-    def test_tripwire_sets_regression_and_fail(self):
-        """Regression tripwire => regression_stop=True => repair_fail=True."""
+    def test_tripwire_is_soft_stop_not_fail(self):
+        """Regression tripwire => regression_tripwire=True but repair_fail=False."""
         stat = _make_stage_stat(
-            stage=0, improve_frac=0.05, regression_stop=True,
+            stage=0, improve_frac=0.05, regression_tripwire=True,
             nan_inf=False, early_stop=False,
         )
-        assert stat["repair_fail"] is True
-        assert stat["regression_stop"] is True
+        assert stat["repair_fail"] is False
+        assert stat["regression_tripwire"] is True
         assert stat["early_stop"] is False
-        assert stat["repair_helpful"] is False
+        assert stat["repair_helpful"] is True
 
     def test_nan_inf_is_fail_without_regression(self):
-        """NaN/Inf detected => repair_fail, but regression_stop stays False."""
+        """NaN/Inf detected => repair_fail, regression_tripwire stays False."""
         stat = _make_stage_stat(
-            stage=0, improve_frac=0.0, regression_stop=False,
+            stage=0, improve_frac=0.0, regression_tripwire=False,
             nan_inf=True, early_stop=False,
         )
         assert stat["repair_fail"] is True
-        assert stat["regression_stop"] is False
+        assert stat["regression_tripwire"] is False
         assert stat["nan_inf"] is True
 
     def test_early_stop_with_improvement_is_helpful(self):
         """A stage with early_stop (patience/max_steps) and improvement is helpful."""
         stat = _make_stage_stat(
-            stage=0, improve_frac=0.05, regression_stop=False,
+            stage=0, improve_frac=0.05, regression_tripwire=False,
             nan_inf=False, early_stop=True,
         )
         assert stat["repair_fail"] is False
@@ -888,18 +912,20 @@ class TestRepairStopSemantics:
         assert helpful_count == 8
 
     def test_mixed_stop_reasons(self):
-        """Mix of early_stop, tripwire, nan_inf: only tripwire/nan count as fail."""
+        """Mix of early_stop, tripwire, nan_inf: only nan_inf counts as fail."""
         stages = [
             _make_stage_stat(0, improve_frac=0.04, early_stop=True),
             _make_stage_stat(1, improve_frac=0.02, early_stop=True),
-            _make_stage_stat(2, improve_frac=0.01, regression_stop=True),
+            _make_stage_stat(2, improve_frac=0.01, regression_tripwire=True),
             _make_stage_stat(3, improve_frac=0.03, early_stop=True),
             _make_stage_stat(4, improve_frac=0.0, nan_inf=True),
         ]
         fail_count = sum(1 for s in stages if s["repair_fail"])
         helpful_count = sum(1 for s in stages if s["repair_helpful"])
-        assert fail_count == 2  # stage 2 (tripwire) + stage 4 (nan)
-        assert helpful_count == 3  # stages 0, 1, 3
+        tripwire_count = sum(1 for s in stages if s["regression_tripwire"])
+        assert fail_count == 1  # only stage 4 (nan_inf)
+        assert tripwire_count == 1  # stage 2
+        assert helpful_count == 4  # stages 0, 1, 2 (tripwire but helpful), 3
 
     def test_repair_return_dict_keys(self):
         """Verify the expected keys exist in the repair return dict shape."""
@@ -914,3 +940,86 @@ class TestRepairStopSemantics:
         assert result["regression_stop_triggered"] is False
         assert result["early_stop_triggered"] is True
         assert result["early_stopped"] is True
+
+
+# ── 20) Controller semantics contract ────────────────────────────────────────
+
+class TestControllerSemanticsContract:
+    """Enforces the non-negotiable controller semantics:
+    repair_fail == nan_inf ONLY.  Tripwire is soft stop."""
+
+    def test_tripwire_only_not_fail(self):
+        s = _make_stage_stat(regression_tripwire=True, nan_inf=False, improve_frac=0.04)
+        assert s["repair_fail"] is False
+        assert s["regression_tripwire"] is True
+        assert s["repair_helpful"] is True
+
+    def test_nan_inf_only_is_fail(self):
+        s = _make_stage_stat(regression_tripwire=False, nan_inf=True, improve_frac=0.04)
+        assert s["repair_fail"] is True
+        assert s["repair_helpful"] is False
+
+    def test_tripwire_plus_nan_inf_is_fail(self):
+        s = _make_stage_stat(regression_tripwire=True, nan_inf=True)
+        assert s["repair_fail"] is True
+
+    def test_pilot_scoring_rejects_nan_inf_not_tripwire(self):
+        clean = [_make_stage_stat(0, regression_tripwire=True, improve_frac=0.03)]
+        score_ok, stable_ok, *_ = _score_two_stage_pilot(clean, 10.0)
+        assert stable_ok is True
+        assert score_ok > -1e9
+
+        bad = [_make_stage_stat(0, nan_inf=True)]
+        score_bad, stable_bad, *_ = _score_two_stage_pilot(bad, 10.0)
+        assert stable_bad is False
+        assert score_bad == -1e9
+
+    def test_escalation_counter_increments_only_on_nan_inf(self):
+        stages = [
+            _make_stage_stat(0, regression_tripwire=True),
+            _make_stage_stat(1, regression_tripwire=True),
+            _make_stage_stat(2, regression_tripwire=True),
+        ]
+        consec = 0
+        for s in stages:
+            if s["repair_fail"]:
+                consec += 1
+            else:
+                consec = 0
+        assert consec == 0
+
+        stages_nan = [
+            _make_stage_stat(0, nan_inf=True),
+            _make_stage_stat(1, nan_inf=True),
+        ]
+        consec = 0
+        for s in stages_nan:
+            if s["repair_fail"]:
+                consec += 1
+            else:
+                consec = 0
+        assert consec == 2
+
+    def test_helpful_with_tripwire(self):
+        s = _make_stage_stat(regression_tripwire=True, improve_frac=0.05)
+        assert s["repair_helpful"] is True
+        assert s["repair_fail"] is False
+
+    def test_stage_stat_has_all_required_keys(self):
+        s = _make_stage_stat()
+        for key in ("regression_tripwire", "nan_inf", "early_stop",
+                     "repair_fail", "repair_helpful"):
+            assert key in s, f"Missing required key: {key}"
+
+    def test_legacy_scoring_ignores_regression_stop_param(self):
+        _, score_trip, stable_trip, _ = _score_pilot(
+            P0=10.0, Pt=9.0, Pmax=10.0, elapsed_s=10.0,
+            regression_stop=True, nan_inf=False,
+        )
+        _, score_clean, stable_clean, _ = _score_pilot(
+            P0=10.0, Pt=9.0, Pmax=10.0, elapsed_s=10.0,
+            regression_stop=False, nan_inf=False,
+        )
+        assert score_trip == score_clean
+        assert stable_trip is True
+        assert stable_clean is True

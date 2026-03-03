@@ -268,7 +268,7 @@ def _score_pilot(
     elapsed_s: float, regression_stop: bool, nan_inf: bool,
 ) -> tuple:
     """Legacy single-metric slope scoring (kept for backward compat)."""
-    if nan_inf or regression_stop:
+    if nan_inf:
         return (0.0, -1e9, False, False)
     if P0 <= 0 or Pt <= 0 or Pmax <= 0:
         return (0.0, -1e9, False, False)
@@ -292,12 +292,17 @@ def _score_two_stage_pilot(
 
     Returns (score, stable, H, I, M) where:
     - score: combined score (higher is better; -1e9 if unstable)
-    - stable: False if any stage had repair_fail
+    - stable: False if any stage had nan_inf (hard failure)
     - H: count of helpful stages
     - I: sum of improve_frac across stages
     - M: max improve_frac across stages (peak win)
     """
-    if any(s.get("repair_fail", False) for s in stage_stats):
+    for s in stage_stats:
+        assert not (
+            s.get("regression_tripwire", False) and s.get("repair_fail", False)
+            and not s.get("nan_inf", False)
+        ), "regression_tripwire must NOT cause repair_fail without nan_inf"
+    if any(s.get("nan_inf", False) for s in stage_stats):
         return (-1e9, False, 0, 0.0, 0.0)
     H = sum(1 for s in stage_stats if s.get("repair_helpful", False))
     I = sum(s.get("improve_frac", 0.0) for s in stage_stats)
@@ -414,7 +419,7 @@ def _run_pilot_stages(
             stage_stats.append({
                 "stage": si, "layers": chunk,
                 "ppl_pre_repair": float("inf"), "ppl_best": float("inf"),
-                "improve_frac": 0.0, "regression_stop": False, "nan_inf": True,
+                "improve_frac": 0.0, "regression_tripwire": False, "nan_inf": True,
                 "early_stop": False,
                 "repair_fail": True, "repair_helpful": False,
             })
@@ -454,15 +459,18 @@ def _run_pilot_stages(
                 Pbest = P0
 
         improve = (P0 - Pbest) / P0 if P0 > 0 else 0.0
-        fail = reg_stop or nan_inf
+        fail = nan_inf
         helpful = (not fail) and improve >= HELPFUL_THRESHOLD
+
+        assert not (reg_stop and fail and not nan_inf), \
+            "regression_tripwire must NOT cause repair_fail without nan_inf"
 
         stage_stats.append({
             "stage": si, "layers": chunk,
             "ppl_pre_repair": round(P0, 4),
             "ppl_best": round(Pbest, 4),
             "improve_frac": round(improve, 6),
-            "regression_stop": reg_stop, "nan_inf": nan_inf,
+            "regression_tripwire": reg_stop, "nan_inf": nan_inf,
             "early_stop": early_stop,
             "repair_fail": fail, "repair_helpful": helpful,
         })
