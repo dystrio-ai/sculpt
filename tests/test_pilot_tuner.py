@@ -25,7 +25,12 @@ from dystrio_sculpt.policy import (
     WH, WI, WM,
 )
 from dystrio_sculpt._bench import compute_latency_percentiles
-from dystrio_sculpt.emit import _bytes_to_gib, _LATENCY_KEYS, _SUMMARY_COLUMNS
+from dystrio_sculpt.emit import (
+    _bytes_to_gib, _LATENCY_KEYS, _SUMMARY_COLUMNS,
+    _BASELINE_LATENCY_KEYS, _DERIVED_KEYS,
+    _safe_pct, _safe_ratio, _safe_throughput_gain_pct, _gpu_hour_reduction_pct,
+    emit_run_metadata,
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1023,3 +1028,157 @@ class TestControllerSemanticsContract:
         assert score_trip == score_clean
         assert stable_trip is True
         assert stable_clean is True
+
+
+# ── 21) Derived metric helpers ────────────────────────────────────────────────
+
+class TestDerivedMetricHelpers:
+    """Test _safe_pct, _safe_ratio, _safe_throughput_gain_pct, _gpu_hour_reduction_pct."""
+
+    def test_safe_pct_normal(self):
+        assert _safe_pct(100.0, 80.0) == 20.0
+
+    def test_safe_pct_zero_baseline(self):
+        assert _safe_pct(0.0, 50.0) is None
+
+    def test_safe_pct_none_inputs(self):
+        assert _safe_pct(None, 50.0) is None
+        assert _safe_pct(50.0, None) is None
+
+    def test_safe_ratio_normal(self):
+        assert _safe_ratio(10.0, 5.0) == 2.0
+
+    def test_safe_ratio_zero_denominator(self):
+        assert _safe_ratio(10.0, 0.0) is None
+
+    def test_safe_ratio_none(self):
+        assert _safe_ratio(None, 5.0) is None
+
+    def test_throughput_gain_pct(self):
+        assert _safe_throughput_gain_pct(150.0, 100.0) == 50.0
+
+    def test_throughput_gain_zero_baseline(self):
+        assert _safe_throughput_gain_pct(150.0, 0.0) is None
+
+    def test_gpu_hour_reduction_2x(self):
+        assert _gpu_hour_reduction_pct(2.0) == 50.0
+
+    def test_gpu_hour_reduction_none(self):
+        assert _gpu_hour_reduction_pct(None) is None
+
+    def test_gpu_hour_reduction_zero(self):
+        assert _gpu_hour_reduction_pct(0.0) is None
+
+    def test_gpu_hour_reduction_1x(self):
+        assert _gpu_hour_reduction_pct(1.0) == 0.0
+
+
+# ── 22) Metrics.json contains derived keys ────────────────────────────────────
+
+class TestMetricsJsonDerivedKeys:
+    """Verify _DERIVED_KEYS and _BASELINE_LATENCY_KEYS are well-formed."""
+
+    def test_derived_keys_list_populated(self):
+        assert len(_DERIVED_KEYS) >= 10
+
+    def test_baseline_latency_keys_match(self):
+        for k in _BASELINE_LATENCY_KEYS:
+            assert k.startswith("baseline_"), f"{k} missing baseline_ prefix"
+        assert len(_BASELINE_LATENCY_KEYS) == len(_LATENCY_KEYS)
+
+    def test_summary_csv_has_whitepaper_columns(self):
+        required = [
+            "baseline_prefill_ms_p95", "baseline_decode_ms_per_tok_p95",
+            "prefill_p95_latency_improvement_pct", "decode_p95_latency_improvement_pct",
+            "prefill_throughput_gain_pct", "decode_throughput_gain_pct",
+            "gpu_hour_reduction_rag_pct",
+            "steady_state_memory_reduction_pct",
+            "compile_minutes",
+        ]
+        for col in required:
+            assert col in _SUMMARY_COLUMNS, f"Missing summary column: {col}"
+
+    def test_derived_keys_include_all_expected(self):
+        expected = {
+            "prefill_p95_latency_ratio", "decode_p95_latency_ratio",
+            "prefill_p95_latency_improvement_pct", "decode_p95_latency_improvement_pct",
+            "prefill_throughput_gain_pct", "decode_throughput_gain_pct",
+            "gpu_hour_reduction_chat_pct", "gpu_hour_reduction_rag_pct",
+            "gpu_hour_reduction_batch_pct",
+            "baseline_steady_state_alloc_gb", "steady_state_memory_reduction_pct",
+            "repair_steps_per_stage", "compile_minutes",
+        }
+        assert expected == set(_DERIVED_KEYS)
+
+
+# ── 23) Run metadata ─────────────────────────────────────────────────────────
+
+class TestRunMetadata:
+    """Verify emit_run_metadata produces expected files."""
+
+    def test_creates_run_metadata_json(self, tmp_path):
+        import json
+        emit_run_metadata(tmp_path, {"deterministic": True, "seed": 42, "dtype": "bf16"})
+        meta_path = tmp_path / "run_metadata.json"
+        assert meta_path.exists()
+        data = json.loads(meta_path.read_text())
+        assert "torch_version" in data
+        assert "transformers_version" in data
+        assert "cuda_available" in data
+        assert data["deterministic_flag"] is True
+        assert data["seed"] == 42
+        assert data["dtype"] == "bf16"
+        assert "timestamp" in data
+        assert "warmup_iters" in data
+        assert "measure_iters" in data
+
+    def test_metadata_has_all_required_keys(self, tmp_path):
+        import json
+        emit_run_metadata(tmp_path, {})
+        data = json.loads((tmp_path / "run_metadata.json").read_text())
+        required = {
+            "git_commit", "torch_version", "transformers_version",
+            "cuda_available", "gpu_name", "deterministic_flag",
+            "seed", "dtype", "tf32_enabled",
+            "warmup_iters", "measure_iters", "decode_steps", "timestamp",
+        }
+        for k in required:
+            assert k in data, f"Missing run_metadata key: {k}"
+
+    def test_no_crash_on_missing_nvidia_smi(self, tmp_path):
+        emit_run_metadata(tmp_path, {})
+        assert (tmp_path / "run_metadata.json").exists()
+
+
+# ── 24) End-to-end derived metric computation ────────────────────────────────
+
+class TestDerivedMetricComputation:
+    """Verify the derived metrics math is correct end-to-end."""
+
+    def test_latency_improvement_math(self):
+        pct = _safe_pct(10.0, 8.0)
+        assert pct == 20.0
+
+    def test_latency_ratio_math(self):
+        ratio = _safe_ratio(10.0, 5.0)
+        assert ratio == 2.0
+
+    def test_throughput_gain_doubling(self):
+        gain = _safe_throughput_gain_pct(200.0, 100.0)
+        assert gain == 100.0
+
+    def test_gpu_hour_reduction_4x(self):
+        pct = _gpu_hour_reduction_pct(4.0)
+        assert pct == 75.0
+
+    def test_memory_reduction(self):
+        pct = _safe_pct(10.0, 7.0)
+        assert pct == 30.0
+
+    def test_compile_minutes_from_seconds(self):
+        assert round(600.0 / 60.0, 1) == 10.0
+
+    def test_repair_steps_per_stage(self):
+        total_steps = 500
+        n_stages = 10
+        assert round(total_steps / max(1, n_stages), 1) == 50.0

@@ -195,6 +195,8 @@ class FrontierSearch:
         self.baseline_metrics = _collect_metrics(
             model, tok, self.texts, self.device, self.max_eval_tokens,
         )
+        if torch.cuda.is_available():
+            self.baseline_metrics["cuda_allocated_baseline_bytes"] = torch.cuda.memory_allocated()
         _log.info(
             "baseline: ppl_w103=%.2f  prefill=%.0f tok/s  decode=%.0f tok/s",
             self.baseline_metrics["ppl_w103_valid"],

@@ -14,6 +14,7 @@ import torch
 
 from . import __version__
 from .policy import E2E_PROFILES, compute_e2e_speedup
+from ._bench import LATENCY_WARMUP, LATENCY_MEASURE
 
 _log = logging.getLogger(__name__)
 
@@ -42,11 +43,52 @@ def _bytes_to_gib(b: Optional[int]) -> Optional[float]:
     return round(b / (1024 ** 3), 2)
 
 
+def _safe_pct(baseline: Optional[float], current: Optional[float]) -> Optional[float]:
+    """100 * (baseline - current) / baseline, or None if inputs are missing/zero."""
+    if baseline is None or current is None or baseline == 0:
+        return None
+    return round(100.0 * (baseline - current) / baseline, 2)
+
+
+def _safe_ratio(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    if numerator is None or denominator is None or denominator == 0:
+        return None
+    return round(numerator / denominator, 3)
+
+
+def _safe_throughput_gain_pct(
+    current: Optional[float], baseline: Optional[float],
+) -> Optional[float]:
+    """100 * (current - baseline) / baseline."""
+    if baseline is None or current is None or baseline == 0:
+        return None
+    return round(100.0 * (current - baseline) / baseline, 2)
+
+
+def _gpu_hour_reduction_pct(e2e_speedup: Optional[float]) -> Optional[float]:
+    """100 * (1 - 1/speedup)."""
+    if e2e_speedup is None or e2e_speedup <= 0:
+        return None
+    return round(100.0 * (1.0 - 1.0 / e2e_speedup), 2)
+
+
 _LATENCY_KEYS = [
     "prefill_latency_ms_p50", "prefill_latency_ms_p95", "prefill_latency_ms_p99",
     "prefill_latency_ms_mean", "prefill_latency_ms_std",
     "decode_ms_per_token_p50", "decode_ms_per_token_p95", "decode_ms_per_token_p99",
     "decode_ms_per_token_mean", "decode_ms_per_token_std",
+]
+
+_BASELINE_LATENCY_KEYS = [f"baseline_{k}" for k in _LATENCY_KEYS]
+
+_DERIVED_KEYS = [
+    "prefill_p95_latency_ratio", "decode_p95_latency_ratio",
+    "prefill_p95_latency_improvement_pct", "decode_p95_latency_improvement_pct",
+    "prefill_throughput_gain_pct", "decode_throughput_gain_pct",
+    "gpu_hour_reduction_chat_pct", "gpu_hour_reduction_rag_pct",
+    "gpu_hour_reduction_batch_pct",
+    "baseline_steady_state_alloc_gb", "steady_state_memory_reduction_pct",
+    "repair_steps_per_stage", "compile_minutes",
 ]
 
 _SUMMARY_COLUMNS = [
@@ -55,6 +97,13 @@ _SUMMARY_COLUMNS = [
     "e2e_speedup_chat", "e2e_speedup_rag", "e2e_speedup_batch",
     "prefill_ms_p95", "decode_ms_per_tok_p95",
     "peak_compile_alloc_gb", "peak_bench_alloc_gb", "steady_state_alloc_gb",
+    # whitepaper-grade additions
+    "baseline_prefill_ms_p95", "baseline_decode_ms_per_tok_p95",
+    "prefill_p95_latency_improvement_pct", "decode_p95_latency_improvement_pct",
+    "prefill_throughput_gain_pct", "decode_throughput_gain_pct",
+    "gpu_hour_reduction_rag_pct",
+    "steady_state_memory_reduction_pct",
+    "compile_minutes",
 ]
 
 
@@ -76,6 +125,15 @@ def append_summary_csv(
     peak_compile_alloc_gb: Optional[float] = None,
     peak_bench_alloc_gb: Optional[float] = None,
     steady_state_alloc_gb: Optional[float] = None,
+    baseline_prefill_ms_p95: Optional[float] = None,
+    baseline_decode_ms_per_tok_p95: Optional[float] = None,
+    prefill_p95_latency_improvement_pct: Optional[float] = None,
+    decode_p95_latency_improvement_pct: Optional[float] = None,
+    prefill_throughput_gain_pct: Optional[float] = None,
+    decode_throughput_gain_pct: Optional[float] = None,
+    gpu_hour_reduction_rag_pct: Optional[float] = None,
+    steady_state_memory_reduction_pct: Optional[float] = None,
+    compile_minutes: Optional[float] = None,
 ) -> None:
     """Append one row to the root-level summary.csv (creates header on first call)."""
     csv_path = outdir / "summary.csv"
@@ -107,6 +165,15 @@ def append_summary_csv(
             "peak_compile_alloc_gb": _fmt(peak_compile_alloc_gb, "{:.2f}"),
             "peak_bench_alloc_gb": _fmt(peak_bench_alloc_gb, "{:.2f}"),
             "steady_state_alloc_gb": _fmt(steady_state_alloc_gb, "{:.2f}"),
+            "baseline_prefill_ms_p95": _fmt(baseline_prefill_ms_p95, "{:.1f}"),
+            "baseline_decode_ms_per_tok_p95": _fmt(baseline_decode_ms_per_tok_p95, "{:.3f}"),
+            "prefill_p95_latency_improvement_pct": _fmt(prefill_p95_latency_improvement_pct, "{:.1f}"),
+            "decode_p95_latency_improvement_pct": _fmt(decode_p95_latency_improvement_pct, "{:.1f}"),
+            "prefill_throughput_gain_pct": _fmt(prefill_throughput_gain_pct, "{:.1f}"),
+            "decode_throughput_gain_pct": _fmt(decode_throughput_gain_pct, "{:.1f}"),
+            "gpu_hour_reduction_rag_pct": _fmt(gpu_hour_reduction_rag_pct, "{:.1f}"),
+            "steady_state_memory_reduction_pct": _fmt(steady_state_memory_reduction_pct, "{:.1f}"),
+            "compile_minutes": _fmt(compile_minutes, "{:.1f}"),
         })
 
 
@@ -183,7 +250,46 @@ def emit_frontier_point(
         "steady_state_reserved_gb": _bytes_to_gib(cuda_reserved_end_bytes),
     }
 
-    metrics_out = {
+    # ── Baseline latency + steady-state memory ────────────────────────────────
+    base_prefill_p95 = baseline_metrics.get("prefill_latency_ms_p95")
+    base_decode_p95 = baseline_metrics.get("decode_ms_per_token_p95")
+    sculpt_prefill_p95 = metrics.get("prefill_latency_ms_p95")
+    sculpt_decode_p95 = metrics.get("decode_ms_per_token_p95")
+
+    baseline_steady_bytes = baseline_metrics.get("cuda_allocated_baseline_bytes")
+    baseline_steady_gb = _bytes_to_gib(baseline_steady_bytes)
+
+    # ── Derived metrics (whitepaper-grade) ────────────────────────────────────
+    derived: Dict[str, Optional[float]] = {}
+
+    derived["prefill_p95_latency_ratio"] = _safe_ratio(base_prefill_p95, sculpt_prefill_p95)
+    derived["decode_p95_latency_ratio"] = _safe_ratio(base_decode_p95, sculpt_decode_p95)
+    derived["prefill_p95_latency_improvement_pct"] = _safe_pct(base_prefill_p95, sculpt_prefill_p95)
+    derived["decode_p95_latency_improvement_pct"] = _safe_pct(base_decode_p95, sculpt_decode_p95)
+
+    derived["prefill_throughput_gain_pct"] = _safe_throughput_gain_pct(
+        metrics.get("prefill_tokens_per_sec"), base_prefill,
+    )
+    derived["decode_throughput_gain_pct"] = _safe_throughput_gain_pct(
+        metrics.get("decode_tokens_per_sec"), base_decode,
+    )
+
+    derived["gpu_hour_reduction_chat_pct"] = _gpu_hour_reduction_pct(e2e_speedups.get("chat"))
+    derived["gpu_hour_reduction_rag_pct"] = _gpu_hour_reduction_pct(e2e_speedups.get("rag"))
+    derived["gpu_hour_reduction_batch_pct"] = _gpu_hour_reduction_pct(e2e_speedups.get("batch"))
+
+    derived["baseline_steady_state_alloc_gb"] = baseline_steady_gb
+    derived["steady_state_memory_reduction_pct"] = _safe_pct(
+        baseline_steady_gb, vram.get("steady_state_alloc_gb"),
+    )
+
+    total_repair_steps = config.get("total_repair_steps", 0)
+    n_stages = max(1, len(config.get("stage_stats", [])))
+    derived["repair_steps_per_stage"] = round(total_repair_steps / n_stages, 1)
+    derived["compile_minutes"] = round(wall_time_s / 60.0, 1)
+
+    # ── Build metrics.json ────────────────────────────────────────────────────
+    metrics_out: Dict[str, Any] = {
         "keep_frac": keep_frac,
         "label": label,
         "ppl_w2_test": round(metrics.get("ppl_w2_test", 0.0), 4),
@@ -201,11 +307,26 @@ def emit_frontier_point(
         "e2e_speedup_rag": e2e_speedups.get("rag"),
         "e2e_speedup_batch": e2e_speedups.get("batch"),
     }
+
+    # Sculpted model latency percentiles
     for k in _LATENCY_KEYS:
         val = metrics.get(k)
         if val is not None:
             metrics_out[k] = val
+
+    # Baseline latency percentiles
+    for k in _LATENCY_KEYS:
+        val = baseline_metrics.get(k)
+        if val is not None:
+            metrics_out[f"baseline_{k}"] = val
+
+    # VRAM GiB fields
     for k, v in vram.items():
+        if v is not None:
+            metrics_out[k] = v
+
+    # Derived whitepaper-grade fields
+    for k, v in derived.items():
         if v is not None:
             metrics_out[k] = v
 
@@ -265,11 +386,20 @@ def emit_frontier_point(
         e2e_speedup_chat=e2e_speedups.get("chat"),
         e2e_speedup_rag=e2e_speedups.get("rag"),
         e2e_speedup_batch=e2e_speedups.get("batch"),
-        prefill_ms_p95=metrics.get("prefill_latency_ms_p95"),
-        decode_ms_per_tok_p95=metrics.get("decode_ms_per_token_p95"),
+        prefill_ms_p95=sculpt_prefill_p95,
+        decode_ms_per_tok_p95=sculpt_decode_p95,
         peak_compile_alloc_gb=vram["peak_compile_alloc_gb"],
         peak_bench_alloc_gb=vram["peak_bench_alloc_gb"],
         steady_state_alloc_gb=vram["steady_state_alloc_gb"],
+        baseline_prefill_ms_p95=base_prefill_p95,
+        baseline_decode_ms_per_tok_p95=base_decode_p95,
+        prefill_p95_latency_improvement_pct=derived.get("prefill_p95_latency_improvement_pct"),
+        decode_p95_latency_improvement_pct=derived.get("decode_p95_latency_improvement_pct"),
+        prefill_throughput_gain_pct=derived.get("prefill_throughput_gain_pct"),
+        decode_throughput_gain_pct=derived.get("decode_throughput_gain_pct"),
+        gpu_hour_reduction_rag_pct=derived.get("gpu_hour_reduction_rag_pct"),
+        steady_state_memory_reduction_pct=derived.get("steady_state_memory_reduction_pct"),
+        compile_minutes=derived.get("compile_minutes"),
     )
 
     _log.info(
@@ -279,3 +409,71 @@ def emit_frontier_point(
         e2e_speedups.get("rag", 0.0),
     )
     return point_dir
+
+
+# ── Run provenance ────────────────────────────────────────────────────────────
+
+def emit_run_metadata(
+    outdir: Path,
+    config: Dict[str, Any],
+) -> None:
+    """Write run_metadata.json, gpu_info.txt, and pip_freeze.txt to outdir.
+
+    Failures are logged but never crash the run.
+    """
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import transformers
+        transformers_version = transformers.__version__
+    except Exception:
+        transformers_version = "unknown"
+
+    gpu_name: Optional[str] = None
+    if torch.cuda.is_available():
+        try:
+            gpu_name = torch.cuda.get_device_name()
+        except Exception:
+            pass
+
+    metadata = {
+        "git_commit": _get_git_sha(),
+        "torch_version": torch.__version__,
+        "transformers_version": transformers_version,
+        "cuda_available": torch.cuda.is_available(),
+        "gpu_name": gpu_name,
+        "deterministic_flag": config.get("deterministic", False),
+        "seed": config.get("seed", 0),
+        "dtype": config.get("dtype", "bf16"),
+        "tf32_enabled": getattr(torch.backends.cuda.matmul, "allow_tf32", None),
+        "warmup_iters": LATENCY_WARMUP,
+        "measure_iters": LATENCY_MEASURE,
+        "decode_steps": 32,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        _write_json(outdir / "run_metadata.json", metadata)
+    except Exception as exc:
+        _log.warning("failed to write run_metadata.json: %s", exc)
+
+    # gpu_info.txt
+    try:
+        r = subprocess.run(
+            ["nvidia-smi"], capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            (outdir / "gpu_info.txt").write_text(r.stdout)
+    except Exception:
+        _log.debug("nvidia-smi not available")
+
+    # pip_freeze.txt
+    try:
+        import sys
+        r = subprocess.run(
+            [sys.executable, "-m", "pip", "freeze"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode == 0:
+            (outdir / "pip_freeze.txt").write_text(r.stdout)
+    except Exception:
+        _log.debug("pip freeze not available")

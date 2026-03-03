@@ -210,6 +210,8 @@ def compile_model(
     if baseline_metrics is None:
         _log.info("computing baseline metrics (final eval)")
         baseline_metrics = _collect_metrics(model, tok, texts, device, max_eval_tokens)
+        if torch.cuda.is_available():
+            baseline_metrics["cuda_allocated_baseline_bytes"] = torch.cuda.memory_allocated()
 
     rng = np.random.RandomState(seed) if deterministic else None
 

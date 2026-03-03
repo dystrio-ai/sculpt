@@ -116,11 +116,17 @@ def sculpt(
                 raise typer.Exit(code=1)
 
     from .search import FrontierSearch
-    from .emit import emit_frontier_point
+    from .emit import emit_frontier_point, emit_run_metadata
     from .validate import validate_saved_model
 
     outpath = Path(outdir)
     outpath.mkdir(parents=True, exist_ok=True)
+
+    emit_run_metadata(outpath, {
+        "deterministic": deterministic,
+        "seed": 0,
+        "dtype": dtype_str,
+    })
 
     search = FrontierSearch(
         model_id=model_id,
