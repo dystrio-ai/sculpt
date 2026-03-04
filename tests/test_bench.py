@@ -96,6 +96,7 @@ class TestBenchmarksCsvSchema:
             "prefill_tokens_per_sec", "decode_tokens_per_sec",
             "ttft_ms_p50", "ttft_ms_p95", "ttft_ms_p99",
             "first_decode_step_ms_p50", "first_decode_step_ms_p95", "first_decode_step_ms_p99",
+            "num_params", "weights_gb", "cold_alloc_gb",
             "peak_alloc_gb", "steady_state_alloc_gb",
             "errors_skipped_prompts",
         ]
@@ -257,6 +258,10 @@ class TestAudit:
                 "ppl_wikitext": str(model_ppl),
                 "ppl_ratio": str(round(model_ppl / base_ppl, 4)),
                 "num_prompts": "500",
+                "num_params": "1000000",
+                "weights_gb": "0.004",
+                "cold_alloc_gb": "0.005",
+                "steady_state_alloc_gb": "0.006",
             })
 
             # prompt workloads
@@ -300,6 +305,10 @@ class TestAudit:
                     "num_prompts": str(len(prompt_ids)),
                     "ttft_ms_p95": "7.0",
                     "errors_skipped_prompts": "0",
+                    "num_params": "1000000",
+                    "weights_gb": "0.004",
+                    "cold_alloc_gb": "0.005",
+                    "steady_state_alloc_gb": "0.006",
                 })
 
         # Write benchmarks.csv
@@ -599,3 +608,199 @@ class TestTTFTNaming:
         request_level = [c for c in BENCHMARKS_CSV_COLUMNS if c.startswith("first_decode_step_ms_")]
         assert len(microbench) >= 3
         assert len(request_level) >= 3
+
+
+# ── weights-only memory metrics ──────────────────────────────────────────────
+
+class TestWeightsMemoryMetrics:
+    def test_csv_has_weight_columns(self):
+        from dystrio_sculpt.bench_runner import BENCHMARKS_CSV_COLUMNS
+
+        assert "num_params" in BENCHMARKS_CSV_COLUMNS
+        assert "weights_gb" in BENCHMARKS_CSV_COLUMNS
+        assert "cold_alloc_gb" in BENCHMARKS_CSV_COLUMNS
+
+    def test_compute_model_weight_stats(self):
+        import torch
+        from dystrio_sculpt.bench_runner import _compute_model_weight_stats
+
+        model = torch.nn.Linear(256, 128, bias=False)
+        stats = _compute_model_weight_stats(model)
+        assert stats["num_params"] == 256 * 128
+        assert stats["weights_gb"] > 0
+        expected_bytes = 256 * 128 * 4  # float32
+        assert abs(stats["weights_gb"] - expected_bytes / (1024 ** 3)) < 1e-6
+
+    def test_weights_gb_consistent_across_workloads(self, tmp_path):
+        """Same model should report identical weights_gb regardless of workload."""
+        import torch
+        from dystrio_sculpt.bench_runner import _compute_model_weight_stats
+
+        model = torch.nn.Sequential(
+            torch.nn.Linear(512, 256),
+            torch.nn.Linear(256, 128),
+        )
+        s1 = _compute_model_weight_stats(model)
+        s2 = _compute_model_weight_stats(model)
+        assert s1["weights_gb"] == s2["weights_gb"]
+        assert s1["num_params"] == s2["num_params"]
+
+    def test_weights_gb_in_write_benchmarks_csv(self, tmp_path):
+        from dystrio_sculpt.bench_runner import write_benchmarks_csv
+
+        results = {
+            "base": {
+                "wikitext": {
+                    "model_id": "base", "workload": "wikitext",
+                    "ppl_wikitext": 10.0, "num_prompts": 100,
+                    "num_params": 1000000, "weights_gb": 0.004,
+                    "cold_alloc_gb": 0.005,
+                },
+                "chat": {
+                    "model_id": "base", "workload": "chat",
+                    "num_prompts": 50,
+                    "num_params": 1000000, "weights_gb": 0.004,
+                    "cold_alloc_gb": 0.005,
+                },
+            },
+        }
+        csv_path = write_benchmarks_csv(results, tmp_path, baseline_model="base")
+        with open(csv_path) as f:
+            rows = list(csv.DictReader(f))
+
+        for row in rows:
+            assert row["num_params"] == "1000000"
+            assert row["weights_gb"] == "0.004"
+            assert row["cold_alloc_gb"] == "0.005"
+
+
+class TestWeightsMemoryPlot:
+    def test_weights_plot_generated(self, tmp_path):
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            pytest.skip("matplotlib not installed")
+
+        from dystrio_sculpt.report import _plot_memory_vs_quality_weights
+
+        rows = [
+            {"model_id": "org/baseline-m", "ppl_ratio": "1.0", "weights_gb": "6.5"},
+            {"model_id": "org/sculpted-conservative", "ppl_ratio": "1.03", "weights_gb": "5.2"},
+        ]
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        _plot_memory_vs_quality_weights(rows, report_dir, plt)
+        assert (report_dir / "memory_vs_quality_weights.png").exists()
+
+    def test_weights_plot_skipped_without_data(self, tmp_path):
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            pytest.skip("matplotlib not installed")
+
+        from dystrio_sculpt.report import _plot_memory_vs_quality_weights
+
+        rows = [{"model_id": "m1", "workload": "chat"}]
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        _plot_memory_vs_quality_weights(rows, report_dir, plt)
+        assert not (report_dir / "memory_vs_quality_weights.png").exists()
+
+    def test_cold_alloc_plot_generated(self, tmp_path):
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            pytest.skip("matplotlib not installed")
+
+        from dystrio_sculpt.report import _plot_memory_vs_quality_cold_alloc
+
+        rows = [
+            {"model_id": "org/baseline-m", "ppl_ratio": "1.0", "cold_alloc_gb": "7.0"},
+            {"model_id": "org/sculpted-balanced", "ppl_ratio": "1.06", "cold_alloc_gb": "5.5"},
+        ]
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        _plot_memory_vs_quality_cold_alloc(rows, report_dir, plt)
+        assert (report_dir / "memory_vs_quality_cold_alloc.png").exists()
+
+
+class TestAuditWeightsConsistency:
+    def _make_csv(self, tmp_path, rows_data):
+        from dystrio_sculpt.bench_runner import BENCHMARKS_CSV_COLUMNS
+
+        bench_out = tmp_path / "bench_out"
+        bench_out.mkdir(parents=True, exist_ok=True)
+        (bench_out / "results").mkdir(exist_ok=True)
+        (bench_out / "run_metadata.json").write_text(json.dumps({
+            "baseline_model_id": "base",
+        }))
+
+        csv_path = bench_out / "benchmarks.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=BENCHMARKS_CSV_COLUMNS)
+            writer.writeheader()
+            for row in rows_data:
+                padded = {c: row.get(c, "") for c in BENCHMARKS_CSV_COLUMNS}
+                writer.writerow(padded)
+        return bench_out
+
+    def test_weights_consistent_passes(self, tmp_path):
+        from dystrio_sculpt.audit import _check_weights_consistency
+
+        bench_out = self._make_csv(tmp_path, [
+            {"model_id": "base", "workload": "wikitext", "weights_gb": "6.5"},
+            {"model_id": "base", "workload": "chat", "weights_gb": "6.5"},
+        ])
+        findings = _check_weights_consistency(bench_out)
+        assert all(f["status"] == "PASS" for f in findings)
+
+    def test_weights_inconsistent_fails(self, tmp_path):
+        from dystrio_sculpt.audit import _check_weights_consistency
+
+        bench_out = self._make_csv(tmp_path, [
+            {"model_id": "base", "workload": "wikitext", "weights_gb": "6.5"},
+            {"model_id": "base", "workload": "chat", "weights_gb": "7.0"},
+        ])
+        findings = _check_weights_consistency(bench_out)
+        assert any(f["status"] == "FAIL" for f in findings)
+
+    def test_steady_state_advisory(self, tmp_path):
+        from dystrio_sculpt.audit import _check_steady_state_advisory
+
+        bench_out = self._make_csv(tmp_path, [
+            {"model_id": "base", "workload": "wikitext", "steady_state_alloc_gb": "6.5"},
+            {"model_id": "base", "workload": "chat", "steady_state_alloc_gb": "7.2"},
+        ])
+        findings = _check_steady_state_advisory(bench_out)
+        assert any(f["status"] == "WARN" for f in findings)
+        assert any("weights_gb" in f.get("detail", "") for f in findings)
+
+
+class TestModelCardWeightsColumns:
+    def test_model_card_has_weights_columns(self, tmp_path):
+        from dystrio_sculpt.report import _write_model_card_snippet
+
+        rows = [
+            {"model_id": "baseline_model", "workload": "wikitext",
+             "ppl_wikitext": "10.0", "ppl_ratio": "1.0"},
+            {"model_id": "baseline_model", "workload": "rag",
+             "ttft_ms_p95": "15.0", "weights_gb": "6.5", "cold_alloc_gb": "7.0",
+             "steady_state_alloc_gb": "7.5", "peak_alloc_gb": "8.5",
+             "prefill_tokens_per_sec": "5000", "decode_tokens_per_sec": "300"},
+        ]
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        _write_model_card_snippet(rows, report_dir)
+
+        content = (report_dir / "model_card_snippet.md").read_text()
+        assert "Weights (GiB)" in content
+        assert "Post-load (GiB)" in content
+        assert "End-of-bench (GiB)" in content
+        assert "6.5" in content
+        assert "7.0" in content

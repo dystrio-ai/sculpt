@@ -341,6 +341,119 @@ def _check_memory_claims(
     return findings
 
 
+def _check_weights_consistency(
+    bench_out: Path,
+) -> List[Dict[str, Any]]:
+    """weights_gb must be identical across workloads for the same model."""
+    findings: List[Dict[str, Any]] = []
+    csv_path = bench_out / "benchmarks.csv"
+    if not csv_path.exists():
+        return findings
+
+    model_weights: Dict[str, Set[str]] = {}
+    for r in _read_csv(csv_path):
+        mid = r.get("model_id", "")
+        wgb = r.get("weights_gb", "")
+        if wgb and wgb != "":
+            model_weights.setdefault(mid, set()).add(wgb)
+
+    if not model_weights:
+        findings.append({
+            "check": "weights_consistency",
+            "status": "WARN",
+            "detail": "No weights_gb values found in benchmarks.csv",
+        })
+        return findings
+
+    for mid, vals in model_weights.items():
+        if len(vals) > 1:
+            findings.append({
+                "check": "weights_consistency",
+                "status": "FAIL",
+                "detail": f"{mid}: weights_gb varies across workloads: {sorted(vals)}",
+            })
+        else:
+            findings.append({
+                "check": "weights_consistency",
+                "status": "PASS",
+                "detail": f"{mid}: weights_gb consistent ({vals.pop()})",
+            })
+
+    return findings
+
+
+def _check_cold_alloc_consistency(
+    bench_out: Path,
+) -> List[Dict[str, Any]]:
+    """cold_alloc_gb should be consistent across workloads for the same model."""
+    findings: List[Dict[str, Any]] = []
+    csv_path = bench_out / "benchmarks.csv"
+    if not csv_path.exists():
+        return findings
+
+    model_cold: Dict[str, Set[str]] = {}
+    for r in _read_csv(csv_path):
+        mid = r.get("model_id", "")
+        ca = r.get("cold_alloc_gb", "")
+        if ca and ca != "":
+            model_cold.setdefault(mid, set()).add(ca)
+
+    if not model_cold:
+        return findings
+
+    for mid, vals in model_cold.items():
+        if len(vals) > 1:
+            findings.append({
+                "check": "cold_alloc_consistency",
+                "status": "WARN",
+                "detail": f"{mid}: cold_alloc_gb varies across workloads: {sorted(vals)}",
+            })
+
+    if not findings:
+        findings.append({
+            "check": "cold_alloc_consistency",
+            "status": "PASS",
+            "detail": "cold_alloc_gb consistent across workloads for all models",
+        })
+    return findings
+
+
+def _check_steady_state_advisory(
+    bench_out: Path,
+) -> List[Dict[str, Any]]:
+    """Warn that steady_state_alloc_gb is workload-dependent."""
+    findings: List[Dict[str, Any]] = []
+    csv_path = bench_out / "benchmarks.csv"
+    if not csv_path.exists():
+        return findings
+
+    model_ss: Dict[str, Set[str]] = {}
+    for r in _read_csv(csv_path):
+        mid = r.get("model_id", "")
+        ss = r.get("steady_state_alloc_gb", "")
+        if ss and ss != "":
+            model_ss.setdefault(mid, set()).add(ss)
+
+    for mid, vals in model_ss.items():
+        if len(vals) > 1:
+            findings.append({
+                "check": "steady_state_advisory",
+                "status": "WARN",
+                "detail": (
+                    f"{mid}: steady_state_alloc_gb varies by workload ({sorted(vals)}); "
+                    "not suitable for headline memory claims — use weights_gb instead"
+                ),
+            })
+
+    if not findings:
+        findings.append({
+            "check": "steady_state_advisory",
+            "status": "INFO",
+            "detail": "steady_state_alloc_gb is workload-dependent; prefer weights_gb for headline claims",
+        })
+    return findings
+
+
 # ── main entry ────────────────────────────────────────────────────────────────
 
 def run_audit(bench_out: Path) -> Dict[str, Any]:
@@ -359,6 +472,9 @@ def run_audit(bench_out: Path) -> Dict[str, Any]:
     all_findings.extend(_check_prompt_id_parity(results_dir))
     all_findings.extend(_check_error_rates(bench_out))
     all_findings.extend(_check_memory_claims(bench_out))
+    all_findings.extend(_check_weights_consistency(bench_out))
+    all_findings.extend(_check_cold_alloc_consistency(bench_out))
+    all_findings.extend(_check_steady_state_advisory(bench_out))
 
     n_fail = sum(1 for f in all_findings if f["status"] == "FAIL")
     n_warn = sum(1 for f in all_findings if f["status"] == "WARN")

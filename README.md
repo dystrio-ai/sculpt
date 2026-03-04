@@ -251,6 +251,11 @@ dystrio bench-audit --bench-out bench_out
 | **Prefill wall** (`prefill_ms`) | Request | Wall time of the prefill forward pass only. Per-prompt. |
 | Prefill / Decode TPS | Microbench | Throughput from batched iteration benchmarks. Used for throughput comparison, not latency claims. |
 | `microbench_prefill_ms_*` | Microbench | Batched iteration latency percentiles. Internal reference — not publishable as request-level claims. |
+| **Weights** (`weights_gb`) | Deterministic | Model parameter memory: `sum(p.numel() * p.element_size())`. Runtime-independent, identical across workloads. **Recommended for headline VRAM claims.** |
+| `num_params` | Deterministic | Total parameter count. |
+| **Post-load** (`cold_alloc_gb`) | Runtime | `torch.cuda.memory_allocated()` right after `model.eval()` + `empty_cache()`. Captures weights + framework overhead before inference. |
+| End-of-bench (`steady_state_alloc_gb`) | Runtime | `torch.cuda.memory_allocated()` at end of workload. Includes KV-cache/activations. Workload-dependent — not suitable for headline claims. |
+| Peak (`peak_alloc_gb`) | Runtime | `torch.cuda.max_memory_allocated()` high-water mark during benchmark. |
 
 Warmup prompts (default 5) are excluded from all published percentile metrics.
 
@@ -272,6 +277,9 @@ bench_out/
     p95_latency_by_workload.png
     throughput_by_workload.png
     rag_ttft_cdf.png
+    memory_vs_quality.png              # steady-state (runtime, workload-dependent)
+    memory_vs_quality_weights.png      # weights-only (headline plot)
+    memory_vs_quality_cold_alloc.png   # post-load allocated VRAM
     model_card_snippet.md
     audit.json
     audit.txt

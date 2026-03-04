@@ -45,6 +45,8 @@ BENCHMARKS_CSV_COLUMNS = [
     "first_decode_step_ms_p50", "first_decode_step_ms_p95", "first_decode_step_ms_p99",
     "ttft_ms_p50", "ttft_ms_p95", "ttft_ms_p99",
     "prefill_ms_p50", "prefill_ms_p95", "prefill_ms_p99",
+    # Memory: deterministic (weights-only) and runtime
+    "num_params", "weights_gb", "cold_alloc_gb",
     "peak_alloc_gb", "steady_state_alloc_gb",
     "errors_skipped_prompts",
 ]
@@ -54,6 +56,15 @@ PER_PROMPT_CSV_COLUMNS = [
     "prefill_ms", "first_decode_step_ms", "ttft_ms",
     "is_warmup", "error",
 ]
+
+
+def _compute_model_weight_stats(model: torch.nn.Module) -> Dict[str, Any]:
+    """Return num_params (int) and weights_gb (float GiB) for a model."""
+    total_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    return {
+        "num_params": sum(p.numel() for p in model.parameters()),
+        "weights_gb": round(total_bytes / (1024 ** 3), 6),
+    }
 
 
 def sanitize_model_id(model_id: str) -> str:
@@ -218,8 +229,14 @@ def bench_model(
     model_root = results_dir / safe_id
     model, tokenizer = _load_model(model_id, device, dtype_str)
 
+    weight_stats = _compute_model_weight_stats(model)
+
+    cold_alloc_gb: Optional[float] = None
     if torch.cuda.is_available():
+        torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        cold_alloc_gb = round(torch.cuda.memory_allocated() / (1024 ** 3), 6)
 
     all_metrics: Dict[str, Dict[str, Any]] = {}
 
@@ -231,7 +248,11 @@ def bench_model(
         try:
             if wl == "wikitext":
                 result = _run_wikitext(model, tokenizer, device)
-                metrics: Dict[str, Any] = {"model_id": model_id, "workload": wl, **result}
+                metrics: Dict[str, Any] = {
+                    "model_id": model_id, "workload": wl, **result,
+                    **weight_stats,
+                    "cold_alloc_gb": cold_alloc_gb,
+                }
                 _write_json(wl_dir / "metrics.json", metrics)
                 all_metrics[wl] = metrics
             else:
@@ -242,7 +263,12 @@ def bench_model(
                 prompts = load_prompt_pack(pack_path)
                 pack_h = prompt_pack_hash(pack_path)
                 result = _run_prompt_workload(model, tokenizer, prompts, device, wl)
-                metrics = {"model_id": model_id, **result["metrics"]}
+                metrics = {
+                    "model_id": model_id,
+                    **result["metrics"],
+                    **weight_stats,
+                    "cold_alloc_gb": cold_alloc_gb,
+                }
                 _write_json(wl_dir / "metrics.json", metrics)
 
                 if result["per_prompt"]:

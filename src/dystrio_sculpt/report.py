@@ -82,6 +82,8 @@ def generate_report(
     _plot_throughput_bars(rows, report_dir, plt)
     _plot_rag_ttft_cdf(rows, results_dir, report_dir, plt)
     _plot_memory_vs_quality(rows, report_dir, plt)
+    _plot_memory_vs_quality_weights(rows, report_dir, plt)
+    _plot_memory_vs_quality_cold_alloc(rows, report_dir, plt)
 
     _write_model_card_snippet(rows, report_dir, bench_out)
 
@@ -325,6 +327,88 @@ def _plot_memory_vs_quality(
     _log.info("[report] memory_vs_quality.png + .md written")
 
 
+# ── scatter: weights memory vs quality ────────────────────────────────────────
+
+def _plot_memory_vs_quality_weights(
+    rows: List[Dict[str, Any]], report_dir: Path, plt,
+) -> None:
+    """Scatter of weights-only GiB vs PPL ratio (headline VRAM plot)."""
+    seen: Dict[str, tuple] = {}
+    for r in rows:
+        mid = r.get("model_id", "")
+        if mid in seen:
+            continue
+        ppl = _float_or_none(r.get("ppl_ratio", ""))
+        wgb = _float_or_none(r.get("weights_gb", ""))
+        if ppl is not None and wgb is not None:
+            seen[mid] = (ppl, wgb)
+
+    if not seen:
+        _log.warning("no rows with ppl_ratio + weights_gb — skipping memory_vs_quality_weights")
+        return
+
+    labels = {mid: model_shortname(mid) for mid in seen}
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for mid, (ppl, wgb) in seen.items():
+        short = labels[mid]
+        is_baseline = "baseline" in short.lower()
+        marker = "*" if is_baseline else "o"
+        color = "black" if is_baseline else "#1f77b4"
+        ax.scatter(ppl, wgb, s=120, marker=marker, color=color, zorder=5)
+        ax.annotate(short, (ppl, wgb), textcoords="offset points",
+                    xytext=(6, 6), fontsize=8)
+
+    ax.set_xlabel("Quality Drift (Perplexity Ratio vs Baseline)")
+    ax.set_ylabel("Weights Memory (GiB)")
+    ax.set_title("Weights Memory vs Quality Drift")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(report_dir / "memory_vs_quality_weights.png", dpi=150)
+    plt.close(fig)
+    _log.info("[report] memory_vs_quality_weights.png written")
+
+
+# ── scatter: cold alloc vs quality ────────────────────────────────────────────
+
+def _plot_memory_vs_quality_cold_alloc(
+    rows: List[Dict[str, Any]], report_dir: Path, plt,
+) -> None:
+    """Scatter of post-load allocated VRAM vs PPL ratio."""
+    seen: Dict[str, tuple] = {}
+    for r in rows:
+        mid = r.get("model_id", "")
+        if mid in seen:
+            continue
+        ppl = _float_or_none(r.get("ppl_ratio", ""))
+        ca = _float_or_none(r.get("cold_alloc_gb", ""))
+        if ppl is not None and ca is not None:
+            seen[mid] = (ppl, ca)
+
+    if not seen:
+        _log.warning("no rows with ppl_ratio + cold_alloc_gb — skipping memory_vs_quality_cold_alloc")
+        return
+
+    labels = {mid: model_shortname(mid) for mid in seen}
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for mid, (ppl, ca) in seen.items():
+        short = labels[mid]
+        is_baseline = "baseline" in short.lower()
+        marker = "*" if is_baseline else "o"
+        color = "black" if is_baseline else "#2ca02c"
+        ax.scatter(ppl, ca, s=120, marker=marker, color=color, zorder=5)
+        ax.annotate(short, (ppl, ca), textcoords="offset points",
+                    xytext=(6, 6), fontsize=8)
+
+    ax.set_xlabel("Quality Drift (Perplexity Ratio vs Baseline)")
+    ax.set_ylabel("Post-load Allocated VRAM (GiB)")
+    ax.set_title("Post-load Allocated VRAM vs Quality Drift")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(report_dir / "memory_vs_quality_cold_alloc.png", dpi=150)
+    plt.close(fig)
+    _log.info("[report] memory_vs_quality_cold_alloc.png written")
+
+
 # ── Model card snippet ────────────────────────────────────────────────────────
 
 def _write_model_card_snippet(
@@ -350,11 +434,13 @@ def _write_model_card_snippet(
     lines.append("## Benchmark Results\n")
     lines.append(
         "| Model | PPL | PPL Ratio | RAG TTFT p95 (ms) | Chat Decode p95 (ms/tok) "
-        "| Prefill TPS | Decode TPS | Steady-state (GiB) | Peak (GiB) |"
+        "| Prefill TPS | Decode TPS | Weights (GiB) | Post-load (GiB) "
+        "| End-of-bench (GiB) | Peak (GiB) |"
     )
     lines.append(
         "|-------|-----|-----------|-------------------|-------------------------|"
-        "------------|------------|---------------------|------------|"
+        "------------|------------|---------------|----------------"
+        "|--------------------|------------|"
     )
     for mid in model_ids:
         short = model_shortname(mid)
@@ -371,16 +457,27 @@ def _write_model_card_snippet(
             chat_decode = _get(mid, "chat", "decode_ms_per_tok_p95")
         pf_tps = _get(mid, "rag", "prefill_tokens_per_sec")
         dc_tps = _get(mid, "chat", "decode_tokens_per_sec")
+
+        def _get_any(mid: str, key: str) -> str:
+            for wl_pref in ("rag", "chat", "wikitext", "code"):
+                v = _get(mid, wl_pref, key)
+                if v != "\u2014":
+                    return v
+            return "\u2014"
+
+        wts_gb = _get_any(mid, "weights_gb")
+        cold_gb = _get_any(mid, "cold_alloc_gb")
         ss_gb = _get(mid, "rag", "steady_state_alloc_gb")
-        if ss_gb == "—":
+        if ss_gb == "\u2014":
             ss_gb = _get(mid, "chat", "steady_state_alloc_gb")
         peak_gb = _get(mid, "rag", "peak_alloc_gb")
-        if peak_gb == "—":
+        if peak_gb == "\u2014":
             peak_gb = _get(mid, "chat", "peak_alloc_gb")
 
         lines.append(
             f"| {short} | {ppl} | {ratio} | {rag_ttft} | {chat_decode} "
-            f"| {pf_tps} | {dc_tps} | {ss_gb} | {peak_gb} |"
+            f"| {pf_tps} | {dc_tps} | {wts_gb} | {cold_gb} "
+            f"| {ss_gb} | {peak_gb} |"
         )
 
     # Environment footnote
@@ -408,8 +505,22 @@ def _write_model_card_snippet(
         "(not request-level; used for throughput comparison only)."
     )
     lines.append(
-        "- **Steady-state / Peak memory**: GPU memory after model load + warmup / "
-        "peak during benchmark."
+        "- **Weights (GiB)**: Model parameter memory only "
+        "(sum of numel * element_size for all parameters). "
+        "Deterministic and runtime-independent."
+    )
+    lines.append(
+        "- **Post-load (GiB)**: `torch.cuda.memory_allocated()` immediately after "
+        "`model.eval()` + `torch.cuda.empty_cache()`. "
+        "Captures weights + framework overhead before any inference."
+    )
+    lines.append(
+        "- **End-of-bench (GiB)**: `torch.cuda.memory_allocated()` at end of "
+        "benchmark workload. Includes KV-cache and activations still held."
+    )
+    lines.append(
+        "- **Peak (GiB)**: `torch.cuda.max_memory_allocated()` during benchmark. "
+        "High-water mark for planning GPU headroom."
     )
     lines.append("")
 
