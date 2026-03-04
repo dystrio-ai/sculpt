@@ -10,6 +10,7 @@ import torch
 
 LATENCY_WARMUP = 5
 LATENCY_MEASURE = 30
+TTFT_WARMUP = 3
 
 
 def _sync(device: str) -> None:
@@ -194,3 +195,96 @@ def bench_decode_latency_ms(
         ms_per_token = ((time.time() - t0) * 1000.0) / max(1, decode_steps)
         timings.append(ms_per_token)
     return timings
+
+
+@torch.inference_mode()
+def bench_ttft_per_prompt(
+    model,
+    tokenizer,
+    prompts: List[Dict],
+    seq_len: int,
+    device: str,
+    warmup: int = TTFT_WARMUP,
+) -> List[Dict]:
+    """Measure per-prompt latency breakdown: prefill wall, first decode step, and
+    TTFT including prefill.
+
+    Warmup prompts are excluded from results (run but not recorded).
+    Each result dict contains:
+        id, prompt_tokens, max_new_tokens,
+        prefill_ms, first_decode_step_ms, ttft_ms (= prefill + first decode),
+        is_warmup, error
+    """
+    model.eval()
+
+    # Warmup: run first N prompts to amortize lazy kernel init / cuda graphs
+    for p in prompts[:warmup]:
+        inp = tokenizer(p["prompt"], return_tensors="pt", truncation=True, max_length=seq_len)
+        ids = inp["input_ids"].to(device)
+        attn = torch.ones_like(ids)
+        out = model(input_ids=ids, attention_mask=attn, use_cache=True)
+        next_tok = out.logits[:, -1:, :].argmax(dim=-1)
+        model(input_ids=next_tok, past_key_values=out.past_key_values, use_cache=True)
+    _sync(device)
+
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    results: List[Dict] = []
+    for idx, p in enumerate(prompts):
+        is_warmup = idx < warmup
+        try:
+            inp = tokenizer(
+                p["prompt"], return_tensors="pt", truncation=True, max_length=seq_len,
+            )
+            ids = inp["input_ids"].to(device)
+            attn = torch.ones_like(ids)
+            prompt_tokens = ids.shape[1]
+
+            # Prefill (timed)
+            _sync(device)
+            t_pf0 = time.time()
+            out = model(input_ids=ids, attention_mask=attn, use_cache=True)
+            _sync(device)
+            prefill_ms = (time.time() - t_pf0) * 1000.0
+
+            next_tok = out.logits[:, -1:, :].argmax(dim=-1)
+
+            # First decode step (timed)
+            _sync(device)
+            t_dc0 = time.time()
+            model(
+                input_ids=next_tok,
+                past_key_values=out.past_key_values,
+                use_cache=True,
+            )
+            _sync(device)
+            first_decode_ms = (time.time() - t_dc0) * 1000.0
+
+            results.append({
+                "id": p.get("id", ""),
+                "prompt_tokens": prompt_tokens,
+                "max_new_tokens": p.get("max_new_tokens", 64),
+                "prefill_ms": round(prefill_ms, 3),
+                "first_decode_step_ms": round(first_decode_ms, 3),
+                "ttft_ms": round(prefill_ms + first_decode_ms, 3),
+                "is_warmup": is_warmup,
+                "error": "",
+            })
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                if device == "cuda" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                results.append({
+                    "id": p.get("id", ""),
+                    "prompt_tokens": 0,
+                    "max_new_tokens": p.get("max_new_tokens", 64),
+                    "prefill_ms": None,
+                    "first_decode_step_ms": None,
+                    "ttft_ms": None,
+                    "is_warmup": is_warmup,
+                    "error": "OOM",
+                })
+            else:
+                raise
+    return results

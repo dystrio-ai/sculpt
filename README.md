@@ -165,6 +165,72 @@ Sculpt targets **decoder-only transformers with SwiGLU FFN blocks**:
 Attention layers, embeddings, layer norms, and residual connections are not
 modified. Only the MLP projections are physically sliced.
 
+## Benchmarking sculpted models
+
+After sculpting, evaluate baseline and compiled models across workloads:
+
+```bash
+dystrio bench \
+  --models org/baseline-model org/sculpted-conservative org/sculpted-balanced \
+  --workloads wikitext chat rag code \
+  --prompts-dir prompts/ \
+  --outdir bench_out \
+  --dtype bf16 --device cuda --deterministic --seed 42
+```
+
+Generate report from existing results (no model loading):
+
+```bash
+dystrio bench-report --results-dir bench_out/results --outdir bench_out/report
+```
+
+Audit results for publishability:
+
+```bash
+dystrio bench-audit --bench-out bench_out
+```
+
+### Metric definitions
+
+| Metric | Level | Description |
+|--------|-------|-------------|
+| **TTFT incl. prefill** (`ttft_ms`) | Request | Wall time from prompt submission to first token: prefill forward + first decode step. Computed per-prompt with CUDA sync. |
+| **First decode step** (`first_decode_step_ms`) | Request | Wall time of the first decode forward call only (post-prefill). Per-prompt. |
+| **Prefill wall** (`prefill_ms`) | Request | Wall time of the prefill forward pass only. Per-prompt. |
+| Prefill / Decode TPS | Microbench | Throughput from batched iteration benchmarks. Used for throughput comparison, not latency claims. |
+| `microbench_prefill_ms_*` | Microbench | Batched iteration latency percentiles. Internal reference — not publishable as request-level claims. |
+
+Warmup prompts (default 5) are excluded from all published percentile metrics.
+
+### Output layout
+
+```
+bench_out/
+  run_metadata.json
+  benchmarks.csv
+  results/
+    <sanitized_model_id>/
+      wikitext/metrics.json
+      chat/metrics.json + per_prompt.csv + run_metadata.json
+      rag/metrics.json + per_prompt.csv + run_metadata.json
+      code/metrics.json + per_prompt.csv + run_metadata.json
+  report/
+    frontier_rag_ttft_p95_vs_pplratio.png
+    frontier_chat_decode_p95_vs_pplratio.png
+    p95_latency_by_workload.png
+    throughput_by_workload.png
+    rag_ttft_cdf.png
+    model_card_snippet.md
+    audit.json
+    audit.txt
+```
+
+### Generating prompt packs
+
+```bash
+python scripts/make_prompt_packs.py --outdir prompts/
+```
+
 ## CLI reference
 
 ```
@@ -180,6 +246,31 @@ Options:
   --deterministic               Enable deterministic mode
   --policy TEXT                 Override auto-selected repair policy (advanced)
   --help                        Show this message and exit
+
+dystrio bench [OPTIONS]
+
+Options:
+  --models TEXT                 Model IDs to benchmark (required, repeatable)
+  --workloads TEXT              Workloads [default: wikitext chat rag code]
+  --prompts-dir TEXT            Directory with JSONL prompt packs
+  --outdir TEXT                 Output directory [default: bench_out]
+  --dtype TEXT                  bf16|fp16|fp32 [default: bf16]
+  --device TEXT                 cuda|cpu [default: cuda]
+  --seed INTEGER                Random seed [default: 0]
+  --deterministic               Enable deterministic mode
+  --baseline-model TEXT         Baseline model for ppl_ratio
+
+dystrio bench-report [OPTIONS]
+
+Options:
+  --results-dir TEXT            Path to results/ directory (required)
+  --outdir TEXT                 Report output [default: bench_out/report]
+  --bench-out TEXT              Root bench dir (for model card env footnote)
+
+dystrio bench-audit [OPTIONS]
+
+Options:
+  --bench-out TEXT              Root bench output dir (required)
 ```
 
 ## License

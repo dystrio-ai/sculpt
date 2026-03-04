@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import typer
 
@@ -191,3 +191,108 @@ def sculpt(
     )
     _print_summary_table(selected, search.baseline_metrics or {})
     log.info("=" * 80)
+
+
+# ── bench command ─────────────────────────────────────────────────────────────
+
+@app.command()
+def bench(
+    models: List[str] = typer.Option(..., "--models", help="Model IDs to benchmark."),
+    workloads: List[str] = typer.Option(
+        ["wikitext", "chat", "rag", "code"], "--workloads",
+        help="Workloads to run.",
+    ),
+    prompts_dir: Optional[str] = typer.Option(None, "--prompts-dir", help="Directory with JSONL prompt packs."),
+    outdir: str = typer.Option("bench_out", "--outdir", help="Output directory."),
+    dtype: str = typer.Option("bf16", "--dtype", help="Model dtype: bf16|fp16|fp32."),
+    device: str = typer.Option("cuda", "--device", help="Device: cuda|cpu."),
+    seed: int = typer.Option(0, "--seed", help="Random seed."),
+    deterministic: bool = typer.Option(False, "--deterministic", help="Enable deterministic mode."),
+    baseline_model: Optional[str] = typer.Option(None, "--baseline-model", help="Baseline model for ppl_ratio."),
+) -> None:
+    """Benchmark baseline + sculpted models across workloads."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    from .bench_runner import run_bench
+
+    outpath = Path(outdir)
+    pp = Path(prompts_dir) if prompts_dir else None
+
+    csv_path = run_bench(
+        models=models,
+        workloads=workloads,
+        prompts_dir=pp,
+        outdir=outpath,
+        device=device,
+        dtype_str=dtype,
+        seed=seed,
+        deterministic=deterministic,
+        baseline_model=baseline_model,
+    )
+
+    log = logging.getLogger("dystrio.bench")
+    log.info("benchmarks.csv: %s", csv_path)
+
+    # Auto-generate report + model card
+    from .report import generate_report
+    report_dir = outpath / "report"
+    try:
+        generate_report(outpath / "results", report_dir, bench_out=outpath)
+    except Exception as exc:
+        log.warning("report generation failed: %s", exc)
+
+    # Auto-run audit
+    from .audit import run_audit
+    try:
+        audit = run_audit(outpath)
+        log.info("audit: %s", audit.get("overall", "?"))
+    except Exception as exc:
+        log.warning("audit failed: %s", exc)
+
+
+# ── bench-report command ──────────────────────────────────────────────────────
+
+@app.command("bench-report")
+def bench_report(
+    results_dir: str = typer.Option(..., "--results-dir", help="Path to results/ directory."),
+    outdir: str = typer.Option("bench_out/report", "--outdir", help="Report output directory."),
+    bench_out: Optional[str] = typer.Option(
+        None, "--bench-out",
+        help="Root bench output dir (parent of results/). Used for model card.",
+    ),
+) -> None:
+    """Generate plots and model-card snippet from existing benchmark results."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    from .report import generate_report
+    bo = Path(bench_out) if bench_out else None
+    generate_report(Path(results_dir), Path(outdir), bench_out=bo)
+
+
+# ── bench-audit command ───────────────────────────────────────────────────────
+
+@app.command("bench-audit")
+def bench_audit(
+    bench_out: str = typer.Option(..., "--bench-out", help="Root bench output dir."),
+) -> None:
+    """Audit benchmark results for publishability."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    from .audit import run_audit
+    result = run_audit(Path(bench_out))
+    overall = result.get("overall", "?")
+    summary = result.get("summary", {})
+    log = logging.getLogger("dystrio.audit")
+    log.info(
+        "Audit %s — pass=%d  warn=%d  fail=%d",
+        overall, summary.get("pass", 0), summary.get("warn", 0), summary.get("fail", 0),
+    )
