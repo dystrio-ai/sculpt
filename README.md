@@ -73,6 +73,27 @@ Just `AutoModelForCausalLM.from_pretrained(path)`.
 - **Deterministic two-tier evaluation** — Cheap eval for search; full eval
   only on final selected points.
 
+## Logging and verbosity
+
+By default, Dystrio suppresses noisy output from Hugging Face libraries,
+httpx, and datasets (including harmless 404 probes for `additional_chat_templates`
+etc.). Only Dystrio's own INFO-level logs are shown.
+
+```bash
+# Default: clean, product-like output
+dystrio sculpt --model-id Qwen/Qwen2-0.5B
+
+# Quiet: warnings and errors only, progress bars disabled
+dystrio -q sculpt --model-id Qwen/Qwen2-0.5B
+
+# Verbose: full debug output including HF/httpx request tracing
+dystrio -v sculpt --model-id Qwen/Qwen2-0.5B
+```
+
+The `--quiet` / `-q` and `--verbose` / `-v` flags are global (apply to all
+commands: `sculpt`, `bench`, `bench-report`, `bench-audit`). They are mutually
+exclusive.
+
 ## Quick start
 
 ```bash
@@ -132,6 +153,37 @@ dystrio sculpt \
   --frontier 4 \
   --max-compile-hours 2.0
 ```
+
+## Custom calibration corpus
+
+By default Sculpt calibrates on `wikitext / wikitext-2-raw-v1 / train`.
+You can point it at any Hugging Face dataset:
+
+```bash
+dystrio sculpt \
+  --model-id Qwen/Qwen2-0.5B \
+  --outdir sculpt_c4 \
+  --calib-dataset allenai/c4 \
+  --calib-config en \
+  --calib-split train \
+  --calib-text-field text \
+  --calib-num-samples 1000 \
+  --calib-seed 42
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--calib-dataset` | `wikitext` | HF dataset identifier |
+| `--calib-config` | `wikitext-2-raw-v1` | Dataset config name |
+| `--calib-split` | `train` | Dataset split |
+| `--calib-text-field` | `text` | Name of the text column |
+| `--calib-num-samples` | all available | Max calibration samples (deterministically sampled) |
+| `--calib-seq-len` | model default | Override sequence length for calibration |
+| `--calib-seed` | 0 | Seed for calibration sampling |
+
+Eval always uses WikiText-103 validation for comparable PPL measurement
+regardless of calibration corpus. The calibration dataset parameters are
+recorded in `run_metadata.json` for reproducibility.
 
 ## Deterministic builds
 
@@ -234,6 +286,10 @@ python scripts/make_prompt_packs.py --outdir prompts/
 ## CLI reference
 
 ```
+Global Options (apply to all commands):
+  --quiet / -q                  Minimal output; suppress most logs + progress bars
+  --verbose / -v                Debug output; show external library logs + request tracing
+
 dystrio sculpt [OPTIONS]
 
 Options:
@@ -245,6 +301,13 @@ Options:
   --max-compile-hours FLOAT     Time budget (hours)
   --deterministic               Enable deterministic mode
   --policy TEXT                 Override auto-selected repair policy (advanced)
+  --calib-dataset TEXT          HF dataset for calibration [default: wikitext]
+  --calib-config TEXT           HF dataset config [default: wikitext-2-raw-v1]
+  --calib-split TEXT            HF dataset split [default: train]
+  --calib-text-field TEXT       Text column name [default: text]
+  --calib-num-samples INTEGER   Max calibration samples
+  --calib-seq-len INTEGER       Calibration sequence length
+  --calib-seed INTEGER          Calibration sampling seed [default: 0]
   --help                        Show this message and exit
 
 dystrio bench [OPTIONS]

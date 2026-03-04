@@ -81,6 +81,7 @@ def generate_report(
     _plot_p95_latency_bars(rows, report_dir, plt)
     _plot_throughput_bars(rows, report_dir, plt)
     _plot_rag_ttft_cdf(rows, results_dir, report_dir, plt)
+    _plot_memory_vs_quality(rows, report_dir, plt)
 
     _write_model_card_snippet(rows, report_dir, bench_out)
 
@@ -268,6 +269,60 @@ def _plot_rag_ttft_cdf(
     fig.tight_layout()
     fig.savefig(report_dir / "rag_ttft_cdf.png", dpi=150)
     plt.close(fig)
+
+
+# ── scatter: memory vs quality ─────────────────────────────────────────────────
+
+def _plot_memory_vs_quality(
+    rows: List[Dict[str, Any]], report_dir: Path, plt,
+) -> None:
+    """Scatter plot of steady-state VRAM vs PPL ratio + markdown table."""
+    # Deduplicate: one point per model (pick first row with both values)
+    seen: Dict[str, tuple] = {}
+    for r in rows:
+        mid = r.get("model_id", "")
+        if mid in seen:
+            continue
+        ppl = _float_or_none(r.get("ppl_ratio", ""))
+        ss = _float_or_none(r.get("steady_state_alloc_gb", ""))
+        if ppl is not None and ss is not None:
+            seen[mid] = (ppl, ss)
+
+    if not seen:
+        _log.warning("no rows with ppl_ratio + steady_state_alloc_gb — skipping memory_vs_quality")
+        return
+
+    labels = {mid: model_shortname(mid) for mid in seen}
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for mid, (ppl, ss) in seen.items():
+        short = labels[mid]
+        is_baseline = "baseline" in short.lower()
+        marker = "*" if is_baseline else "o"
+        color = "black" if is_baseline else "#1f77b4"
+        ax.scatter(ppl, ss, s=120, marker=marker, color=color, zorder=5)
+        ax.annotate(short, (ppl, ss), textcoords="offset points",
+                    xytext=(6, 6), fontsize=8)
+
+    ax.set_xlabel("Quality Drift (Perplexity Ratio vs Baseline)")
+    ax.set_ylabel("Steady-State VRAM (GB)")
+    ax.set_title("Memory vs Quality Tradeoff")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(report_dir / "memory_vs_quality.png", dpi=150)
+    plt.close(fig)
+
+    # Markdown table
+    md_lines: List[str] = []
+    md_lines.append("## Memory vs Quality\n")
+    md_lines.append("| Model | PPL Ratio | VRAM (GB) |")
+    md_lines.append("|-------|-----------|-----------|")
+    for mid in seen:
+        ppl, ss = seen[mid]
+        md_lines.append(f"| {labels[mid]} | {ppl:.3f} | {ss:.3f} |")
+    md_lines.append("")
+    (report_dir / "memory_vs_quality.md").write_text("\n".join(md_lines))
+    _log.info("[report] memory_vs_quality.png + .md written")
 
 
 # ── Model card snippet ────────────────────────────────────────────────────────

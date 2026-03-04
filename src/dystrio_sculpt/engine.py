@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from ._model import load_model_and_tokenizer, resolve_dtype
-from ._data import load_text_sets, deterministic_subset
+from ._data import CalibConfig, load_text_sets, deterministic_subset
 from ._eval import eval_perplexity
 from ._bench import (
     bench_prefill_tps, bench_decode_tps,
@@ -179,6 +179,7 @@ def compile_model(
     failure_dir: Optional[Path] = None,
     layer_order: Optional[List[int]] = None,
     allow_escalation: bool = True,
+    calib: Optional[CalibConfig] = None,
 ) -> CompileResult:
     """Compile a model at a specific keep_frac.
 
@@ -197,7 +198,7 @@ def compile_model(
 
     if texts is None:
         _log.info("loading datasets")
-        texts = load_text_sets(n_texts_cal, n_texts_train, n_texts_eval)
+        texts = load_text_sets(n_texts_cal, n_texts_train, n_texts_eval, calib=calib)
 
     # Resolve policy
     if policy is None:

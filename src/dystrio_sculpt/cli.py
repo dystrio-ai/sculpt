@@ -12,8 +12,23 @@ app = typer.Typer(name="dystrio", add_completion=False, rich_markup_mode="rich")
 
 
 @app.callback()
-def main() -> None:
+def main(
+    quiet: bool = typer.Option(
+        False, "--quiet", "-q",
+        help="Minimal output: suppress most logs and progress bars.",
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v",
+        help="Debug output: show external library logs and request tracing.",
+    ),
+) -> None:
     """Dystrio Sculpt — structural FFN compiler for decoder-only LLMs."""
+    if quiet and verbose:
+        typer.echo("Error: --quiet and --verbose are mutually exclusive.", err=True)
+        raise typer.Exit(code=1)
+
+    from .logging_utils import configure_logging
+    configure_logging(quiet=quiet, verbose=verbose)
 
 
 def _print_summary_table(selected, baseline_metrics) -> None:
@@ -67,13 +82,36 @@ def sculpt(
         help="Override auto-selected repair policy (advanced). "
              "Format: ss<N>_lr<X>_p<Y> or policy index 0-3.",
     ),
+    calib_dataset: str = typer.Option(
+        "wikitext", "--calib-dataset",
+        help="HF dataset for calibration corpus.",
+    ),
+    calib_config: str = typer.Option(
+        "wikitext-2-raw-v1", "--calib-config",
+        help="HF dataset config name.",
+    ),
+    calib_split: str = typer.Option(
+        "train", "--calib-split",
+        help="HF dataset split.",
+    ),
+    calib_num_samples: Optional[int] = typer.Option(
+        None, "--calib-num-samples",
+        help="Max calibration samples (default: use all available up to n_texts_cal).",
+    ),
+    calib_seq_len: Optional[int] = typer.Option(
+        None, "--calib-seq-len",
+        help="Sequence length for calibration (default: model max_len).",
+    ),
+    calib_seed: Optional[int] = typer.Option(
+        None, "--calib-seed",
+        help="Seed for calibration sampling (default: same as --seed).",
+    ),
+    calib_text_field: str = typer.Option(
+        "text", "--calib-text-field",
+        help="Name of the text column in the HF dataset.",
+    ),
 ) -> None:
     """Compile a model across a Pareto frontier of quality vs speed."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
     log = logging.getLogger("dystrio.sculpt")
 
     import torch
@@ -118,6 +156,17 @@ def sculpt(
     from .search import FrontierSearch
     from .emit import emit_frontier_point, emit_run_metadata
     from .validate import validate_saved_model
+    from ._data import CalibConfig
+
+    calib_cfg = CalibConfig(
+        dataset=calib_dataset,
+        config=calib_config,
+        split=calib_split,
+        text_field=calib_text_field,
+        num_samples=calib_num_samples,
+        seq_len=calib_seq_len,
+        seed=calib_seed if calib_seed is not None else 0,
+    )
 
     outpath = Path(outdir)
     outpath.mkdir(parents=True, exist_ok=True)
@@ -126,7 +175,10 @@ def sculpt(
         "deterministic": deterministic,
         "seed": 0,
         "dtype": dtype_str,
+        **calib_cfg.to_dict(),
     })
+
+    log.info("  calib:         %s / %s / %s", calib_dataset, calib_config, calib_split)
 
     search = FrontierSearch(
         model_id=model_id,
@@ -139,6 +191,7 @@ def sculpt(
         dtype_str=dtype_str,
         policy_override=policy_override,
         outdir=outpath,
+        calib=calib_cfg,
     )
 
     selected = search.run()
@@ -211,11 +264,6 @@ def bench(
     baseline_model: Optional[str] = typer.Option(None, "--baseline-model", help="Baseline model for ppl_ratio."),
 ) -> None:
     """Benchmark baseline + sculpted models across workloads."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
     from .bench_runner import run_bench
 
     outpath = Path(outdir)
@@ -265,11 +313,6 @@ def bench_report(
     ),
 ) -> None:
     """Generate plots and model-card snippet from existing benchmark results."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
     from .report import generate_report
     bo = Path(bench_out) if bench_out else None
     generate_report(Path(results_dir), Path(outdir), bench_out=bo)
@@ -282,11 +325,6 @@ def bench_audit(
     bench_out: str = typer.Option(..., "--bench-out", help="Root bench output dir."),
 ) -> None:
     """Audit benchmark results for publishability."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
     from .audit import run_audit
     result = run_audit(Path(bench_out))
     overall = result.get("overall", "?")

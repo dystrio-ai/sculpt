@@ -451,6 +451,13 @@ def emit_run_metadata(
         "decode_steps": 32,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    # Calibration corpus provenance (written by sculpt, absent for bench)
+    for ck in (
+        "calib_dataset", "calib_config", "calib_split",
+        "calib_text_field", "calib_num_samples", "calib_seq_len", "calib_seed",
+    ):
+        if ck in config:
+            metadata[ck] = config[ck]
     try:
         _write_json(outdir / "run_metadata.json", metadata)
     except Exception as exc:

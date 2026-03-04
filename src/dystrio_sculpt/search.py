@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from ._model import load_model_and_tokenizer, resolve_dtype
-from ._data import load_text_sets
+from ._data import CalibConfig, load_text_sets
 from .engine import CompileResult, compile_model, _collect_metrics, setup_determinism, MAX_LEN
 from .policy import RepairPolicy, auto_select_policy
 from .risk import model_risk_score, risk_aware_keep_candidates, layer_compressibility_order
@@ -137,6 +137,7 @@ class FrontierSearch:
         selector: str = "structural",
         policy_override: Optional[RepairPolicy] = None,
         outdir: Optional[Path] = None,
+        calib: Optional[CalibConfig] = None,
     ):
         self.model_id = model_id
         self.n_frontier = n_frontier
@@ -160,6 +161,7 @@ class FrontierSearch:
         self.selector = selector
         self.policy_override = policy_override
         self.outdir = outdir
+        self.calib = calib
 
         self.texts: Optional[Dict[str, List[str]]] = None
         self.prescan_cache: Optional[Dict[int, Dict[str, Any]]] = None
@@ -184,7 +186,9 @@ class FrontierSearch:
         self._start_time = time.time()
         setup_determinism(self.seed, self.deterministic)
         _log.info("loading datasets")
-        self.texts = load_text_sets(self.n_texts_cal, self.n_texts_train, self.n_texts_eval)
+        self.texts = load_text_sets(
+            self.n_texts_cal, self.n_texts_train, self.n_texts_eval, calib=self.calib,
+        )
 
     def _compute_baseline(self) -> None:
         _log.info("computing baseline (no compression)")

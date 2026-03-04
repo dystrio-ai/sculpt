@@ -486,6 +486,95 @@ class TestModelCardSnippet:
         assert not (report_dir / "model_card_snippet.md").exists()
 
 
+# ── memory vs quality plot ────────────────────────────────────────────────────
+
+class TestMemoryVsQuality:
+    def test_plot_and_table_generated(self, tmp_path):
+        from dystrio_sculpt.report import _plot_memory_vs_quality
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            pytest.skip("matplotlib not installed")
+
+        rows = [
+            {"model_id": "org/baseline-model", "ppl_ratio": "1.0", "steady_state_alloc_gb": "8.5"},
+            {"model_id": "org/sculpted-conservative", "ppl_ratio": "1.02", "steady_state_alloc_gb": "6.1"},
+            {"model_id": "org/sculpted-balanced", "ppl_ratio": "1.08", "steady_state_alloc_gb": "5.0"},
+        ]
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        _plot_memory_vs_quality(rows, report_dir, plt)
+
+        assert (report_dir / "memory_vs_quality.png").exists()
+        assert (report_dir / "memory_vs_quality.md").exists()
+
+        md = (report_dir / "memory_vs_quality.md").read_text()
+        assert "| PPL Ratio | VRAM (GB) |" in md
+        assert "baseline" in md.lower()
+        assert "1.000" in md
+        assert "8.500" in md
+
+    def test_baseline_star_marker(self, tmp_path):
+        from dystrio_sculpt.report import _plot_memory_vs_quality
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            pytest.skip("matplotlib not installed")
+
+        rows = [
+            {"model_id": "org/baseline-v1", "ppl_ratio": "1.0", "steady_state_alloc_gb": "8.0"},
+            {"model_id": "org/sculpted-v1", "ppl_ratio": "1.05", "steady_state_alloc_gb": "6.0"},
+        ]
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        _plot_memory_vs_quality(rows, report_dir, plt)
+        assert (report_dir / "memory_vs_quality.png").exists()
+
+    def test_skipped_when_no_data(self, tmp_path):
+        from dystrio_sculpt.report import _plot_memory_vs_quality
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            pytest.skip("matplotlib not installed")
+
+        rows = [{"model_id": "m1", "workload": "chat"}]
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        _plot_memory_vs_quality(rows, report_dir, plt)
+        assert not (report_dir / "memory_vs_quality.png").exists()
+
+    def test_table_values_rounded(self, tmp_path):
+        from dystrio_sculpt.report import _plot_memory_vs_quality
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            pytest.skip("matplotlib not installed")
+
+        rows = [
+            {"model_id": "org/model-x", "ppl_ratio": "1.12345", "steady_state_alloc_gb": "7.56789"},
+        ]
+        report_dir = tmp_path / "report"
+        report_dir.mkdir()
+        _plot_memory_vs_quality(rows, report_dir, plt)
+
+        md = (report_dir / "memory_vs_quality.md").read_text()
+        assert "1.123" in md
+        assert "7.568" in md
+        assert "1.12345" not in md
+
+
 # ── TTFT naming clarity ──────────────────────────────────────────────────────
 
 class TestTTFTNaming:
