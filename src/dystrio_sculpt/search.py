@@ -55,12 +55,24 @@ def _is_safe(pt: FrontierPoint, ceiling: float) -> bool:
     return not pt.failed and pt.ppl_ratio <= ceiling
 
 
+_ORDERED_TIER_NAMES = ["conservative", "balanced", "aggressive"]
+
+
 def _assign_labels(
     selected: List[FrontierPoint], ceiling: Optional[float],
 ) -> None:
-    """Assign semantic labels based on role, not index."""
+    """Assign semantic labels by keep_frac order (descending).
+
+    Highest keep_frac = conservative, next = balanced, next = aggressive.
+    Points above the quality ceiling are excluded from named tiers and
+    given generic ``point_N`` labels.  With only 1 point, it gets
+    "balanced" if safe, "conservative" otherwise.
+    """
     if not selected:
         return
+
+    # Sort by keep_frac descending (most conservative first)
+    selected.sort(key=lambda p: -p.keep_frac)
 
     if len(selected) == 1:
         pt = selected[0]
@@ -70,39 +82,22 @@ def _assign_labels(
             pt.label = "frontier_0_conservative"
         return
 
-    # Sort by keep_frac descending (most conservative first)
-    selected.sort(key=lambda p: -p.keep_frac)
+    # Separate safe (under ceiling) from unsafe points
+    safe = [p for p in selected if ceiling is None or _is_safe(p, ceiling)]
+    unsafe = [p for p in selected if p not in safe]
 
-    selected[0].label = "frontier_0_conservative"
-
-    if len(selected) >= 2:
-        # The fastest safe point is "balanced"
-        safe_sorted = sorted(
-            [p for p in selected if ceiling is None or _is_safe(p, ceiling)],
-            key=lambda p: -p.prefill_speedup,
-        )
-        if safe_sorted:
-            fastest_safe = safe_sorted[0]
-            if fastest_safe is not selected[0]:
-                fastest_safe.label = f"frontier_1_balanced"
-
-    # Label remaining unlabeled points
-    idx = 2
-    for pt in selected:
-        if pt.label:
-            continue
-        if ceiling and not _is_safe(pt, ceiling):
-            continue
-        if idx == 2:
-            pt.label = f"frontier_{idx}_aggressive"
+    # Assign named tiers to safe points in keep_frac order
+    for i, pt in enumerate(safe):
+        if i < len(_ORDERED_TIER_NAMES):
+            pt.label = f"frontier_{i}_{_ORDERED_TIER_NAMES[i]}"
         else:
-            pt.label = f"frontier_{idx}_point{idx}"
-        idx += 1
-
-    # Ensure all have labels
-    for i, pt in enumerate(selected):
-        if not pt.label:
             pt.label = f"frontier_{i}_point{i}"
+
+    # Label unsafe points generically
+    next_idx = len(safe)
+    for pt in unsafe:
+        pt.label = f"frontier_{next_idx}_point{next_idx}"
+        next_idx += 1
 
 
 class FrontierSearch:

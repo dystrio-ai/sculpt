@@ -164,3 +164,49 @@ class TestCeilingEnforcement:
         _assign_labels(pts, 2.0)
         for pt in pts:
             assert pt.label, "every point must have a label"
+
+    def test_three_points_ordered_by_keep_frac(self):
+        pts = [
+            _make_point(0.88, 1.07, 1.04),
+            _make_point(0.82, 1.25, 1.09),
+            _make_point(0.75, 1.47, 1.16),
+        ]
+        _assign_labels(pts, 2.0)
+        labels = {pt.keep_frac: pt.label for pt in pts}
+        assert "conservative" in labels[0.88]
+        assert "balanced" in labels[0.82]
+        assert "aggressive" in labels[0.75]
+
+    def test_two_points_conservative_and_balanced(self):
+        pts = [
+            _make_point(0.88, 1.07, 1.04),
+            _make_point(0.75, 1.47, 1.16),
+        ]
+        _assign_labels(pts, 2.0)
+        labels = {pt.keep_frac: pt.label for pt in pts}
+        assert "conservative" in labels[0.88]
+        assert "balanced" in labels[0.75]
+
+    def test_above_ceiling_gets_generic_label(self):
+        pts = [
+            _make_point(0.9, 1.1, 1.0),
+            _make_point(0.7, 1.5, 1.3),
+            _make_point(0.5, 2.5, 1.8),  # above 2.0 ceiling
+        ]
+        _assign_labels(pts, 2.0)
+        above = [p for p in pts if p.keep_frac == 0.5][0]
+        assert "point" in above.label
+        assert "conservative" not in above.label
+        assert "balanced" not in above.label
+        assert "aggressive" not in above.label
+
+    def test_label_indices_are_sequential(self):
+        pts = [
+            _make_point(0.9, 1.1, 1.0),
+            _make_point(0.8, 1.3, 1.15),
+            _make_point(0.7, 1.5, 1.3),
+        ]
+        _assign_labels(pts, 2.0)
+        assert pts[0].label.startswith("frontier_0")
+        assert pts[1].label.startswith("frontier_1")
+        assert pts[2].label.startswith("frontier_2")
