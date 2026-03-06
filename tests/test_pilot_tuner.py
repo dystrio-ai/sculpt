@@ -1092,8 +1092,9 @@ class TestMetricsJsonDerivedKeys:
             "prefill_p95_latency_improvement_pct", "decode_p95_latency_improvement_pct",
             "prefill_throughput_gain_pct", "decode_throughput_gain_pct",
             "gpu_hour_reduction_rag_pct",
-            "steady_state_memory_reduction_pct",
+            "weights_memory_reduction_pct", "steady_state_memory_reduction_pct",
             "compile_minutes",
+            "num_params", "weights_gb",
         ]
         for col in required:
             assert col in _SUMMARY_COLUMNS, f"Missing summary column: {col}"
@@ -1106,6 +1107,7 @@ class TestMetricsJsonDerivedKeys:
             "gpu_hour_reduction_chat_pct", "gpu_hour_reduction_rag_pct",
             "gpu_hour_reduction_batch_pct",
             "baseline_steady_state_alloc_gb", "steady_state_memory_reduction_pct",
+            "weights_memory_reduction_pct",
             "repair_steps_per_stage", "compile_minutes",
         }
         assert expected == set(_DERIVED_KEYS)
@@ -1182,3 +1184,96 @@ class TestDerivedMetricComputation:
         total_steps = 500
         n_stages = 10
         assert round(total_steps / max(1, n_stages), 1) == 50.0
+
+
+# ── Weights-only memory in sculpt emit ────────────────────────────────────────
+
+class TestSculptEmitWeightsMemory:
+    """Verify weights_gb and num_params flow through the sculpt emit path."""
+
+    def test_compile_result_has_weight_fields(self):
+        from dystrio_sculpt.engine import CompileResult
+
+        cr = CompileResult()
+        assert hasattr(cr, "num_params")
+        assert hasattr(cr, "weights_bytes")
+        assert hasattr(cr, "baseline_num_params")
+        assert hasattr(cr, "baseline_weights_bytes")
+
+    def test_emit_frontier_point_writes_weights(self, tmp_path):
+        import json
+        import torch
+        from dystrio_sculpt.emit import emit_frontier_point
+
+        model = torch.nn.Linear(256, 128, bias=False)
+        model.save_pretrained = lambda path, **kw: None
+        num_p = 256 * 128
+        wbytes = num_p * 4  # float32
+
+        class FakeTokenizer:
+            def save_pretrained(self, path):
+                pass
+
+        model.config = type("Cfg", (), {
+            "intermediate_size": 128,
+            "num_hidden_layers": 1,
+        })()
+        model.model = type("M", (), {"layers": []})()
+
+        point_dir = emit_frontier_point(
+            model=model,
+            tokenizer=FakeTokenizer(),
+            outdir=tmp_path,
+            label="frontier_0_conservative",
+            keep_frac=0.85,
+            metrics={"ppl_w2_test": 10.0, "ppl_w103_valid": 11.0,
+                      "prefill_tokens_per_sec": 5000, "decode_tokens_per_sec": 50},
+            baseline_metrics={"ppl_w103_valid": 10.0,
+                               "prefill_tokens_per_sec": 4500, "decode_tokens_per_sec": 55},
+            compile_report={},
+            config={"model_id": "test", "seed": 0},
+            wall_time_s=100.0,
+            num_params=num_p,
+            weights_bytes=wbytes,
+            baseline_num_params=num_p * 2,
+            baseline_weights_bytes=wbytes * 2,
+        )
+
+        metrics = json.loads((point_dir / "metrics.json").read_text())
+        assert metrics["num_params"] == num_p
+        assert metrics["weights_gb"] > 0
+        assert metrics["baseline_num_params"] == num_p * 2
+        assert metrics["baseline_weights_gb"] > 0
+        assert metrics["weights_memory_reduction_pct"] is not None
+        assert metrics["weights_memory_reduction_pct"] > 0
+
+    def test_summary_csv_includes_weights(self, tmp_path):
+        import csv
+        from dystrio_sculpt.emit import append_summary_csv
+
+        append_summary_csv(
+            outdir=tmp_path, name="test", keep_frac=0.85,
+            ppl_w103=11.0, baseline_ppl_w103=10.0,
+            prefill_speedup=1.1, decode_speedup=0.95,
+            compile_time_s=100.0,
+            num_params=1000000, weights_gb=3.725,
+            weights_memory_reduction_pct=9.5,
+        )
+
+        csv_path = tmp_path / "summary.csv"
+        assert csv_path.exists()
+        with open(csv_path) as f:
+            rows = list(csv.DictReader(f))
+        assert len(rows) == 1
+        assert rows[0]["num_params"] == "1000000"
+        assert rows[0]["weights_gb"] == "3.725"
+        assert rows[0]["weights_memory_reduction_pct"] == "9.5"
+
+    def test_weights_reduction_math(self):
+        from dystrio_sculpt.emit import _safe_pct
+
+        baseline_gb = 14.24
+        sculpted_gb = 11.53
+        pct = _safe_pct(baseline_gb, sculpted_gb)
+        assert pct > 0
+        assert abs(pct - 19.03) < 0.5

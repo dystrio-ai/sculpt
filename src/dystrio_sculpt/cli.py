@@ -224,6 +224,10 @@ def sculpt(
             peak_cuda_reserved_bench_bytes=cr.peak_cuda_reserved_bench_bytes,
             cuda_allocated_end_bytes=cr.cuda_allocated_end_bytes,
             cuda_reserved_end_bytes=cr.cuda_reserved_end_bytes,
+            num_params=cr.num_params,
+            weights_bytes=cr.weights_bytes,
+            baseline_num_params=cr.baseline_num_params,
+            baseline_weights_bytes=cr.baseline_weights_bytes,
         )
 
         model_dir = point_dir / "model"

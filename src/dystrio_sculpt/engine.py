@@ -71,6 +71,10 @@ class CompileResult:
     peak_cuda_reserved_bench_bytes: Optional[int] = None
     cuda_allocated_end_bytes: Optional[int] = None
     cuda_reserved_end_bytes: Optional[int] = None
+    num_params: Optional[int] = None
+    weights_bytes: Optional[int] = None
+    baseline_num_params: Optional[int] = None
+    baseline_weights_bytes: Optional[int] = None
 
 
 def _collect_metrics(
@@ -213,6 +217,9 @@ def compile_model(
         baseline_metrics = _collect_metrics(model, tok, texts, device, max_eval_tokens)
         if torch.cuda.is_available():
             baseline_metrics["cuda_allocated_baseline_bytes"] = torch.cuda.memory_allocated()
+
+    baseline_num_params = sum(p.numel() for p in model.parameters())
+    baseline_weights_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
 
     rng = np.random.RandomState(seed) if deterministic else None
 
@@ -473,6 +480,9 @@ def compile_model(
         peak_resv_compile = torch.cuda.max_memory_reserved()
         torch.cuda.reset_peak_memory_stats()
 
+    sculpt_num_params = sum(p.numel() for p in model.parameters())
+    sculpt_weights_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+
     # Final evaluation + benchmark (full token budget)
     metrics_post = _collect_metrics(model, tok, texts, device, policy.final_eval_max_tokens)
 
@@ -545,4 +555,8 @@ def compile_model(
         peak_cuda_reserved_bench_bytes=peak_resv_bench,
         cuda_allocated_end_bytes=end_alloc,
         cuda_reserved_end_bytes=end_resv,
+        num_params=sculpt_num_params,
+        weights_bytes=sculpt_weights_bytes,
+        baseline_num_params=baseline_num_params,
+        baseline_weights_bytes=baseline_weights_bytes,
     )

@@ -88,6 +88,7 @@ _DERIVED_KEYS = [
     "gpu_hour_reduction_chat_pct", "gpu_hour_reduction_rag_pct",
     "gpu_hour_reduction_batch_pct",
     "baseline_steady_state_alloc_gb", "steady_state_memory_reduction_pct",
+    "weights_memory_reduction_pct",
     "repair_steps_per_stage", "compile_minutes",
 ]
 
@@ -96,13 +97,14 @@ _SUMMARY_COLUMNS = [
     "prefill_speedup", "decode_speedup", "risk_score", "compile_time_s",
     "e2e_speedup_chat", "e2e_speedup_rag", "e2e_speedup_batch",
     "prefill_ms_p95", "decode_ms_per_tok_p95",
+    "num_params", "weights_gb",
     "peak_compile_alloc_gb", "peak_bench_alloc_gb", "steady_state_alloc_gb",
     # whitepaper-grade additions
     "baseline_prefill_ms_p95", "baseline_decode_ms_per_tok_p95",
     "prefill_p95_latency_improvement_pct", "decode_p95_latency_improvement_pct",
     "prefill_throughput_gain_pct", "decode_throughput_gain_pct",
     "gpu_hour_reduction_rag_pct",
-    "steady_state_memory_reduction_pct",
+    "weights_memory_reduction_pct", "steady_state_memory_reduction_pct",
     "compile_minutes",
 ]
 
@@ -122,6 +124,8 @@ def append_summary_csv(
     e2e_speedup_batch: Optional[float] = None,
     prefill_ms_p95: Optional[float] = None,
     decode_ms_per_tok_p95: Optional[float] = None,
+    num_params: Optional[int] = None,
+    weights_gb: Optional[float] = None,
     peak_compile_alloc_gb: Optional[float] = None,
     peak_bench_alloc_gb: Optional[float] = None,
     steady_state_alloc_gb: Optional[float] = None,
@@ -132,6 +136,7 @@ def append_summary_csv(
     prefill_throughput_gain_pct: Optional[float] = None,
     decode_throughput_gain_pct: Optional[float] = None,
     gpu_hour_reduction_rag_pct: Optional[float] = None,
+    weights_memory_reduction_pct: Optional[float] = None,
     steady_state_memory_reduction_pct: Optional[float] = None,
     compile_minutes: Optional[float] = None,
 ) -> None:
@@ -162,6 +167,8 @@ def append_summary_csv(
             "e2e_speedup_batch": _fmt(e2e_speedup_batch, "{:.3f}"),
             "prefill_ms_p95": _fmt(prefill_ms_p95, "{:.1f}"),
             "decode_ms_per_tok_p95": _fmt(decode_ms_per_tok_p95, "{:.3f}"),
+            "num_params": num_params if num_params is not None else "",
+            "weights_gb": _fmt(weights_gb, "{:.3f}"),
             "peak_compile_alloc_gb": _fmt(peak_compile_alloc_gb, "{:.2f}"),
             "peak_bench_alloc_gb": _fmt(peak_bench_alloc_gb, "{:.2f}"),
             "steady_state_alloc_gb": _fmt(steady_state_alloc_gb, "{:.2f}"),
@@ -172,6 +179,7 @@ def append_summary_csv(
             "prefill_throughput_gain_pct": _fmt(prefill_throughput_gain_pct, "{:.1f}"),
             "decode_throughput_gain_pct": _fmt(decode_throughput_gain_pct, "{:.1f}"),
             "gpu_hour_reduction_rag_pct": _fmt(gpu_hour_reduction_rag_pct, "{:.1f}"),
+            "weights_memory_reduction_pct": _fmt(weights_memory_reduction_pct, "{:.1f}"),
             "steady_state_memory_reduction_pct": _fmt(steady_state_memory_reduction_pct, "{:.1f}"),
             "compile_minutes": _fmt(compile_minutes, "{:.1f}"),
         })
@@ -196,6 +204,10 @@ def emit_frontier_point(
     peak_cuda_reserved_bench_bytes: Optional[int] = None,
     cuda_allocated_end_bytes: Optional[int] = None,
     cuda_reserved_end_bytes: Optional[int] = None,
+    num_params: Optional[int] = None,
+    weights_bytes: Optional[int] = None,
+    baseline_num_params: Optional[int] = None,
+    baseline_weights_bytes: Optional[int] = None,
 ) -> Path:
     """Save a single frontier point: model weights, metrics, and manifest.
 
@@ -240,8 +252,16 @@ def emit_frontier_point(
             3,
         )
 
+    # Weights-only memory (deterministic, runtime-independent)
+    weights_gb = round(weights_bytes / (1024 ** 3), 6) if weights_bytes is not None else None
+    baseline_weights_gb = round(baseline_weights_bytes / (1024 ** 3), 6) if baseline_weights_bytes is not None else None
+
     # VRAM: compile peaks, bench peaks, steady-state (bytes -> GiB)
     vram = {
+        "num_params": num_params,
+        "weights_gb": weights_gb,
+        "baseline_num_params": baseline_num_params,
+        "baseline_weights_gb": baseline_weights_gb,
         "peak_compile_alloc_gb": _bytes_to_gib(peak_cuda_allocated_compile_bytes),
         "peak_compile_reserved_gb": _bytes_to_gib(peak_cuda_reserved_compile_bytes),
         "peak_bench_alloc_gb": _bytes_to_gib(peak_cuda_allocated_bench_bytes),
@@ -282,6 +302,7 @@ def emit_frontier_point(
     derived["steady_state_memory_reduction_pct"] = _safe_pct(
         baseline_steady_gb, vram.get("steady_state_alloc_gb"),
     )
+    derived["weights_memory_reduction_pct"] = _safe_pct(baseline_weights_gb, weights_gb)
 
     total_repair_steps = config.get("total_repair_steps", 0)
     n_stages = max(1, len(config.get("stage_stats", [])))
@@ -388,6 +409,8 @@ def emit_frontier_point(
         e2e_speedup_batch=e2e_speedups.get("batch"),
         prefill_ms_p95=sculpt_prefill_p95,
         decode_ms_per_tok_p95=sculpt_decode_p95,
+        num_params=num_params,
+        weights_gb=weights_gb,
         peak_compile_alloc_gb=vram["peak_compile_alloc_gb"],
         peak_bench_alloc_gb=vram["peak_bench_alloc_gb"],
         steady_state_alloc_gb=vram["steady_state_alloc_gb"],
@@ -398,6 +421,7 @@ def emit_frontier_point(
         prefill_throughput_gain_pct=derived.get("prefill_throughput_gain_pct"),
         decode_throughput_gain_pct=derived.get("decode_throughput_gain_pct"),
         gpu_hour_reduction_rag_pct=derived.get("gpu_hour_reduction_rag_pct"),
+        weights_memory_reduction_pct=derived.get("weights_memory_reduction_pct"),
         steady_state_memory_reduction_pct=derived.get("steady_state_memory_reduction_pct"),
         compile_minutes=derived.get("compile_minutes"),
     )
