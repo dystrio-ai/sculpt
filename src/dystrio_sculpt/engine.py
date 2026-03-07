@@ -27,7 +27,7 @@ from ._bench import (
 )
 from ._compile import compress_mlp_layer_swiglu_inplace
 from .selectors import select_for_layer, BLOCK_SIZE
-from .selectors.structural import prescan_structural_artifacts
+from .selectors.structural import prescan_structural_artifacts, CrossLayerNoveltyTracker
 from .repair import repair_layers, _snapshot_trainable, _restore_trainable
 from .policy import RepairPolicy, auto_select_policy, build_policy_ladder, escalate_policy, HELPFUL_THRESHOLD
 
@@ -184,12 +184,18 @@ def compile_model(
     layer_order: Optional[List[int]] = None,
     allow_escalation: bool = True,
     calib: Optional[CalibConfig] = None,
+    keep_schedule: Optional[Dict[int, float]] = None,
 ) -> CompileResult:
     """Compile a model at a specific keep_frac.
 
     Orchestrates: load -> prescan -> staged compress -> repair -> eval.
     Uses *policy* for all repair hyperparameters.  If a stage fails, attempts
     one downshift to a more conservative policy before marking as failed.
+
+    When *keep_schedule* is provided, each layer uses its own keep_frac
+    from the schedule (a dict mapping layer index to keep_frac).  The
+    scalar *keep_frac* is still stored in the result for labeling but
+    per-layer values take precedence during compression.
     """
     wall_t0 = time.time()
     setup_determinism(seed, deterministic)
@@ -233,6 +239,9 @@ def compile_model(
     original_ffn_dims: Dict[int, int] = {}
     for li in layers:
         original_ffn_dims[li] = model.model.layers[li].mlp.gate_proj.out_features
+
+    # Cross-layer novelty tracker for structural diversity across layers
+    novelty_tracker = CrossLayerNoveltyTracker() if selector == "structural" else None
 
     if layer_order is not None and keep_frac < 1.0:
         compressible = [li for li in layer_order if li in set(layers)]
@@ -289,17 +298,34 @@ def compile_model(
         pre_stage_snap = _snapshot_trainable(model, compressed_so_far + chunk) if compressed_so_far else None
 
         for li in chunk:
-            kept_blocks, kept_idx, _ = select_for_layer(
-                model, tok, li, texts["cal"], keep_frac,
+            layer_kf = keep_schedule[li] if keep_schedule and li in keep_schedule else keep_frac
+            if layer_kf >= 1.0:
+                _log.info("layer %d: keep_frac=%.3f (protected, skipping)", li, layer_kf)
+                continue
+
+            n_blocks_li = original_ffn_dims[li] // BLOCK_SIZE
+            novelty = (
+                novelty_tracker.novelty_multiplier(n_blocks_li)
+                if novelty_tracker is not None else None
+            )
+
+            kept_blocks, kept_idx, sel_arts = select_for_layer(
+                model, tok, li, texts["cal"], layer_kf,
                 MAX_LEN, device, selector=selector,
                 prescan_cache=prescan_cache, rng=rng,
+                cross_layer_novelty=novelty,
             )
+
+            if novelty_tracker is not None:
+                block_adj = sel_arts.get("block_adj_norm") if sel_arts else None
+                novelty_tracker.record(kept_blocks, n_blocks_li, block_adj=block_adj)
+
             rep = compress_mlp_layer_swiglu_inplace(model, li, kept_idx, dtype, device)
             compile_report[str(li)] = {
                 "kept_blocks": len(kept_blocks),
                 "original_ffn": original_ffn_dims[li],
                 "ffn_kept": rep["ffn_kept"],
-                "keep_frac": keep_frac,
+                "keep_frac": layer_kf,
             }
         compressed_so_far.extend(chunk)
 
@@ -511,6 +537,7 @@ def compile_model(
     config = {
         "model_id": model_id,
         "keep_frac": keep_frac,
+        "keep_schedule": {str(k): v for k, v in keep_schedule.items()} if keep_schedule else None,
         "seed": seed,
         "deterministic": deterministic,
         "device": device,

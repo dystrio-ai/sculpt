@@ -110,6 +110,21 @@ def sculpt(
         "text", "--calib-text-field",
         help="Name of the text column in the HF dataset.",
     ),
+    speed_profile: Optional[str] = typer.Option(
+        None, "--speed-profile",
+        help="Workload speed profile: balanced, prefill_heavy, decode_heavy, "
+             "rag, chatbot, throughput, latency.",
+    ),
+    use_risk_schedule: bool = typer.Option(
+        False, "--use-risk-schedule",
+        help="Derive per-layer keep_frac from structural risk scores "
+             "instead of a uniform value.",
+    ),
+    protection_threshold: Optional[float] = typer.Option(
+        None, "--protection-threshold",
+        help="Risk score above which layers skip compression entirely. "
+             "[default: 0.70]",
+    ),
 ) -> None:
     """Compile a model across a Pareto frontier of quality vs speed."""
     log = logging.getLogger("dystrio.sculpt")
@@ -132,6 +147,12 @@ def sculpt(
         log.info("  time_budget:   %.1fh", max_compile_hours)
     if policy is not None:
         log.info("  policy:        %s (override)", policy)
+    if speed_profile is not None:
+        log.info("  speed_profile: %s", speed_profile)
+    if use_risk_schedule:
+        log.info("  risk_schedule: enabled")
+    if protection_threshold is not None:
+        log.info("  protection:    %.2f", protection_threshold)
 
     # Resolve optional policy override
     policy_override = None
@@ -192,6 +213,9 @@ def sculpt(
         policy_override=policy_override,
         outdir=outpath,
         calib=calib_cfg,
+        speed_profile=speed_profile,
+        use_risk_schedule=use_risk_schedule,
+        protection_threshold=protection_threshold,
     )
 
     selected = search.run()

@@ -3,14 +3,19 @@
 Pipeline:
   1. Base score  = operator sensitivity (how much zeroing block changes MLP output)
   2. Modulated   by normalised block energy
-  3. Diversity   from coupling graph (covariance -> correlation -> Physarum conductance)
+  3. Novelty     from cross-layer selection history (penalises blocks that are
+                 selected in every layer, encouraging structural diversity)
+  4. Diversity   from coupling graph (covariance -> correlation -> Physarum conductance)
                  penalises selecting tightly-coupled neighbours
+
+Cross-layer novelty filtering inspired by ShinkaEvolve (Sakana AI,
+arXiv:2509.19349) novelty-based rejection sampling.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -19,6 +24,8 @@ from .._calibrate import (
     collect_block_geometry_swiglu,
     collect_block_operator_sensitivity_swiglu,
 )
+
+DEFAULT_NOVELTY_LAMBDA = 0.15
 
 
 # ── Graph construction ────────────────────────────────────────────────────────
@@ -87,6 +94,103 @@ def physarum_conductance(
     return k
 
 
+# ── Cross-layer novelty tracking ──────────────────────────────────────────────
+
+
+class CrossLayerNoveltyTracker:
+    """Conductance-aware cross-layer novelty tracking.
+
+    Combines ShinkaEvolve-inspired novelty rejection (Sakana AI,
+    arXiv:2509.19349) with Physarum conductance coupling to perform
+    *structural deduplication* across layers.
+
+    Plain frequency counting treats blocks as independent: "block 5 was
+    selected in 3/4 layers, penalize it."  But Physarum conductance
+    reveals that blocks 5 and 6 are structurally coupled.  Selecting
+    block 6 in a new layer provides redundant structural coverage even
+    though block 6's raw count is low.
+
+    The hybrid approach propagates selection counts through the running
+    average conductance adjacency, so structurally-coupled neighbours of
+    frequently-selected blocks also receive a novelty penalty.
+    """
+
+    def __init__(
+        self,
+        novelty_lambda: float = DEFAULT_NOVELTY_LAMBDA,
+        conductance_diffusion: float = 0.3,
+    ):
+        self.novelty_lambda = novelty_lambda
+        self.conductance_diffusion = conductance_diffusion
+        self._block_counts: Optional[np.ndarray] = None
+        self._adj_accum: Optional[np.ndarray] = None
+        self._n_layers: int = 0
+
+    def record(
+        self,
+        kept_blocks: List[int],
+        n_blocks: int,
+        block_adj: Optional[np.ndarray] = None,
+    ) -> None:
+        """Register a layer's block selection and conductance adjacency.
+
+        *block_adj*, when provided, is the row-normalised block-level
+        adjacency from the Physarum conductance graph.  It is accumulated
+        as a running average across layers so that the novelty multiplier
+        reflects the model's average coupling topology.
+        """
+        if self._block_counts is None:
+            self._block_counts = np.zeros(n_blocks, dtype=np.float64)
+        for b in kept_blocks:
+            if b < len(self._block_counts):
+                self._block_counts[b] += 1.0
+
+        if block_adj is not None:
+            if self._adj_accum is None:
+                self._adj_accum = np.zeros_like(block_adj)
+            self._adj_accum += block_adj[:n_blocks, :n_blocks]
+
+        self._n_layers += 1
+
+    def novelty_multiplier(self, n_blocks: int) -> Optional[np.ndarray]:
+        """Per-block multiplier in [1.0, 1.0 + novelty_lambda].
+
+        When conductance adjacency is available, raw selection frequency
+        is diffused through the coupling graph: if block *i* was selected
+        often AND block *j* is structurally coupled to *i*, then *j* also
+        receives a (softer) novelty penalty.  The ``conductance_diffusion``
+        parameter controls how strongly the coupling propagates (0 = pure
+        frequency counting, 1 = full one-hop diffusion).
+
+        Returns None when no history is available yet.
+        """
+        if self._n_layers == 0 or self._block_counts is None:
+            return None
+
+        counts = self._block_counts[:n_blocks]
+        frequency = counts / self._n_layers
+
+        if self._adj_accum is not None and self.conductance_diffusion > 0:
+            avg_adj = self._adj_accum[:n_blocks, :n_blocks] / self._n_layers
+            row_max = avg_adj.max(axis=1, keepdims=True) + 1e-30
+            adj_norm = avg_adj / row_max
+            diffused = frequency + self.conductance_diffusion * (adj_norm @ frequency)
+            diffused = np.clip(diffused / (diffused.max() + 1e-30), 0.0, 1.0)
+        else:
+            diffused = frequency
+
+        novelty = 1.0 - diffused
+        return 1.0 + self.novelty_lambda * novelty
+
+    @property
+    def n_layers(self) -> int:
+        return self._n_layers
+
+    @property
+    def block_counts(self) -> Optional[np.ndarray]:
+        return self._block_counts.copy() if self._block_counts is not None else None
+
+
 # ── Selection ─────────────────────────────────────────────────────────────────
 
 
@@ -101,8 +205,14 @@ def select_blocks_structural(
     feature_multiplier: int = 3,
     block_sensitivity: torch.Tensor | None = None,
     rng: np.random.RandomState | None = None,
+    cross_layer_novelty: np.ndarray | None = None,
 ) -> Tuple[List[int], torch.Tensor, Dict[str, object]]:
-    """Structural block selection (operator-fidelity + coupling diversity)."""
+    """Structural block selection (operator-fidelity + coupling diversity).
+
+    When *cross_layer_novelty* is provided (from a CrossLayerNoveltyTracker),
+    base scores are modulated to favour blocks that weren't frequently selected
+    in earlier layers.
+    """
     n_feat = D.shape[0]
     F = feature_multiplier
     n_blocks = n_feat // F
@@ -140,6 +250,10 @@ def select_blocks_structural(
         be_norm = be / (be.max() + 1e-30)
         raw_scores = raw_scores * (0.5 + 0.5 * be_norm)
 
+    # Cross-layer novelty modulation
+    if cross_layer_novelty is not None:
+        raw_scores = raw_scores * cross_layer_novelty[:n_blocks]
+
     # Greedy selection with diversity penalty
     scores = raw_scores.copy()
     selected: List[int] = []
@@ -167,6 +281,7 @@ def select_blocks_structural(
         "edges": edges,
         "k_edge": torch.from_numpy(k_edge),
         "block_scores": torch.from_numpy(raw_scores),
+        "block_adj_norm": adj_norm,
     }
     return selected, torch.tensor(idx, dtype=torch.long), artifacts
 

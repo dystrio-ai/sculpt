@@ -26,6 +26,13 @@ MAX_LEN = 256
 SPIKE_LAMBDA = 6.0
 MIN_SLOPE_THRESHOLD = 1e-4
 HELPFUL_THRESHOLD = 0.002
+
+# Asymmetric exponential reward scaling factor.
+# At scale=10, a 5% improve_frac yields ~0.65 reward while 1% yields ~0.105,
+# giving >6x separation vs the <5x from a linear model.
+ASYMMETRIC_SCALE = 10.0
+
+# Legacy linear weights (kept for backward compatibility).
 WH = 1.0
 WI = 10.0
 WM = 12.0
@@ -263,6 +270,21 @@ def _stratified_pilot_chunks(
 # ── Pilot scoring ────────────────────────────────────────────────────────────
 
 
+def _asymmetric_reward(
+    improve_frac: float, scale: float = ASYMMETRIC_SCALE,
+) -> float:
+    """Exponentially-scaled asymmetric reward.
+
+    Only improvements contribute; regressions clamp to zero.  The exponential
+    amplifies large gains over incremental ones, encouraging bold policy
+    choices when they pay off while ignoring harmless non-improvements.
+
+    Inspired by ShinkaEvolve (Sakana AI, arXiv:2509.19349) asymmetric
+    bandit reward transformation.
+    """
+    return math.exp(scale * max(improve_frac, 0.0)) - 1.0
+
+
 def _score_pilot(
     P0: float, Pt: float, Pmax: float,
     elapsed_s: float, regression_stop: bool, nan_inf: bool,
@@ -288,10 +310,15 @@ def _score_two_stage_pilot(
     stage_stats: List[Dict[str, Any]],
     elapsed_s: float,
 ) -> tuple:
-    """Score a pilot candidate by helpfulness, total improvement, and peak win.
+    """Score a pilot candidate using asymmetric exponential rewards.
+
+    Each stage's improve_frac is transformed through an exponential that
+    (a) clamps regressions to zero and (b) amplifies large gains over
+    incremental ones.  The final score sums per-stage rewards plus the
+    peak single-stage reward, normalized by wall-clock time.
 
     Returns (score, stable, H, I, M) where:
-    - score: combined score (higher is better; -1e9 if unstable)
+    - score: asymmetric reward / time (higher is better; -1e9 if unstable)
     - stable: False if any stage had nan_inf (hard failure)
     - H: count of helpful stages
     - I: sum of improve_frac across stages
@@ -307,8 +334,13 @@ def _score_two_stage_pilot(
     H = sum(1 for s in stage_stats if s.get("repair_helpful", False))
     I = sum(s.get("improve_frac", 0.0) for s in stage_stats)
     M = max((s.get("improve_frac", 0.0) for s in stage_stats), default=0.0)
+
+    stage_rewards = [_asymmetric_reward(s.get("improve_frac", 0.0)) for s in stage_stats]
+    total_reward = sum(stage_rewards)
+    peak_reward = max(stage_rewards) if stage_rewards else 0.0
+
     T = max(1e-6, elapsed_s)
-    score = (WH * H + WI * I + WM * M) / T
+    score = (total_reward + peak_reward) / T
     return (score, True, H, I, M)
 
 

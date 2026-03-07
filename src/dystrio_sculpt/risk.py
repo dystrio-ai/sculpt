@@ -168,3 +168,74 @@ def risk_aware_keep_candidates(risk: float) -> List[float]:
     if risk >= 0.65:
         return [0.92, 0.88, 0.84, 0.80, 0.76, 0.72]
     return [0.88, 0.82, 0.75, 0.70, 0.66, 0.62]
+
+
+# ── Layer protection ──────────────────────────────────────────────────────────
+
+
+DEFAULT_PROTECTION_THRESHOLD = 0.70
+
+
+def protected_layers(
+    prescan_cache: Dict[int, Dict[str, Any]],
+    threshold: float = DEFAULT_PROTECTION_THRESHOLD,
+) -> List[int]:
+    """Return layer indices whose risk score exceeds *threshold*.
+
+    Protected layers should be skipped during compression (keep_frac=1.0)
+    because their structural risk is too high for safe pruning.  This
+    corresponds to the production practice of leaving final/deep blocks
+    untouched to preserve semantic integrity.
+    """
+    result: List[int] = []
+    for li in sorted(prescan_cache.keys()):
+        pre = prescan_cache[li]
+        bs = pre.get("block_sensitivity")
+        D = pre.get("D")
+        if bs is None or D is None:
+            continue
+        risk, _ = layer_risk_score(bs, D, pre.get("block_energy"))
+        if risk >= threshold:
+            result.append(li)
+    return result
+
+
+# ── Risk-weighted keep_frac schedule ──────────────────────────────────────────
+
+
+def risk_weighted_keep_schedule(
+    prescan_cache: Dict[int, Dict[str, Any]],
+    aggressiveness: float,
+    floor: float = 0.50,
+    ceiling: float = 1.0,
+    protection_threshold: float = DEFAULT_PROTECTION_THRESHOLD,
+) -> Dict[int, float]:
+    """Derive per-layer keep_frac from risk scores and a single scalar.
+
+    *aggressiveness* in [0, 1] controls how hard low-risk layers are
+    compressed.  At aggressiveness=0.5 with floor=0.50:
+      - A layer with risk=0.0 gets keep_frac = 0.50  (maximum compression)
+      - A layer with risk=1.0 gets keep_frac = 1.00  (no compression)
+      - A layer with risk=0.5 gets keep_frac ≈ 0.75  (midpoint)
+
+    Layers above *protection_threshold* are always set to 1.0 (skip).
+    The mapping is: keep = ceiling - aggressiveness * (ceiling - floor) * (1 - risk)
+    """
+    schedule: Dict[int, float] = {}
+    span = ceiling - floor
+
+    for li in sorted(prescan_cache.keys()):
+        pre = prescan_cache[li]
+        bs = pre.get("block_sensitivity")
+        D = pre.get("D")
+        if bs is None or D is None:
+            schedule[li] = ceiling
+            continue
+        risk, _ = layer_risk_score(bs, D, pre.get("block_energy"))
+        if risk >= protection_threshold:
+            schedule[li] = ceiling
+        else:
+            keep = ceiling - aggressiveness * span * (1.0 - risk)
+            schedule[li] = round(max(floor, min(ceiling, keep)), 4)
+
+    return schedule

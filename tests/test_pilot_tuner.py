@@ -8,6 +8,7 @@ import pytest
 
 from dystrio_sculpt.policy import (
     RepairPolicy,
+    _asymmetric_reward,
     _score_pilot,
     _score_two_stage_pilot,
     _stratified_pilot_chunks,
@@ -20,6 +21,7 @@ from dystrio_sculpt.policy import (
     build_policy_ladder,
     compute_e2e_speedup,
     E2E_PROFILES,
+    ASYMMETRIC_SCALE,
     HELPFUL_THRESHOLD,
     TIE_BREAK_GAIN,
     WH, WI, WM,
@@ -156,6 +158,46 @@ class TestStratifiedPilotChunks:
         layer_order = list(range(32))
         chunks = _stratified_pilot_chunks(layer_order, stage_size=4, K=2)
         assert chunks[0] != chunks[1]
+
+
+# ── 2b) Asymmetric reward function ─────────────────────────────────────────
+
+class TestAsymmetricReward:
+    def test_zero_improvement_zero_reward(self):
+        assert _asymmetric_reward(0.0) == 0.0
+
+    def test_negative_improvement_clamped_to_zero(self):
+        assert _asymmetric_reward(-0.05) == 0.0
+        assert _asymmetric_reward(-1.0) == 0.0
+
+    def test_positive_improvement_positive_reward(self):
+        assert _asymmetric_reward(0.01) > 0.0
+        assert _asymmetric_reward(0.05) > 0.0
+
+    def test_monotonically_increasing(self):
+        r1 = _asymmetric_reward(0.01)
+        r2 = _asymmetric_reward(0.03)
+        r3 = _asymmetric_reward(0.05)
+        r4 = _asymmetric_reward(0.10)
+        assert r1 < r2 < r3 < r4
+
+    def test_exponential_amplification(self):
+        """Doubling improve_frac more than doubles the reward."""
+        r_small = _asymmetric_reward(0.03)
+        r_large = _asymmetric_reward(0.06)
+        assert r_large > 2.0 * r_small
+
+    def test_custom_scale(self):
+        r_default = _asymmetric_reward(0.05)
+        r_low_scale = _asymmetric_reward(0.05, scale=1.0)
+        r_high_scale = _asymmetric_reward(0.05, scale=20.0)
+        assert r_low_scale < r_default < r_high_scale
+
+    def test_known_value(self):
+        """exp(10 * 0.05) - 1 = exp(0.5) - 1 ≈ 0.6487."""
+        import math
+        expected = math.exp(0.5) - 1.0
+        assert _asymmetric_reward(0.05) == pytest.approx(expected, rel=1e-6)
 
 
 # ── 3) Two-stage pilot scoring (with M term) ─────────────────────────────────
