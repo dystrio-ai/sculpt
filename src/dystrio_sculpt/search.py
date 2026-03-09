@@ -13,6 +13,7 @@ repair policy selection, and stage ordering.
 
 from __future__ import annotations
 
+import gc
 import logging
 import time
 from dataclasses import dataclass, field
@@ -444,6 +445,9 @@ class FrontierSearch:
             )
         except Exception as exc:
             _log.error("compile_model failed for kf=%.3f: %s", keep_frac, exc)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             point = FrontierPoint(
                 keep_frac=keep_frac, ppl_w103=float("inf"), ppl_w2=float("inf"),
                 prefill_tps=0.0, decode_tps=0.0, prefill_speedup=0.0,
@@ -468,6 +472,14 @@ class FrontierSearch:
                 "[search] escalation persisted: policy=%s (from keep=%.3f)",
                 self.policy.name, keep_frac,
             )
+
+        # Move model to CPU to free GPU for subsequent iterations.
+        # The model is still accessible for the emit step (saving to disk).
+        if result.model is not None:
+            result.model.cpu()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         m = result.metrics_post
         base = self.baseline_metrics
