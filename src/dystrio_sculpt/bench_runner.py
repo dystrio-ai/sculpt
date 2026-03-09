@@ -95,6 +95,7 @@ def _load_model(model_id: str, device: str, dtype_str: str):
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_id, torch_dtype=dtype, device_map=device, trust_remote_code=True,
+        ignore_mismatched_sizes=True,
     )
     model.eval()
     if tokenizer.pad_token is None:
