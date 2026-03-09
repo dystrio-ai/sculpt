@@ -206,36 +206,69 @@ def protected_layers(
 def risk_weighted_keep_schedule(
     prescan_cache: Dict[int, Dict[str, Any]],
     aggressiveness: float,
-    floor: float = 0.50,
+    floor: float = 0.30,
     ceiling: float = 1.0,
     protection_threshold: float = DEFAULT_PROTECTION_THRESHOLD,
 ) -> Dict[int, float]:
     """Derive per-layer keep_frac from risk scores and a single scalar.
 
-    *aggressiveness* in [0, 1] controls how hard low-risk layers are
-    compressed.  At aggressiveness=0.5 with floor=0.50:
-      - A layer with risk=0.0 gets keep_frac = 0.50  (maximum compression)
-      - A layer with risk=1.0 gets keep_frac = 1.00  (no compression)
-      - A layer with risk=0.5 gets keep_frac ≈ 0.75  (midpoint)
+    Computes a risk-shaped distribution of per-layer keep_frac values,
+    then rescales so the mean of non-protected layers equals the target
+    keep_frac (``1 - aggressiveness``).  This ensures the overall
+    compression budget is actually spent while distributing it according
+    to layer risk.
 
     Layers above *protection_threshold* are always set to 1.0 (skip).
-    The mapping is: keep = ceiling - aggressiveness * (ceiling - floor) * (1 - risk)
     """
-    schedule: Dict[int, float] = {}
-    span = ceiling - floor
+    target_kf = max(floor, 1.0 - aggressiveness)
 
-    for li in sorted(prescan_cache.keys()):
+    if aggressiveness <= 0:
+        return {li: ceiling for li in sorted(prescan_cache.keys())}
+
+    # Phase 1: compute raw risk-shaped weights (0 = safest, 1 = riskiest)
+    layers_sorted = sorted(prescan_cache.keys())
+    risks: Dict[int, float] = {}
+    protected: List[int] = []
+
+    for li in layers_sorted:
         pre = prescan_cache[li]
         bs = pre.get("block_sensitivity")
         D = pre.get("D")
         if bs is None or D is None:
-            schedule[li] = ceiling
+            protected.append(li)
             continue
         risk, _ = layer_risk_score(bs, D, pre.get("block_energy"))
         if risk >= protection_threshold:
+            protected.append(li)
+        else:
+            risks[li] = risk
+
+    if not risks:
+        return {li: ceiling for li in layers_sorted}
+
+    # Phase 2: distribute the target keep_frac across non-protected layers
+    # proportional to risk.  Higher risk => higher keep_frac.
+    risk_vals = np.array([risks[li] for li in sorted(risks.keys())])
+    risk_min, risk_max = float(risk_vals.min()), float(risk_vals.max())
+    risk_range = max(risk_max - risk_min, 1e-9)
+
+    # Normalized risk in [0, 1] where 0 = safest layer, 1 = riskiest
+    normed = {li: (risks[li] - risk_min) / risk_range for li in risks}
+
+    # Raw keep_frac shaped by risk: safest layer gets floor, riskiest
+    # non-protected gets ceiling.  Then we shift the whole curve so the
+    # mean equals target_kf.
+    span = ceiling - floor
+    raw = {li: floor + normed[li] * span for li in risks}
+    raw_mean = sum(raw.values()) / len(raw)
+    shift = target_kf - raw_mean
+
+    schedule: Dict[int, float] = {}
+    for li in layers_sorted:
+        if li in protected or li not in risks:
             schedule[li] = ceiling
         else:
-            keep = ceiling - aggressiveness * span * (1.0 - risk)
+            keep = raw[li] + shift
             schedule[li] = round(max(floor, min(ceiling, keep)), 4)
 
     return schedule
