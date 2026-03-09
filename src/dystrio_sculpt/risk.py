@@ -212,20 +212,19 @@ def risk_weighted_keep_schedule(
 ) -> Dict[int, float]:
     """Derive per-layer keep_frac from risk scores and a single scalar.
 
-    Computes a risk-shaped distribution of per-layer keep_frac values,
-    then rescales so the mean of non-protected layers equals the target
-    keep_frac (``1 - aggressiveness``).  This ensures the overall
-    compression budget is actually spent while distributing it according
-    to layer risk.
-
-    Layers above *protection_threshold* are always set to 1.0 (skip).
+    Ensures **total weight reduction** matches what uniform compression at
+    the same keep_frac would produce.  Protected layers (risk above
+    threshold) stay at 1.0, and non-protected layers compensate so the
+    whole-model average equals the target.  Within non-protected layers,
+    keep_frac is distributed proportionally to risk: safe layers are
+    compressed harder, risky layers lighter.
     """
     target_kf = max(floor, 1.0 - aggressiveness)
 
     if aggressiveness <= 0:
         return {li: ceiling for li in sorted(prescan_cache.keys())}
 
-    # Phase 1: compute raw risk-shaped weights (0 = safest, 1 = riskiest)
+    # Phase 1: identify protected vs compressible layers
     layers_sorted = sorted(prescan_cache.keys())
     risks: Dict[int, float] = {}
     protected: List[int] = []
@@ -246,22 +245,28 @@ def risk_weighted_keep_schedule(
     if not risks:
         return {li: ceiling for li in layers_sorted}
 
-    # Phase 2: distribute the target keep_frac across non-protected layers
+    n_total = len(layers_sorted)
+    n_protected = len(protected)
+    n_compressible = n_total - n_protected
+
+    # Phase 2: compute the compensated target for non-protected layers.
+    # Protected layers contribute ceiling (1.0) to the whole-model average,
+    # so compressible layers must absorb the full compression budget.
+    compensated_target = (target_kf * n_total - ceiling * n_protected) / n_compressible
+    compensated_target = max(floor, min(ceiling, compensated_target))
+
+    # Phase 3: distribute compensated target across non-protected layers
     # proportional to risk.  Higher risk => higher keep_frac.
     risk_vals = np.array([risks[li] for li in sorted(risks.keys())])
     risk_min, risk_max = float(risk_vals.min()), float(risk_vals.max())
     risk_range = max(risk_max - risk_min, 1e-9)
 
-    # Normalized risk in [0, 1] where 0 = safest layer, 1 = riskiest
     normed = {li: (risks[li] - risk_min) / risk_range for li in risks}
 
-    # Raw keep_frac shaped by risk: safest layer gets floor, riskiest
-    # non-protected gets ceiling.  Then we shift the whole curve so the
-    # mean equals target_kf.
     span = ceiling - floor
     raw = {li: floor + normed[li] * span for li in risks}
     raw_mean = sum(raw.values()) / len(raw)
-    shift = target_kf - raw_mean
+    shift = compensated_target - raw_mean
 
     schedule: Dict[int, float] = {}
     for li in layers_sorted:

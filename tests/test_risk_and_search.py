@@ -580,19 +580,17 @@ class TestRiskWeightedKeepSchedule:
         for kf in schedule.values():
             assert 0.30 <= kf <= 1.0
 
-    def test_mean_near_target(self):
+    def test_whole_model_mean_near_target(self):
         cache = _make_prescan_cache(16)
         for target_kf in [0.85, 0.70, 0.55]:
             agg = 1.0 - target_kf
             schedule = risk_weighted_keep_schedule(
                 cache, aggressiveness=agg, protection_threshold=0.90,
             )
-            non_protected = [v for v in schedule.values() if v < 1.0]
-            if non_protected:
-                mean_kf = sum(non_protected) / len(non_protected)
-                assert abs(mean_kf - target_kf) < 0.15, (
-                    f"target={target_kf} but mean={mean_kf:.3f}"
-                )
+            whole_model_mean = sum(schedule.values()) / len(schedule)
+            assert abs(whole_model_mean - target_kf) < 0.10, (
+                f"target={target_kf} but whole-model mean={whole_model_mean:.3f}"
+            )
 
 
 # ── Speed profile tests ──────────────────────────────────────────────────────
