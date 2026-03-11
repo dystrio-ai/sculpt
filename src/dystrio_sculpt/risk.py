@@ -164,10 +164,10 @@ def layer_compressibility_order(
 def risk_aware_keep_candidates(risk: float) -> List[float]:
     """Return initial keep_frac candidates adapted to structural risk."""
     if risk <= 0.35:
-        return [0.85, 0.78, 0.70, 0.62, 0.55]
+        return [0.85, 0.78, 0.70, 0.62, 0.55, 0.48, 0.42]
     if risk >= 0.65:
-        return [0.92, 0.88, 0.84, 0.80, 0.76, 0.72]
-    return [0.88, 0.82, 0.75, 0.70, 0.66, 0.62]
+        return [0.92, 0.88, 0.84, 0.80, 0.76, 0.72, 0.66, 0.60]
+    return [0.88, 0.82, 0.75, 0.70, 0.66, 0.60, 0.54, 0.48]
 
 
 # ── Layer protection ──────────────────────────────────────────────────────────

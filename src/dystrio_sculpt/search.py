@@ -155,7 +155,7 @@ def _is_safe(pt: FrontierPoint, ceiling: float) -> bool:
     return not pt.failed and pt.ppl_ratio <= ceiling
 
 
-_ORDERED_TIER_NAMES = ["conservative", "balanced", "aggressive"]
+_ORDERED_TIER_NAMES = ["conservative", "balanced", "aggressive", "extreme", "ultra"]
 
 
 def _assign_labels(
