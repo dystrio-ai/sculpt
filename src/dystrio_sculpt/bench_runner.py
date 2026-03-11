@@ -76,7 +76,8 @@ def sanitize_model_id(model_id: str) -> str:
 def model_shortname(model_id: str) -> str:
     """Derive a display-friendly short name from a model id."""
     base = model_id.rsplit("/", 1)[-1].lower()
-    for tag in ("baseline", "conservative", "balanced", "aggressive"):
+    for tag in ("baseline", "default", "production", "throughput", "experimental", "frontier",
+                 "conservative", "balanced", "aggressive"):
         if tag in base:
             return tag
     parts = base.replace("-", "_").split("_")

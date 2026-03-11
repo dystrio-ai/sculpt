@@ -86,7 +86,7 @@ class TestEmitArtifacts:
 
         point_dir = emit_frontier_point(
             model=model, tokenizer=tok,
-            outdir=tmp_path, label="frontier_0_conservative",
+            outdir=tmp_path, label="frontier_0_default",
             keep_frac=0.75,
             metrics={
                 "ppl_w2_test": 12.5, "ppl_w103_valid": 14.0,
@@ -108,7 +108,7 @@ class TestEmitArtifacts:
 
         metrics = json.loads((point_dir / "metrics.json").read_text())
         assert metrics["keep_frac"] == 0.75
-        assert metrics["label"] == "frontier_0_conservative"
+        assert metrics["label"] == "frontier_0_default"
         assert metrics["ppl_ratio"] > 1.0
 
     def test_summary_csv_appended(self, tmp_path):
@@ -150,7 +150,7 @@ class TestEmitArtifacts:
         policy_info = {"name": "ss4_lr1e-4_p8_s450", "stage_size": 4, "lr": 1e-4}
         emit_frontier_point(
             model=model, tokenizer=tok,
-            outdir=tmp_path, label="frontier_0_conservative",
+            outdir=tmp_path, label="frontier_0_default",
             keep_frac=0.8,
             metrics={
                 "ppl_w2_test": 11.0, "ppl_w103_valid": 12.0,
@@ -166,7 +166,7 @@ class TestEmitArtifacts:
         )
 
         manifest = json.loads(
-            (tmp_path / "frontier_0_conservative" / "manifest.json").read_text(),
+            (tmp_path / "frontier_0_default" / "manifest.json").read_text(),
         )
         assert "policy" in manifest
         assert manifest["policy"]["name"] == "ss4_lr1e-4_p8_s450"
@@ -181,7 +181,7 @@ class TestEmitArtifacts:
 
         point_dir = emit_frontier_point(
             model=model, tokenizer=tok,
-            outdir=tmp_path, label="frontier_0_conservative",
+            outdir=tmp_path, label="frontier_0_default",
             keep_frac=0.75,
             metrics={
                 "ppl_w2_test": 12.5, "ppl_w103_valid": 14.0,

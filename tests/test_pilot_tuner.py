@@ -1271,7 +1271,7 @@ class TestSculptEmitWeightsMemory:
             model=model,
             tokenizer=FakeTokenizer(),
             outdir=tmp_path,
-            label="frontier_0_conservative",
+            label="frontier_0_default",
             keep_frac=0.85,
             metrics={"ppl_w2_test": 10.0, "ppl_w103_valid": 11.0,
                       "prefill_tokens_per_sec": 5000, "decode_tokens_per_sec": 50},

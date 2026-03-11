@@ -71,9 +71,10 @@ class TestModelShortname:
 
         assert model_shortname("org/my-baseline-model") == "baseline"
 
-    def test_conservative(self):
+    def test_default_and_legacy(self):
         from dystrio_sculpt.bench_runner import model_shortname
 
+        assert model_shortname("org/sculpted-default-v1") == "default"
         assert model_shortname("org/sculpted-conservative-v1") == "conservative"
 
     def test_fallback(self):

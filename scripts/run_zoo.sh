@@ -76,8 +76,8 @@ for entry in "${COMPILED[@]}"; do
   bench_out="$ZOO_DIR/${short}_bench"
   logfile="$ZOO_DIR/${short}_bench.log"
 
-  con_model="$outdir/frontier_0_conservative/model"
-  bal_model="$outdir/frontier_1_balanced/model"
+  con_model="$outdir/frontier_0_default/model"
+  bal_model="$outdir/frontier_1_production/model"
 
   bench_args=(--models "$model_id" --workloads wikitext --outdir "$bench_out" --baseline-model "$model_id")
 
@@ -110,13 +110,13 @@ for entry in "${COMPILED[@]}"; do
   IFS='|' read -r model_id short <<< "$entry"
   outdir="$ZOO_DIR/$short"
   echo "--- $short ---"
-  if [ -f "$outdir/frontier_0_conservative/manifest.json" ]; then
-    echo "  Conservative: $(grep -o '"compile_wall_time_s": [0-9.]*' "$outdir/frontier_0_conservative/manifest.json")"
-    echo "               $(grep -o '"new_intermediate_size": [0-9]*' "$outdir/frontier_0_conservative/manifest.json")"
+  if [ -f "$outdir/frontier_0_default/manifest.json" ]; then
+    echo "  Default:      $(grep -o '"compile_wall_time_s": [0-9.]*' "$outdir/frontier_0_default/manifest.json")"
+    echo "               $(grep -o '"new_intermediate_size": [0-9]*' "$outdir/frontier_0_default/manifest.json")"
   fi
-  if [ -f "$outdir/frontier_1_balanced/manifest.json" ]; then
-    echo "  Balanced:     $(grep -o '"compile_wall_time_s": [0-9.]*' "$outdir/frontier_1_balanced/manifest.json")"
-    echo "               $(grep -o '"new_intermediate_size": [0-9]*' "$outdir/frontier_1_balanced/manifest.json")"
+  if [ -f "$outdir/frontier_1_production/manifest.json" ]; then
+    echo "  Production:   $(grep -o '"compile_wall_time_s": [0-9.]*' "$outdir/frontier_1_production/manifest.json")"
+    echo "               $(grep -o '"new_intermediate_size": [0-9]*' "$outdir/frontier_1_production/manifest.json")"
   fi
   bench_csv="$ZOO_DIR/${short}_bench/benchmarks.csv"
   if [ -f "$bench_csv" ]; then

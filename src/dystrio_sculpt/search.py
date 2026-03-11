@@ -155,7 +155,7 @@ def _is_safe(pt: FrontierPoint, ceiling: float) -> bool:
     return not pt.failed and pt.ppl_ratio <= ceiling
 
 
-_ORDERED_TIER_NAMES = ["conservative", "balanced", "aggressive", "extreme", "ultra"]
+_ORDERED_TIER_NAMES = ["default", "production", "throughput", "experimental", "frontier"]
 
 
 def _assign_labels(
@@ -163,10 +163,10 @@ def _assign_labels(
 ) -> None:
     """Assign semantic labels by keep_frac order (descending).
 
-    Highest keep_frac = conservative, next = balanced, next = aggressive.
+    Highest keep_frac = default (free-lunch), next = production, etc.
     Points above the quality ceiling are excluded from named tiers and
     given generic ``point_N`` labels.  With only 1 point, it gets
-    "balanced" if safe, "conservative" otherwise.
+    "production" if safe, "default" otherwise.
     """
     if not selected:
         return
@@ -177,9 +177,9 @@ def _assign_labels(
     if len(selected) == 1:
         pt = selected[0]
         if ceiling and _is_safe(pt, ceiling):
-            pt.label = "frontier_0_balanced"
+            pt.label = "frontier_0_production"
         else:
-            pt.label = "frontier_0_conservative"
+            pt.label = "frontier_0_default"
         return
 
     # Separate safe (under ceiling) from unsafe points
@@ -693,7 +693,7 @@ class FrontierSearch:
             )
             if viable:
                 best_viable = min(viable, key=lambda p: p.ppl_ratio)
-                best_viable.label = "frontier_0_conservative"
+                best_viable.label = "frontier_0_default"
                 return [best_viable]
             _log.error("no viable points at all")
             return []
@@ -726,7 +726,7 @@ class FrontierSearch:
 
         selected = selected[:self.n_frontier]
 
-        # Assign semantic labels (never label above-ceiling as "balanced")
+        # Assign semantic labels (never label above-ceiling as named tier)
         _assign_labels(selected, ceiling)
 
         _log.info(

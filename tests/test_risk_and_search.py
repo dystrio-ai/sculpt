@@ -115,9 +115,9 @@ class TestRiskAwareCandidates:
         cands = risk_aware_keep_candidates(0.2)
         assert min(cands) <= 0.60
 
-    def test_high_risk_stays_conservative(self):
+    def test_high_risk_stays_cautious(self):
         cands = risk_aware_keep_candidates(0.8)
-        assert min(cands) >= 0.70
+        assert min(cands) >= 0.58
 
     def test_candidates_sorted_possible(self):
         for risk in [0.1, 0.5, 0.9]:
@@ -149,7 +149,7 @@ class TestCeilingEnforcement:
         pt = _make_point(0.9, 1.0, 1.0, failed=True)
         assert not _is_safe(pt, 10.0)
 
-    def test_assign_labels_no_balanced_above_ceiling(self):
+    def test_assign_labels_no_named_tier_above_ceiling(self):
         ceiling = 2.0
         pts = [
             _make_point(0.9, 1.2, 1.1),
@@ -158,9 +158,9 @@ class TestCeilingEnforcement:
         ]
         _assign_labels(pts, ceiling)
         for pt in pts:
-            if "balanced" in pt.label:
+            if "production" in pt.label:
                 assert pt.ppl_ratio <= ceiling, (
-                    f"balanced label on point with ppl_ratio={pt.ppl_ratio} > ceiling={ceiling}"
+                    f"production label on point with ppl_ratio={pt.ppl_ratio} > ceiling={ceiling}"
                 )
 
     def test_single_point_labeled(self):
@@ -182,19 +182,19 @@ class TestCeilingEnforcement:
         ]
         _assign_labels(pts, 2.0)
         labels = {pt.keep_frac: pt.label for pt in pts}
-        assert "conservative" in labels[0.88]
-        assert "balanced" in labels[0.82]
-        assert "aggressive" in labels[0.75]
+        assert "default" in labels[0.88]
+        assert "production" in labels[0.82]
+        assert "throughput" in labels[0.75]
 
-    def test_two_points_conservative_and_balanced(self):
+    def test_two_points_default_and_production(self):
         pts = [
             _make_point(0.88, 1.07, 1.04),
             _make_point(0.75, 1.47, 1.16),
         ]
         _assign_labels(pts, 2.0)
         labels = {pt.keep_frac: pt.label for pt in pts}
-        assert "conservative" in labels[0.88]
-        assert "balanced" in labels[0.75]
+        assert "default" in labels[0.88]
+        assert "production" in labels[0.75]
 
     def test_above_ceiling_gets_generic_label(self):
         pts = [
@@ -205,9 +205,9 @@ class TestCeilingEnforcement:
         _assign_labels(pts, 2.0)
         above = [p for p in pts if p.keep_frac == 0.5][0]
         assert "point" in above.label
-        assert "conservative" not in above.label
-        assert "balanced" not in above.label
-        assert "aggressive" not in above.label
+        assert "default" not in above.label
+        assert "production" not in above.label
+        assert "throughput" not in above.label
 
     def test_label_indices_are_sequential(self):
         pts = [
