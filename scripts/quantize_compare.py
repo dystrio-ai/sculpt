@@ -109,9 +109,8 @@ def load_and_eval(model_id, label, device="cuda", is_awq=False):
 
     if is_awq:
         from awq import AutoAWQForCausalLM
-        model = AutoAWQForCausalLM.from_pretrained(
-            model_id, device_map=device, torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
+        model = AutoAWQForCausalLM.from_quantized(
+            model_id, fuse_layers=False, trust_remote_code=True,
         ).model
     else:
         model = AutoModelForCausalLM.from_pretrained(
