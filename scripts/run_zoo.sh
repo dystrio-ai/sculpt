@@ -13,9 +13,10 @@ MODELS=(
   "mistralai/Mistral-7B-Instruct-v0.3|mistral-7b-instruct"
   "meta-llama/Llama-3.1-8B-Instruct|llama-3.1-8b-instruct"
   "Qwen/Qwen2.5-7B-Instruct|qwen2.5-7b-instruct"
-  "microsoft/Phi-3.5-mini-instruct|phi-3.5-mini-instruct"
   "google/gemma-2-9b-it|gemma-2-9b-it"
 )
+# NOTE: Phi-3.5 uses fused gate_up_proj (not separate gate_proj/up_proj),
+# which is incompatible with the current FFN pruning code.
 
 FALLBACK="mistralai/Mistral-7B-v0.1|mistral-7b-v0.1-base"
 

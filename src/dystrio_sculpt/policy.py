@@ -32,6 +32,14 @@ HELPFUL_THRESHOLD = 0.002
 # giving >6x separation vs the <5x from a linear model.
 ASYMMETRIC_SCALE = 10.0
 
+# Thompson Sampling LR search grid (log-uniform spacing).
+# 100x range covers everything from very conservative (5e-6) repair learning
+# rates to aggressive (5e-4), so the controller can self-tune for any
+# architecture without a hand-tuned ladder.
+LR_GRID = [5e-6, 1e-5, 2e-5, 5e-5, 1e-4, 2e-4, 5e-4]
+MAX_LR_PROBES = 12
+LR_REWARD_THRESHOLD = 0.05
+
 # Legacy linear weights (kept for backward compatibility).
 WH = 1.0
 WI = 10.0
@@ -122,9 +130,10 @@ class TuningReport:
     escalation_applied: bool = False
     stage_size_selection: Optional[Dict[str, Any]] = None
     steps_adapted: bool = False
+    lr_search: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "pilot_enabled": self.pilot_enabled,
             "pilot_keep_frac": self.pilot_keep_frac,
             "pilot_budget_s": round(self.pilot_budget_s, 1),
@@ -137,6 +146,9 @@ class TuningReport:
             "stage_size_selection": self.stage_size_selection,
             "steps_adapted": self.steps_adapted,
         }
+        if self.lr_search is not None:
+            d["lr_search"] = self.lr_search
+        return d
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -145,6 +157,25 @@ class TuningReport:
 def _estimate_param_billions(model) -> float:
     total = sum(p.numel() for p in model.parameters())
     return total / 1e9
+
+
+@dataclass
+class _LRArm:
+    """Beta-conjugate bandit arm for Thompson Sampling LR search.
+
+    Same mathematical primitive as search.py's BetaArm, but scoped to the
+    pilot tuner so we avoid a circular import (search -> policy -> search).
+    """
+
+    alpha: float = 1.0
+    beta: float = 1.0
+
+    def sample(self, rng: np.random.Generator) -> float:
+        return float(rng.beta(self.alpha, self.beta))
+
+    @property
+    def mean(self) -> float:
+        return self.alpha / (self.alpha + self.beta)
 
 
 def _scale_steps(base_steps: int, param_b: float) -> int:
@@ -265,6 +296,60 @@ def _stratified_pilot_chunks(
     if late_idx != early_idx and K >= 2:
         result.append(chunks[late_idx])
     return result[:K]
+
+
+def _conductance_probe_chunk(
+    layer_order: List[int],
+    prescan_cache: Optional[Dict[int, Dict[str, Any]]],
+    stage_size: int,
+) -> List[int]:
+    """Select one maximally-informative probe chunk using prescan risk scores.
+
+    Targets layers around the 75th risk percentile among compressible layers.
+    These are hard-enough that learning-rate choice genuinely affects repair
+    quality, but not so extreme that every LR fails.  The risk score already
+    incorporates Physarum conductance coupling (0.35 weight), so probe
+    selection is structurally informed.
+
+    Falls back to the positional heuristic if prescan data is missing.
+    """
+    if not prescan_cache or not layer_order:
+        chunks = [
+            layer_order[i : i + stage_size]
+            for i in range(0, len(layer_order), stage_size)
+        ]
+        idx = int(0.70 * max(0, len(chunks) - 1))
+        return chunks[idx] if chunks else layer_order[:stage_size]
+
+    from .risk import layer_risk_score
+
+    layer_risks: Dict[int, float] = {}
+    for li in layer_order:
+        if li in prescan_cache:
+            pre = prescan_cache[li]
+            bs, D = pre.get("block_sensitivity"), pre.get("D")
+            if bs is not None and D is not None:
+                risk, _ = layer_risk_score(bs, D, pre.get("block_energy"))
+                layer_risks[li] = risk
+                continue
+        layer_risks[li] = 0.5
+
+    sorted_layers = sorted(layer_order, key=lambda x: layer_risks[x])
+    n = len(sorted_layers)
+    center = int(0.75 * max(0, n - 1))
+    start = max(0, center - stage_size // 2)
+    end = min(n, start + stage_size)
+    if end - start < stage_size:
+        start = max(0, end - stage_size)
+
+    chunk = sorted_layers[start:end]
+    _log.info(
+        "[policy] conductance probe chunk: layers=%s risk=[%.3f..%.3f]",
+        chunk,
+        min(layer_risks[li] for li in chunk),
+        max(layer_risks[li] for li in chunk),
+    )
+    return chunk
 
 
 # ── Pilot scoring ────────────────────────────────────────────────────────────
@@ -672,12 +757,12 @@ def tune_policy_with_pilot(
     prescan_cache: Optional[Dict[int, Dict[str, Any]]] = None,
     layer_order: Optional[List[int]] = None,
 ) -> tuple:
-    """Stratified pilot tuner: select LR policy, adapt steps, choose stage_size.
+    """Adaptive pilot tuner with Thompson Sampling LR search.
 
-    Phase 1: evaluate <=3 candidate LR policies via stratified 2-stage pilot
-             (early + ~70th-percentile chunk, fixed ss=4).
+    Phase 1: Thompson Sampling over LR_GRID with conductance-informed probe
+             chunk selection and asymmetric reward shaping.
     Phase 2: adapt steps based on measured helpfulness / peak improvement.
-    Phase 3: probe stage_sizes {4,2} with stratified chunks using winning policy.
+    Phase 3: probe stage_sizes {4,2} with stratified chunks using winning LR.
 
     Returns (selected_policy, TuningReport).
     """
@@ -691,84 +776,145 @@ def tune_policy_with_pilot(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    ladder = build_policy_ladder(param_b)
-    candidates = _pilot_candidates(ladder, risk_score)
+    base_steps = _scale_steps(450, param_b)
+    patience = _scale_patience(8, param_b)
+    cheap_texts = min(128, max(32, int(64 * (1.0 + param_b))))
     eval_subset = list(texts_eval[:64])
     default_order = layer_order if layer_order is not None else list(range(num_layers))
 
+    # ── Phase 1: Thompson Sampling LR search ─────────────────────────────────
+    #
+    # Conductance-informed probe chunk: picks layers at ~75th risk percentile
+    # where the risk score (sensitivity 0.45 + coupling 0.35 + rank 0.20)
+    # makes repair most sensitive to LR choice.
+    probe_chunk = _conductance_probe_chunk(default_order, prescan_cache, stage_size=4)
+
+    lr_arms: Dict[float, _LRArm] = {lr: _LRArm() for lr in LR_GRID}
+    ts_rng = np.random.default_rng(seed)
+    lr_probe_log: List[Dict[str, Any]] = []
+
+    budget_start = time.time()
+
     _log.info(
-        "[policy] pilot tuner: keep=%.2f budget=%.0fs candidates=[%s] risk=%.3f",
+        "[policy] pilot tuner: keep=%.2f budget=%.0fs LR_GRID=%s risk=%.3f probe_layers=%s",
         pilot_keep_frac, pilot_budget_s,
-        ", ".join(c.name for c in candidates), risk_score,
+        [f"{lr:.0e}" for lr in LR_GRID], risk_score, probe_chunk,
     )
 
-    # Phase 1: Policy (LR) selection via stratified 2-stage pilot at fixed ss=4
-    pilot_lr_chunks = _stratified_pilot_chunks(default_order, stage_size=4, K=2)
-    budget_start = time.time()
-    pilot_results: List[Dict[str, Any]] = []
-
-    for cand in candidates:
+    for probe_idx in range(MAX_LR_PROBES):
         elapsed_total = time.time() - budget_start
         remaining = pilot_budget_s - elapsed_total
-        if remaining < 30:
-            _log.info("[policy] pilot budget low after %d candidates", len(pilot_results))
+        if remaining < 40:
+            _log.info("[policy] LR search: budget low after %d probes", probe_idx)
             break
 
-        norm_cand = _with_stage_size(cand, 4)
+        # Thompson sample an LR
+        samples = {lr: arm.sample(ts_rng) for lr, arm in lr_arms.items()}
+        chosen_lr = max(samples, key=samples.get)
+
+        probe_policy = RepairPolicy(
+            name=f"ts_lr{chosen_lr:.0e}",
+            stage_size=4, lr=chosen_lr, steps=base_steps,
+            early_stop_patience=patience,
+            regression_limit=0.02, curve_every=50,
+            cheap_eval_texts=cheap_texts, cheap_eval_max_tokens=5000,
+            final_eval_max_tokens=40_000, grad_accum_steps=1,
+        )
+
         stats, elapsed = _run_pilot_stages(
             model_id=model_id,
             texts_cal=texts_cal, texts_train=texts_train,
-            eval_subset=eval_subset, policy=norm_cand,
+            eval_subset=eval_subset, policy=probe_policy,
             keep_frac=pilot_keep_frac, stage_size=4,
-            n_stages=2, device=device, dtype_str=dtype_str,
+            n_stages=1, device=device, dtype_str=dtype_str,
             seed=seed, deterministic=deterministic,
             prescan_cache=prescan_cache, layer_order=layer_order,
-            selector=selector, pilot_chunks=pilot_lr_chunks,
+            selector=selector, pilot_chunks=[probe_chunk],
         )
 
-        score, stable, H, I, M = _score_two_stage_pilot(stats, elapsed)
-        result = {
-            "policy_name": cand.name,
-            "stage_stats": stats,
+        improve = max((s.get("improve_frac", 0.0) for s in stats), default=0.0)
+        is_nan = any(s.get("nan_inf", False) for s in stats)
+        is_helpful = any(s.get("repair_helpful", False) for s in stats)
+        reward = _asymmetric_reward(improve)
+
+        if is_nan:
+            lr_arms[chosen_lr].beta += 2.0
+        elif reward > LR_REWARD_THRESHOLD:
+            lr_arms[chosen_lr].alpha += 1.0
+        else:
+            lr_arms[chosen_lr].beta += 1.0
+
+        lr_probe_log.append({
+            "probe_idx": probe_idx,
+            "lr": chosen_lr,
+            "improve_frac": round(improve, 6),
+            "reward": round(reward, 6),
+            "nan_inf": is_nan,
+            "helpful": is_helpful,
             "elapsed_s": round(elapsed, 2),
-            "score": round(score, 8),
-            "stable": stable,
-            "H": H,
-            "I": round(I, 6),
-            "M": round(M, 6),
-        }
-        pilot_results.append(result)
+            "arm_alpha": round(lr_arms[chosen_lr].alpha, 1),
+            "arm_beta": round(lr_arms[chosen_lr].beta, 1),
+        })
 
         _log.info(
-            "[policy]   %s: H=%d I=%.4f M=%.4f score=%.6f stable=%s (%.1fs)",
-            cand.name, H, I, M, score, stable, elapsed,
+            "[policy] LR probe %d/%d: lr=%.0e improve=%.4f reward=%.4f "
+            "helpful=%s α=%.1f β=%.1f (%.1fs)",
+            probe_idx + 1, MAX_LR_PROBES, chosen_lr, improve, reward,
+            is_helpful, lr_arms[chosen_lr].alpha, lr_arms[chosen_lr].beta,
+            elapsed,
         )
 
-    # Selection rule
-    stable_results = [(r, c) for r, c in zip(pilot_results, candidates) if r["stable"]]
-    best_H, best_I, best_M = 0, 0.0, 0.0
-
-    if not stable_results:
-        chosen = candidates[-1]
-        reason = "fallback_no_stable"
+    # Select best LR by posterior mean
+    best_lr = max(lr_arms, key=lambda lr: lr_arms[lr].mean)
+    any_helpful = any(p["helpful"] for p in lr_probe_log)
+    if not any_helpful:
+        best_lr = 5e-5
+        reason = "fallback_no_helpful"
     else:
-        helpful_results = [(r, c) for r, c in stable_results if r["H"] > 0]
-        if helpful_results:
-            best_r, chosen = max(helpful_results, key=lambda rc: rc[0]["score"])
-            reason = "best_score_helpful"
-            best_H, best_I, best_M = best_r["H"], best_r["I"], best_r["M"]
-        else:
-            chosen = stable_results[-1][1]
-            reason = "most_conservative_stable"
+        reason = "thompson_best_mean"
 
-    _log.info("[policy] pilot tuner: chosen=%s reason=%s", chosen.name, reason)
+    # Aggregate stats from best LR's probes for steps adaptation
+    best_probes = [p for p in lr_probe_log if p["lr"] == best_lr and not p["nan_inf"]]
+    best_H = sum(1 for p in best_probes if p["helpful"])
+    best_I = sum(p["improve_frac"] for p in best_probes)
+    best_M = max((p["improve_frac"] for p in best_probes), default=0.0)
 
-    # Phase 2: Steps adaptation (uses I or M)
+    _log.info(
+        "[policy] LR search complete: best_lr=%.0e mean=%.3f reason=%s "
+        "probes=%d H=%d I=%.4f M=%.4f",
+        best_lr, lr_arms[best_lr].mean, reason,
+        len(lr_probe_log), best_H, best_I, best_M,
+    )
+
+    lr_search_report = {
+        "grid": [f"{lr:.0e}" for lr in LR_GRID],
+        "probe_chunk": probe_chunk,
+        "num_probes": len(lr_probe_log),
+        "probes": lr_probe_log,
+        "arm_posteriors": {
+            f"{lr:.0e}": {"alpha": round(arm.alpha, 2), "beta": round(arm.beta, 2),
+                          "mean": round(arm.mean, 4)}
+            for lr, arm in lr_arms.items()
+        },
+        "best_lr": best_lr,
+        "reason": reason,
+    }
+
+    chosen = RepairPolicy(
+        name=f"ss4_lr{best_lr:.0e}_p{patience}_s{base_steps}",
+        stage_size=4, lr=best_lr, steps=base_steps,
+        early_stop_patience=patience,
+        regression_limit=0.02, curve_every=50,
+        cheap_eval_texts=cheap_texts, cheap_eval_max_tokens=5000,
+        final_eval_max_tokens=40_000, grad_accum_steps=1,
+    )
+
+    # ── Phase 2: Steps adaptation ────────────────────────────────────────────
     original_steps = chosen.steps
     chosen = _adapt_steps(chosen, best_H, best_I, best_M)
     steps_adapted = chosen.steps != original_steps
 
-    # Phase 3: Stage-size selection with stratified probing
+    # ── Phase 3: Stage-size selection with stratified probing ────────────────
     budget_remaining = pilot_budget_s - (time.time() - budget_start)
     if budget_remaining >= 60:
         chosen_ss, ss_report = _select_stage_size(
@@ -790,14 +936,15 @@ def tune_policy_with_pilot(
     report = TuningReport(
         pilot_keep_frac=pilot_keep_frac,
         pilot_budget_s=pilot_budget_s,
-        candidates=[c.name for c in candidates],
-        results=pilot_results,
+        candidates=[f"{lr:.0e}" for lr in LR_GRID],
+        results=lr_probe_log,
         chosen_policy=chosen.name,
         chosen_reason=reason,
         risk_score=risk_score,
-        ladder_start_idx=ladder.index(candidates[0]) if candidates[0] in ladder else 0,
+        ladder_start_idx=0,
         stage_size_selection=ss_report,
         steps_adapted=steps_adapted,
+        lr_search=lr_search_report,
     )
     return chosen, report
 
