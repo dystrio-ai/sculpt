@@ -195,7 +195,6 @@ tags:
   - pruned
   - compressed
   - efficient
-  - structural-pruning
   - dense
   - runtime-agnostic
   - no-custom-kernels
@@ -269,14 +268,13 @@ All tiers compiled from [{model_info["base_display"]}](https://huggingface.co/{b
 
 ## What is Dystrio Sculpt?
 
-Dystrio Sculpt is a structural FFN compiler for transformer LLMs. It:
+Dystrio Sculpt compiles transformer models into smaller, faster variants. Output models:
 
-- Removes redundant neurons from SwiGLU feed-forward blocks
-- Uses conductance-aware scoring and adaptive repair
-- Produces standard HuggingFace safetensors output
-- Requires **no custom kernels** and **no runtime changes**
-- Works as a compile step before deployment
-- Stacks with quantization (AWQ, GPTQ, GGUF) for compound savings
+- Are **dense** (not sparse) — standard architecture, fewer parameters
+- Load with **standard HuggingFace Transformers** — no custom code needed
+- Require **no custom kernels** and **no runtime changes**
+- Work as a one-step compile before deployment
+- Stack with quantization (AWQ, GPTQ, GGUF) for compound savings
 
 ## Compatibility
 
