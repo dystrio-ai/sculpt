@@ -19,6 +19,12 @@ pnn/
 runs/
 runs_*/
 *.tar.gz
+zoo/
+
+# Cloned repos / model weights (not part of this repo)
+BumbleB/
+Mistral-7B-v0.1-sculpt-*/
+update_readmes.sh
 
 # Mac junk
 .DS_Store

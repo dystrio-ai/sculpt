@@ -30,6 +30,7 @@ from .selectors import select_for_layer, BLOCK_SIZE
 from .selectors.structural import prescan_structural_artifacts, CrossLayerNoveltyTracker
 from .repair import repair_layers, _snapshot_trainable, _restore_trainable
 from .policy import RepairPolicy, auto_select_policy, build_policy_ladder, escalate_policy, HELPFUL_THRESHOLD
+from .architectures.base import ArchitectureAdapter
 
 _log = logging.getLogger(__name__)
 
@@ -185,6 +186,7 @@ def compile_model(
     allow_escalation: bool = True,
     calib: Optional[CalibConfig] = None,
     keep_schedule: Optional[Dict[int, float]] = None,
+    adapter: Optional[ArchitectureAdapter] = None,
 ) -> CompileResult:
     """Compile a model at a specific keep_frac.
 
@@ -233,12 +235,15 @@ def compile_model(
         _log.info("running structural prescan on %d layers", num_layers)
         prescan_cache = prescan_structural_artifacts(
             model, tok, layers, texts["cal"], MAX_LEN, device,
-            block_size=BLOCK_SIZE,
+            block_size=BLOCK_SIZE, adapter=adapter,
         )
 
     original_ffn_dims: Dict[int, int] = {}
     for li in layers:
-        original_ffn_dims[li] = model.model.layers[li].mlp.gate_proj.out_features
+        if adapter is not None:
+            original_ffn_dims[li] = adapter.get_ffn_size(model, li)
+        else:
+            original_ffn_dims[li] = model.model.layers[li].mlp.gate_proj.out_features
 
     # Cross-layer novelty tracker for structural diversity across layers
     novelty_tracker = CrossLayerNoveltyTracker() if selector == "structural" else None
@@ -295,7 +300,13 @@ def compile_model(
         _log.info("stage %d/%d: layers %s", si + 1, len(chunks), chunk)
 
         # Save pre-stage snapshot for rollback
-        pre_stage_snap = _snapshot_trainable(model, compressed_so_far + chunk) if compressed_so_far else None
+        if compressed_so_far:
+            if adapter is not None:
+                pre_stage_snap = adapter.snapshot_trainable(model, compressed_so_far + chunk)
+            else:
+                pre_stage_snap = _snapshot_trainable(model, compressed_so_far + chunk)
+        else:
+            pre_stage_snap = None
 
         for li in chunk:
             layer_kf = keep_schedule[li] if keep_schedule and li in keep_schedule else keep_frac
@@ -313,14 +324,17 @@ def compile_model(
                 model, tok, li, texts["cal"], layer_kf,
                 MAX_LEN, device, selector=selector,
                 prescan_cache=prescan_cache, rng=rng,
-                cross_layer_novelty=novelty,
+                cross_layer_novelty=novelty, adapter=adapter,
             )
 
             if novelty_tracker is not None:
                 block_adj = sel_arts.get("block_adj_norm") if sel_arts else None
                 novelty_tracker.record(kept_blocks, n_blocks_li, block_adj=block_adj)
 
-            rep = compress_mlp_layer_swiglu_inplace(model, li, kept_idx, dtype, device)
+            if adapter is not None:
+                rep = adapter.compress_layer(model, li, kept_idx, dtype, device)
+            else:
+                rep = compress_mlp_layer_swiglu_inplace(model, li, kept_idx, dtype, device)
             compile_report[str(li)] = {
                 "kept_blocks": len(kept_blocks),
                 "original_ffn": original_ffn_dims[li],
@@ -360,6 +374,7 @@ def compile_model(
                 regression_limit=current_policy.regression_limit,
                 max_grad_norm=current_policy.max_grad_norm,
                 save_best=True, pre_repair_metric=stage_ppl,
+                adapter=adapter,
             )
             total_repair_steps += int(sr["steps"])
             if sr.get("early_stopped"):
@@ -382,7 +397,10 @@ def compile_model(
                     si + 1, sr.get("repaired_ok"), post_ppl,
                 )
                 if pre_stage_snap is not None:
-                    _restore_trainable(model, compressed_so_far, pre_stage_snap)
+                    if adapter is not None:
+                        adapter.restore_trainable(model, compressed_so_far, pre_stage_snap)
+                    else:
+                        _restore_trainable(model, compressed_so_far, pre_stage_snap)
 
                 from .policy import _estimate_param_billions
                 param_b = _estimate_param_billions(model)
@@ -407,6 +425,7 @@ def compile_model(
                         regression_limit=fallback.regression_limit,
                         max_grad_norm=fallback.max_grad_norm,
                         save_best=True, pre_repair_metric=stage_ppl,
+                        adapter=adapter,
                     )
                     total_repair_steps += int(sr2["steps"])
                     if not sr2.get("repaired_ok", True):
@@ -493,6 +512,7 @@ def compile_model(
             regression_limit=current_policy.regression_limit,
             max_grad_norm=current_policy.max_grad_norm,
             save_best=True, pre_repair_metric=pre_final_ppl,
+            adapter=adapter,
         )
         total_repair_steps += int(fr["steps"])
         if fr.get("early_stopped"):

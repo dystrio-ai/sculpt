@@ -241,9 +241,11 @@ class FrontierSearch:
         speed_profile: Optional[str] = None,
         use_risk_schedule: bool = False,
         protection_threshold: Optional[float] = None,
+        adapter=None,
     ):
         self.model_id = model_id
         self.n_frontier = n_frontier
+        self.adapter = adapter
         # Default quality ceiling
         if max_ppl_multiplier is None or max_ppl_multiplier <= 0:
             self.max_ppl_multiplier = DEFAULT_PPL_CEILING
@@ -337,6 +339,7 @@ class FrontierSearch:
         self.prescan_cache = prescan_structural_artifacts(
             model, tok, list(range(num_layers)), self.texts["cal"],
             MAX_LEN, self.device, block_size=BLOCK_SIZE,
+            adapter=self.adapter,
         )
         _log.info("prescan cached %d layers", len(self.prescan_cache))
         del model, tok
@@ -442,6 +445,7 @@ class FrontierSearch:
                 layer_order=self.layer_order,
                 allow_escalation=not self._escalation_applied,
                 keep_schedule=schedule,
+                adapter=self.adapter,
             )
         except Exception as exc:
             _log.error("compile_model failed for kf=%.3f: %s", keep_frac, exc)

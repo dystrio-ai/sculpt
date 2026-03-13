@@ -1,19 +1,18 @@
-#!/usr/bin/env python3
-"""Push sculpted model zoo to HuggingFace with generated model cards.
+"""Publish stage: generate model cards and push to HuggingFace Hub.
 
-Usage:
-    export HF_TOKEN=hf_...
-    python3 scripts/push_to_hf.py --zoo-dir /data/zoo --org dystrio --dry-run
-    python3 scripts/push_to_hf.py --zoo-dir /data/zoo --org dystrio
+Refactored from scripts/push_to_hf.py into a callable module so the
+factory orchestrator can invoke it without subprocess calls.
 """
 
 from __future__ import annotations
 
-import argparse
 import csv
-import json
+import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+_log = logging.getLogger(__name__)
 
 TIER_USE_CASES = {
     "default": "Zero-regret: quality preserved, smaller footprint",
@@ -25,36 +24,8 @@ TIER_USE_CASES = {
 
 TIER_ORDER = ["default", "production", "throughput", "experimental", "frontier"]
 
-MODEL_ZOO = [
-    {
-        "base_model_id": "mistralai/Mistral-7B-Instruct-v0.3",
-        "base_display": "Mistral 7B Instruct v0.3",
-        "model_short": "Mistral-7B-Instruct-v0.3",
-        "arch_tag": "mistral",
-        "compile_dir": "mistral-7b-instruct-f5",
-        "bench_dir": "bench_mistral",
-    },
-    {
-        "base_model_id": "meta-llama/Llama-3.1-8B-Instruct",
-        "base_display": "Llama 3.1 8B Instruct",
-        "model_short": "Llama-3.1-8B-Instruct",
-        "arch_tag": "llama",
-        "compile_dir": "llama-3.1-8b-instruct-f4",
-        "bench_dir": "bench_llama",
-    },
-    {
-        "base_model_id": "Qwen/Qwen2.5-7B-Instruct",
-        "base_display": "Qwen 2.5 7B Instruct",
-        "model_short": "Qwen2.5-7B-Instruct",
-        "arch_tag": "qwen",
-        "compile_dir": "qwen2.5-7b-instruct-f3",
-        "bench_dir": "bench_qwen",
-    },
-]
-
 
 def _load_bench(bench_csv: Path) -> Dict[str, Dict[str, Any]]:
-    """Load benchmarks.csv into {model_id: {workload: row}}."""
     results: Dict[str, Dict[str, Any]] = {}
     with open(bench_csv) as f:
         reader = csv.DictReader(f)
@@ -67,7 +38,7 @@ def _load_bench(bench_csv: Path) -> Dict[str, Dict[str, Any]]:
     return results
 
 
-def _fmt_params(n: str) -> str:
+def _fmt_params(n) -> str:
     try:
         p = int(n)
         if p >= 1e9:
@@ -85,15 +56,11 @@ def _pct_change(new: float, old: float) -> str:
     return f"{sign}{pct:.0f}%"
 
 
-def _build_benchmark_table(bench: Dict[str, Dict[str, Any]], tiers: List[dict],
-                           base_model_id: str) -> str:
+def _build_benchmark_table(bench, tiers, base_model_id):
     lines = [
         "| Model | PPL | PPL Ratio | Weights (GB) | Chat Prefill TPS | RAG TTFT p95 (ms) | Decode TPS |",
         "|-------|-----|-----------|-------------|------------------|-------------------|------------|",
     ]
-    base_wiki = bench.get(base_model_id, {}).get("wikitext", {})
-    base_chat = bench.get(base_model_id, {}).get("chat", {})
-    base_rag = bench.get(base_model_id, {}).get("rag", {})
 
     def _row(label, mid):
         wiki = bench.get(mid, {}).get("wikitext", {})
@@ -116,8 +83,7 @@ def _build_benchmark_table(bench: Dict[str, Dict[str, Any]], tiers: List[dict],
     return "\n".join(lines)
 
 
-def _build_tier_links(tiers: List[dict], org: str, model_short: str,
-                      current_tier: str) -> str:
+def _build_tier_links(tiers, org, model_short, current_tier):
     lines = []
     for t in tiers:
         tn = t["tier_name"]
@@ -126,21 +92,18 @@ def _build_tier_links(tiers: List[dict], org: str, model_short: str,
         ratio = t.get("ppl_ratio", "")
         use_case = TIER_USE_CASES.get(tn, "")
         marker = " 👈 **this model**" if tn == current_tier else ""
-        lines.append(f"| {tn} | [{hf_id}](https://huggingface.co/{hf_id}){marker} | {wgb} GB | {ratio} | {use_case} |")
+        lines.append(
+            f"| {tn} | [{hf_id}](https://huggingface.co/{hf_id}){marker} "
+            f"| {wgb} GB | {ratio} | {use_case} |"
+        )
     return "\n".join(lines)
 
 
-def _generate_card(
-    tier: dict,
-    all_tiers: List[dict],
-    model_info: dict,
-    bench: Dict[str, Dict[str, Any]],
-    org: str,
-) -> str:
+def _generate_card(tier, all_tiers, base_model_id, base_display, model_short,
+                   arch_tag, bench, org) -> str:
+    """Generate a full model card for a single tier."""
     tier_name = tier["tier_name"]
     model_path = tier["model_path"]
-    model_short = model_info["model_short"]
-    base_model_id = model_info["base_model_id"]
     hf_model_id = f"{org}/{model_short}-sculpt-{tier_name}"
 
     wiki = bench.get(model_path, {}).get("wikitext", {})
@@ -157,7 +120,6 @@ def _generate_card(
     chat_prefill = chat.get("prefill_tokens_per_sec", "")
     chat_decode = chat.get("decode_tokens_per_sec", "")
     rag_ttft = rag.get("ttft_ms_p95", "")
-    chat_ttft = chat.get("ttft_ms_p95", "")
 
     base_weights = float(base_wiki.get("weights_gb", 0) or base_chat.get("weights_gb", 0) or 0)
     cur_weights = float(weights_gb) if weights_gb else 0
@@ -202,11 +164,11 @@ tags:
   - drop-in-replacement
   - smaller
   - faster
-  - {model_info["arch_tag"]}
+  - {arch_tag}
 datasets:
   - wikitext
 model-index:
-  - name: Dystrio Sculpt ({model_info["model_short"]} {tier_display})
+  - name: Dystrio Sculpt ({model_short} {tier_display})
     results:
       - task:
           type: text-generation
@@ -228,7 +190,7 @@ model-index:
 
 Dystrio Sculpt structurally compresses transformer models, producing dense models that load with standard `transformers` — no custom code, no new ops, no deployment friction.
 
-This is the **{tier_display}** tier of [{model_info["base_display"]}](https://huggingface.co/{base_model_id}).
+This is the **{tier_display}** tier of [{base_display}](https://huggingface.co/{base_model_id}).
 
 ## Quick Start
 
@@ -245,7 +207,7 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 
 ## Benchmark Results
 
-All tiers compiled from [{model_info["base_display"]}](https://huggingface.co/{base_model_id}) on A100 80GB, bf16:
+All tiers compiled from [{base_display}](https://huggingface.co/{base_model_id}) on A100 80GB, bf16:
 
 {benchmark_table}
 
@@ -316,92 +278,102 @@ Dystrio Sculpt compiles transformer models into smaller, faster variants. Output
     return card
 
 
-def _discover_tiers(compile_dir: Path, bench: Dict[str, Dict[str, Any]]) -> List[dict]:
-    tiers = []
-    for d in sorted(compile_dir.iterdir()):
-        if not d.is_dir() or not d.name.startswith("frontier_"):
-            continue
-        model_dir = d / "model"
-        if not model_dir.exists():
-            continue
-        parts = d.name.split("_", 2)
-        tier_name = parts[2] if len(parts) > 2 else parts[1]
-        model_path = str(model_dir)
+def _derive_model_short(model_id: str) -> str:
+    """Derive short model name from HF model_id for repo naming."""
+    return model_id.split("/")[-1]
 
+
+def _derive_arch_tag(family: str) -> str:
+    """Map architecture family to tag string."""
+    return family.lower()
+
+
+def run_publish_stage(
+    compile_result,
+    org: str,
+    *,
+    benchmark_csv: Optional[Path] = None,
+    hf_token: Optional[str] = None,
+    dry_run: bool = False,
+    base_display: Optional[str] = None,
+) -> List[str]:
+    """Publish compiled tiers to HuggingFace Hub.
+
+    Returns list of published repo IDs.
+    """
+    model_id = compile_result.model_id
+    model_short = _derive_model_short(model_id)
+
+    if base_display is None:
+        base_display = model_short.replace("-", " ")
+
+    # Try to detect arch_tag from descriptor
+    arch_tag = "transformer"
+    try:
+        from ..architectures import fingerprint
+        desc = fingerprint(model_id)
+        arch_tag = _derive_arch_tag(desc.family)
+    except Exception:
+        pass
+
+    bench: Dict[str, Dict[str, Any]] = {}
+    if benchmark_csv is not None and Path(benchmark_csv).exists():
+        bench = _load_bench(Path(benchmark_csv))
+
+    # Build tier info from compile result
+    tier_info = []
+    for tier in compile_result.tiers:
+        model_path = str(tier.model_dir)
         wiki = bench.get(model_path, {}).get("wikitext", {})
         chat = bench.get(model_path, {}).get("chat", {})
-        tiers.append({
-            "tier_name": tier_name,
+        tier_info.append({
+            "tier_name": tier.label.split("_")[-1] if "_" in tier.label else tier.label,
             "model_path": model_path,
-            "dir": d,
+            "dir": tier.point_dir,
             "weights_gb": wiki.get("weights_gb", chat.get("weights_gb", "")),
-            "ppl_ratio": wiki.get("ppl_ratio", chat.get("ppl_ratio", "")),
+            "ppl_ratio": wiki.get("ppl_ratio", chat.get("ppl_ratio", f"{tier.ppl_ratio:.4f}")),
         })
-    tiers.sort(key=lambda t: TIER_ORDER.index(t["tier_name"]) if t["tier_name"] in TIER_ORDER else 99)
-    return tiers
 
+    tier_info.sort(
+        key=lambda t: TIER_ORDER.index(t["tier_name"]) if t["tier_name"] in TIER_ORDER else 99,
+    )
 
-def main():
-    parser = argparse.ArgumentParser(description="Push model zoo to HuggingFace")
-    parser.add_argument("--zoo-dir", type=str, default="/data/zoo")
-    parser.add_argument("--org", type=str, default="dystrio")
-    parser.add_argument("--dry-run", action="store_true", help="Generate cards but don't upload")
-    args = parser.parse_args()
+    token = hf_token or os.environ.get("HF_TOKEN")
+    published: List[str] = []
 
-    zoo = Path(args.zoo_dir)
+    for tier in tier_info:
+        tier_name = tier["tier_name"]
+        hf_repo = f"{org}/{model_short}-sculpt-{tier_name}"
+        model_dir = Path(tier["dir"]) / "model"
 
-    for model_info in MODEL_ZOO:
-        compile_dir = zoo / model_info["compile_dir"]
-        bench_csv = zoo / model_info["bench_dir"] / "benchmarks.csv"
+        card = _generate_card(
+            tier, tier_info, model_id, base_display, model_short,
+            arch_tag, bench, org,
+        )
 
-        if not compile_dir.exists():
-            print(f"SKIP {model_info['model_short']}: {compile_dir} not found")
-            continue
-        if not bench_csv.exists():
-            print(f"SKIP {model_info['model_short']}: {bench_csv} not found")
-            continue
+        card_path = model_dir / "README.md"
+        card_path.write_text(card)
+        _log.info("wrote model card: %s", card_path)
 
-        bench = _load_bench(bench_csv)
-        tiers = _discover_tiers(compile_dir, bench)
-
-        if not tiers:
-            print(f"SKIP {model_info['model_short']}: no tiers found in {compile_dir}")
+        if dry_run:
+            _log.info("[dry-run] would upload %s -> %s", model_dir, hf_repo)
+            published.append(hf_repo)
             continue
 
-        print(f"\n{'='*60}")
-        print(f"  {model_info['base_display']}: {len(tiers)} tiers")
-        print(f"{'='*60}")
-
-        for tier in tiers:
-            tier_name = tier["tier_name"]
-            hf_repo = f"{args.org}/{model_info['model_short']}-sculpt-{tier_name}"
-            model_dir = tier["dir"] / "model"
-
-            card = _generate_card(tier, tiers, model_info, bench, args.org)
-
-            card_path = model_dir / "README.md"
-            card_path.write_text(card)
-            print(f"  wrote {card_path}")
-
-            if args.dry_run:
-                print(f"  DRY RUN: would upload {model_dir} -> {hf_repo}")
-                continue
-
+        try:
             from huggingface_hub import HfApi
-            api = HfApi()
+            api = HfApi(token=token)
 
-            print(f"  uploading {model_dir} -> {hf_repo} ...")
             api.create_repo(hf_repo, exist_ok=True, repo_type="model")
             api.upload_folder(
                 folder_path=str(model_dir),
                 repo_id=hf_repo,
                 repo_type="model",
-                commit_message=f"Dystrio Sculpt {tier_name} tier of {model_info['base_display']}",
+                commit_message=f"Dystrio Sculpt {tier_name} tier of {base_display}",
             )
-            print(f"  ✓ {hf_repo} uploaded")
+            _log.info("published %s", hf_repo)
+            published.append(hf_repo)
+        except Exception as exc:
+            _log.error("failed to publish %s: %s", hf_repo, exc)
 
-        print()
-
-
-if __name__ == "__main__":
-    main()
+    return published

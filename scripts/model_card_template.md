@@ -54,7 +54,7 @@ model-index:
 
 > **{SIZE_CUT}% smaller, {SPEED_CLAIM}, drop-in replacement. No custom kernels. No runtime changes.**
 
-Dystrio Sculpt structurally compresses transformer FFN blocks, producing dense models that load with standard `transformers` — no custom code, no new ops, no deployment friction.
+Dystrio Sculpt structurally compresses transformer models, producing dense models that load with standard `transformers` — no custom code, no new ops, no deployment friction.
 
 This is the **{TIER_DISPLAY}** tier of [{BASE_MODEL_DISPLAY}](https://huggingface.co/{BASE_MODEL_ID}).
 
@@ -134,7 +134,7 @@ Dystrio Sculpt compiles transformer models into smaller, faster variants. Output
 
 ```bibtex
 @misc{dystrio_sculpt_2026,
-  title={Dystrio Sculpt: Structural FFN Compilation for Transformer LLMs},
+  title={Dystrio Sculpt: Structural Compilation for Transformer LLMs},
   author={Dystrio},
   year={2026},
   url={https://huggingface.co/dystrio}

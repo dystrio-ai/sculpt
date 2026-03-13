@@ -298,22 +298,36 @@ def prescan_structural_artifacts(
     device: str,
     block_size: int = 128,
     max_tokens: int = 30_000,
+    adapter=None,
 ) -> Dict[int, Dict[str, Any]]:
     """Precompute structural tensors on an uncompressed model.
 
     Returns {layer_idx: {D, block_energy, block_sensitivity, feature_multiplier}}
     with all tensors on CPU.
+
+    When *adapter* is provided, calibration is dispatched through it instead
+    of calling the SwiGLU-specific functions directly.
     """
     out: Dict[int, Dict[str, Any]] = {}
     for li in layers:
-        geom = collect_block_geometry_swiglu(
-            model, tokenizer, li, texts_cal, max_len, device,
-            block_size=block_size, max_tokens=max_tokens,
-        )
-        sens = collect_block_operator_sensitivity_swiglu(
-            model, tokenizer, li, texts_cal, max_len, device,
-            block_size=block_size, max_tokens=max_tokens,
-        )
+        if adapter is not None:
+            geom = adapter.collect_block_geometry(
+                model, tokenizer, li, texts_cal, max_len, device,
+                block_size=block_size, max_tokens=max_tokens,
+            )
+            sens = adapter.collect_block_sensitivity(
+                model, tokenizer, li, texts_cal, max_len, device,
+                block_size=block_size, max_tokens=max_tokens,
+            )
+        else:
+            geom = collect_block_geometry_swiglu(
+                model, tokenizer, li, texts_cal, max_len, device,
+                block_size=block_size, max_tokens=max_tokens,
+            )
+            sens = collect_block_operator_sensitivity_swiglu(
+                model, tokenizer, li, texts_cal, max_len, device,
+                block_size=block_size, max_tokens=max_tokens,
+            )
         out[li] = {
             "D": geom["D"].detach().cpu(),
             "block_energy": (

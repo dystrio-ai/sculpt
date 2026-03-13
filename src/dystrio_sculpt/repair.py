@@ -66,6 +66,7 @@ def repair_layers(
     save_best: bool = True,
     pre_repair_metric: Optional[float] = None,
     never_worse_eps: float = 0.005,
+    adapter=None,
 ) -> Dict[str, Any]:
     """Train only MLP params in selected layers with best-checkpoint restore.
 
@@ -85,16 +86,33 @@ def repair_layers(
     layers = list(layers)
     for p in model.parameters():
         p.requires_grad = False
-    params = []
-    for li in layers:
-        for p in model.model.layers[li].mlp.parameters():
+    if adapter is not None:
+        params = adapter.get_trainable_params(model, layers)
+        for p in params:
             p.requires_grad = True
-            params.append(p)
+    else:
+        params = []
+        for li in layers:
+            for p in model.model.layers[li].mlp.parameters():
+                p.requires_grad = True
+                params.append(p)
+
+    # Local dispatch helpers so the rest of repair_layers stays clean
+    def _snap() -> Dict[str, torch.Tensor]:
+        if adapter is not None:
+            return adapter.snapshot_trainable(model, layers)
+        return _snapshot_trainable(model, layers)
+
+    def _restore(snap: Dict[str, torch.Tensor]) -> None:
+        if adapter is not None:
+            adapter.restore_trainable(model, layers, snap)
+        else:
+            _restore_trainable(model, layers, snap)
 
     # Pre-repair snapshot (for never-worse rollback)
     pre_repair_snap: Optional[Dict[str, torch.Tensor]] = None
     if pre_repair_metric is not None:
-        pre_repair_snap = _snapshot_trainable(model, layers)
+        pre_repair_snap = _snap()
 
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
     model.train()
@@ -126,7 +144,7 @@ def repair_layers(
             best_metric = val
             best_step = 0
             if save_best:
-                best_snap = _snapshot_trainable(model, layers)
+                best_snap = _snap()
         model.train()
 
     _es_no_improve: int = 0
@@ -199,7 +217,7 @@ def repair_layers(
                 best_step = opt_step
                 _es_no_improve = 0
                 if save_best:
-                    best_snap = _snapshot_trainable(model, layers)
+                    best_snap = _snap()
             else:
                 _es_no_improve += 1
 
@@ -242,13 +260,13 @@ def repair_layers(
                 best_metric = val
                 best_step = opt_step
                 if save_best:
-                    best_snap = _snapshot_trainable(model, layers)
+                    best_snap = _snap()
             model.train()
 
     # Restore best checkpoint
     repaired_ok = True
     if save_best and best_snap is not None:
-        _restore_trainable(model, layers, best_snap)
+        _restore(best_snap)
         _log.info("restored best checkpoint from step %d (metric=%.4f)", best_step, best_metric)
 
     # Never-worse-than-pre-repair invariant
@@ -260,7 +278,7 @@ def repair_layers(
                 "rolling back to pre-repair weights",
                 best_metric, pre_repair_metric, never_worse_eps, threshold,
             )
-            _restore_trainable(model, layers, pre_repair_snap)
+            _restore(pre_repair_snap)
             repaired_ok = False
 
     return {
