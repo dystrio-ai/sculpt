@@ -711,3 +711,7 @@ def dataset_stats(
         for r in records:
             tier_names = [t.name for t in r.tiers]
             log.info("  %s: %s", r.model_id, ", ".join(tier_names))
+
+
+if __name__ == "__main__":
+    app()
