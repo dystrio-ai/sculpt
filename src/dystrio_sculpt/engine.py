@@ -6,6 +6,7 @@ best-checkpoint restore, and staged rollback with never-ship-worse invariant.
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import math
@@ -528,6 +529,11 @@ def compile_model(
 
     sculpt_num_params = sum(p.numel() for p in model.parameters())
     sculpt_weights_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+
+    # Free compilation artifacts before the full eval to avoid OOM on large models
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # Final evaluation + benchmark (full token budget)
     metrics_post = _collect_metrics(model, tok, texts, device, policy.final_eval_max_tokens)

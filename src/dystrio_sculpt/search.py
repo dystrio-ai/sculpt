@@ -702,7 +702,8 @@ class FrontierSearch:
             _log.error("no viable points at all")
             return []
 
-        # Build selection: best quality, fastest safe, then fill
+        # Build selection: best quality + fastest safe, then fill evenly
+        # across the keep_frac range so tiers cover a smooth quality gradient.
         best_q = self._best_quality()
         fastest_s = self._fastest_safe()
         selected_set: Dict[float, FrontierPoint] = {}
@@ -712,13 +713,18 @@ class FrontierSearch:
         if fastest_s is not None and fastest_s.keep_frac not in selected_set:
             selected_set[fastest_s.keep_frac] = fastest_s
 
-        # Fill remaining slots from safe points sorted by descending blended speedup
-        safe_by_speed = sorted(safe, key=lambda p: -p.blended_speedup)
-        for pt in safe_by_speed:
-            if len(selected_set) >= self.n_frontier:
-                break
-            if pt.keep_frac not in selected_set:
-                selected_set[pt.keep_frac] = pt
+        # Fill remaining slots by spacing evenly across the keep_frac range
+        remaining_slots = self.n_frontier - len(selected_set)
+        candidates = sorted(
+            [p for p in safe if p.keep_frac not in selected_set],
+            key=lambda p: -p.keep_frac,
+        )
+        if remaining_slots > 0 and candidates:
+            step = max(1, len(candidates) // (remaining_slots + 1))
+            for i in range(step - 1, len(candidates), step):
+                if len(selected_set) >= self.n_frontier:
+                    break
+                selected_set[candidates[i].keep_frac] = candidates[i]
 
         selected = sorted(selected_set.values(), key=lambda p: -p.keep_frac)
 
