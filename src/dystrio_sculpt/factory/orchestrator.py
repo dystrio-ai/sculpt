@@ -278,6 +278,11 @@ def run_factory(cfg: FactoryConfig) -> FactoryResult:
     # ── Run manifest ──────────────────────────────────────────────────────
     _write_run_manifest(result, cfg, desc, outdir)
 
+    # ── Stage 6: Sync dataset to HuggingFace ─────────────────────────────
+    if cfg.dataset_path and result.dataset_record:
+        from ..dataset.sync import sync_dataset_to_hub
+        sync_dataset_to_hub(cfg.dataset_path)
+
     _log.info(
         "FACTORY COMPLETE: %s — %d tiers in %.0fs  [run_id=%s]",
         cfg.model_id, len(compile_result.tiers), result.wall_time_s,
