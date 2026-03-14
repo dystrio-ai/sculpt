@@ -530,10 +530,16 @@ def compile_model(
     sculpt_num_params = sum(p.numel() for p in model.parameters())
     sculpt_weights_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
 
-    # Free compilation artifacts before the full eval to avoid OOM on large models
+    # Free compilation artifacts before the full eval to avoid OOM on large models.
+    # Move model to CPU, wipe GPU, then bring it back. Without this, repair
+    # dicts and snapshot tensors keep ~50+ GiB pinned and the final eval OOMs
+    # on 12B+ models (A100-80GB).
+    del chunks
     gc.collect()
     if torch.cuda.is_available():
+        model.cpu()
         torch.cuda.empty_cache()
+        model.to(device)
 
     # Final evaluation + benchmark (full token budget)
     metrics_post = _collect_metrics(model, tok, texts, device, policy.final_eval_max_tokens)
