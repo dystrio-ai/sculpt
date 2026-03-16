@@ -6,6 +6,7 @@ best-checkpoint restore, and staged rollback with never-ship-worse invariant.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -184,6 +185,7 @@ def compile_model(
     layer_order: Optional[List[int]] = None,
     allow_escalation: bool = True,
     calib: Optional[CalibConfig] = None,
+    distill: bool = False,
 ) -> CompileResult:
     """Compile a model at a specific keep_frac.
 
@@ -229,6 +231,20 @@ def compile_model(
             model, tok, layers, texts["cal"], MAX_LEN, device,
             block_size=BLOCK_SIZE,
         )
+
+    # Distillation: create a frozen teacher from the original model before compression
+    teacher_model = None
+    distill_alpha = 0.0
+    if distill:
+        if policy is not None:
+            distill_alpha = policy.distill_alpha
+        if distill_alpha <= 0.0:
+            distill_alpha = 0.5
+        _log.info("creating teacher model for distillation (alpha=%.2f)", distill_alpha)
+        teacher_model = copy.deepcopy(model)
+        for p in teacher_model.parameters():
+            p.requires_grad = False
+        teacher_model.eval()
 
     original_ffn_dims: Dict[int, int] = {}
     for li in layers:
@@ -334,6 +350,7 @@ def compile_model(
                 regression_limit=current_policy.regression_limit,
                 max_grad_norm=current_policy.max_grad_norm,
                 save_best=True, pre_repair_metric=stage_ppl,
+                teacher_model=teacher_model, distill_alpha=distill_alpha,
             )
             total_repair_steps += int(sr["steps"])
             if sr.get("early_stopped"):
@@ -381,6 +398,7 @@ def compile_model(
                         regression_limit=fallback.regression_limit,
                         max_grad_norm=fallback.max_grad_norm,
                         save_best=True, pre_repair_metric=stage_ppl,
+                        teacher_model=teacher_model, distill_alpha=distill_alpha,
                     )
                     total_repair_steps += int(sr2["steps"])
                     if not sr2.get("repaired_ok", True):
@@ -467,10 +485,18 @@ def compile_model(
             regression_limit=current_policy.regression_limit,
             max_grad_norm=current_policy.max_grad_norm,
             save_best=True, pre_repair_metric=pre_final_ppl,
+            teacher_model=teacher_model, distill_alpha=distill_alpha,
         )
         total_repair_steps += int(fr["steps"])
         if fr.get("early_stopped"):
             any_early_stopped = True
+
+    # Free teacher model before benchmarks to reclaim VRAM
+    if teacher_model is not None:
+        del teacher_model
+        teacher_model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Compile-phase VRAM peaks (covers staging + repair)
     peak_alloc_compile: Optional[int] = None
@@ -527,6 +553,10 @@ def compile_model(
         "escalation": {
             "applied": _escalation_applied,
             "details": _escalation_details,
+        },
+        "distillation": {
+            "enabled": distill,
+            "alpha": distill_alpha,
         },
     }
 

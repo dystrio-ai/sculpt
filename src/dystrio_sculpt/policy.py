@@ -50,6 +50,7 @@ class RepairPolicy:
     final_eval_max_tokens: int
     grad_accum_steps: int
     max_grad_norm: Optional[float] = None
+    distill_alpha: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -65,6 +66,7 @@ class RepairPolicy:
             "final_eval_max_tokens": self.final_eval_max_tokens,
             "grad_accum_steps": self.grad_accum_steps,
             "max_grad_norm": self.max_grad_norm,
+            "distill_alpha": self.distill_alpha,
         }
 
 
@@ -215,6 +217,7 @@ def risk_scale_policy(policy: RepairPolicy, risk: float) -> RepairPolicy:
         final_eval_max_tokens=policy.final_eval_max_tokens,
         grad_accum_steps=policy.grad_accum_steps,
         max_grad_norm=policy.max_grad_norm,
+        distill_alpha=policy.distill_alpha,
     )
 
 
@@ -231,6 +234,7 @@ def _with_stage_size(policy: RepairPolicy, stage_size: int) -> RepairPolicy:
         final_eval_max_tokens=policy.final_eval_max_tokens,
         grad_accum_steps=policy.grad_accum_steps,
         max_grad_norm=policy.max_grad_norm,
+        distill_alpha=policy.distill_alpha,
     )
 
 
@@ -505,6 +509,7 @@ def _adapt_steps(policy: RepairPolicy, H: int, I: float, M: float = 0.0) -> Repa
                 final_eval_max_tokens=policy.final_eval_max_tokens,
                 grad_accum_steps=policy.grad_accum_steps,
                 max_grad_norm=policy.max_grad_norm,
+                distill_alpha=policy.distill_alpha,
             )
     return policy
 
@@ -821,6 +826,7 @@ def escalate_policy(
         final_eval_max_tokens=policy.final_eval_max_tokens,
         grad_accum_steps=policy.grad_accum_steps,
         max_grad_norm=policy.max_grad_norm,
+        distill_alpha=policy.distill_alpha,
     )
     return escalated, details
 

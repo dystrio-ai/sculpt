@@ -1,5 +1,6 @@
 """Repair: fine-tune compressed MLP layers with cosine LR, best-checkpoint
-restore, and never-worse-than-pre-repair safety invariant."""
+restore, never-worse-than-pre-repair safety invariant, and optional
+knowledge distillation from a frozen teacher model."""
 
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import time
 from typing import Any, Callable, Dict, Optional, Sequence
 
 import torch
+import torch.nn.functional as F
 
 _log = logging.getLogger(__name__)
 
@@ -66,6 +68,9 @@ def repair_layers(
     save_best: bool = True,
     pre_repair_metric: Optional[float] = None,
     never_worse_eps: float = 0.005,
+    teacher_model=None,
+    distill_alpha: float = 0.0,
+    distill_temp: float = 2.0,
 ) -> Dict[str, Any]:
     """Train only MLP params in selected layers with best-checkpoint restore.
 
@@ -79,10 +84,23 @@ def repair_layers(
     pre_repair_metric * (1 + never_worse_eps), pre-repair weights are restored
     and ``repaired_ok`` is set to False.
 
+    When *teacher_model* is provided and *distill_alpha* > 0, the loss becomes
+    a weighted blend of next-token CE and KL divergence against the teacher's
+    logits: ``loss = (1 - alpha) * ce + alpha * kl``.  The teacher must be
+    frozen and in eval mode.  *distill_temp* controls the softmax temperature
+    for the KL term.
+
     Returns dict with: steps, microsteps, curve, early_stopped, best_metric,
     best_step, repaired_ok.
     """
     layers = list(layers)
+    use_distill = teacher_model is not None and distill_alpha > 0.0
+    if use_distill:
+        _log.info(
+            "distillation enabled: alpha=%.2f temp=%.1f",
+            distill_alpha, distill_temp,
+        )
+
     for p in model.parameters():
         p.requires_grad = False
     params = []
@@ -142,9 +160,24 @@ def repair_layers(
         out = model(**inp, use_cache=False)
         logits = out.logits[:, :-1, :]
         target = inp["input_ids"][:, 1:]
-        loss = torch.nn.functional.cross_entropy(
+        ce_loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)), target.reshape(-1),
         )
+
+        if use_distill:
+            with torch.no_grad():
+                teacher_out = teacher_model(**inp, use_cache=False)
+            teacher_logits = teacher_out.logits[:, :-1, :]
+            student_log_probs = F.log_softmax(logits / distill_temp, dim=-1)
+            teacher_probs = F.softmax(teacher_logits / distill_temp, dim=-1)
+            kl_loss = F.kl_div(
+                student_log_probs.reshape(-1, logits.size(-1)),
+                teacher_probs.reshape(-1, logits.size(-1)),
+                reduction="batchmean",
+            ) * (distill_temp ** 2)
+            loss = (1.0 - distill_alpha) * ce_loss + distill_alpha * kl_loss
+        else:
+            loss = ce_loss
 
         if torch.isnan(loss) or torch.isinf(loss):
             _log.warning("NaN/Inf loss at microstep %d — stopping repair", microstep)
@@ -275,4 +308,7 @@ def repair_layers(
         "regression_stop_triggered": _regression_tripwire,  # backward compat
         "nan_inf_detected": _nan_inf_detected,
         "early_stop_triggered": _early_stop_triggered,
+        "distillation_enabled": use_distill,
+        "distill_alpha": distill_alpha if use_distill else 0.0,
+        "distill_temp": distill_temp if use_distill else 0.0,
     }

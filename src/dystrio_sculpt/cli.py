@@ -110,6 +110,10 @@ def sculpt(
         "text", "--calib-text-field",
         help="Name of the text column in the HF dataset.",
     ),
+    distill: bool = typer.Option(
+        False, "--distill",
+        help="Enable knowledge distillation during repair (teacher = uncompressed model).",
+    ),
 ) -> None:
     """Compile a model across a Pareto frontier of quality vs speed."""
     log = logging.getLogger("dystrio.sculpt")
@@ -132,6 +136,8 @@ def sculpt(
         log.info("  time_budget:   %.1fh", max_compile_hours)
     if policy is not None:
         log.info("  policy:        %s (override)", policy)
+    if distill:
+        log.info("  distill:       enabled")
 
     # Resolve optional policy override
     policy_override = None
@@ -192,6 +198,7 @@ def sculpt(
         policy_override=policy_override,
         outdir=outpath,
         calib=calib_cfg,
+        distill=distill,
     )
 
     selected = search.run()
