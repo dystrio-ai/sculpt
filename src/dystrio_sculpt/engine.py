@@ -232,19 +232,30 @@ def compile_model(
             block_size=BLOCK_SIZE,
         )
 
-    # Distillation: create a frozen teacher from the original model before compression
+    # Distillation: create a frozen teacher from the original model before compression.
+    # A/B testing showed distillation only helps at aggressive compression
+    # (keep_frac <= 0.65) where the model is damaged enough that teacher
+    # guidance aids recovery. At lighter compression, CE-only repair is
+    # sufficient and the KL term adds noise.
+    DISTILL_THRESHOLD = 0.65
     teacher_model = None
     distill_alpha = 0.0
     if distill:
-        if policy is not None:
+        if policy is not None and policy.distill_alpha > 0.0:
             distill_alpha = policy.distill_alpha
-        if distill_alpha <= 0.0:
+        elif keep_frac <= DISTILL_THRESHOLD:
             distill_alpha = 0.5
-        _log.info("creating teacher model for distillation (alpha=%.2f)", distill_alpha)
-        teacher_model = copy.deepcopy(model)
-        for p in teacher_model.parameters():
-            p.requires_grad = False
-        teacher_model.eval()
+        else:
+            _log.info(
+                "distillation skipped: keep_frac=%.3f > %.2f threshold",
+                keep_frac, DISTILL_THRESHOLD,
+            )
+        if distill_alpha > 0.0:
+            _log.info("creating teacher model for distillation (alpha=%.2f)", distill_alpha)
+            teacher_model = copy.deepcopy(model)
+            for p in teacher_model.parameters():
+                p.requires_grad = False
+            teacher_model.eval()
 
     original_ffn_dims: Dict[int, int] = {}
     for li in layers:
