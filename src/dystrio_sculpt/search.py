@@ -134,6 +134,7 @@ class FrontierSearch:
         outdir: Optional[Path] = None,
         calib: Optional[CalibConfig] = None,
         distill: bool = False,
+        distill_alpha: Optional[float] = None,
     ):
         self.model_id = model_id
         self.n_frontier = n_frontier
@@ -159,6 +160,7 @@ class FrontierSearch:
         self.outdir = outdir
         self.calib = calib
         self.distill = distill
+        self.distill_alpha = distill_alpha
 
         self.texts: Optional[Dict[str, List[str]]] = None
         self.prescan_cache: Optional[Dict[int, Dict[str, Any]]] = None
@@ -305,6 +307,7 @@ class FrontierSearch:
                 layer_order=self.layer_order,
                 allow_escalation=not self._escalation_applied,
                 distill=self.distill,
+                distill_alpha_override=self.distill_alpha,
             )
         except Exception as exc:
             _log.error("compile_model failed for kf=%.3f: %s", keep_frac, exc)

@@ -1,0 +1,147 @@
+{
+  "gemma_baseline": {
+    "model_id": "google/gemma-2-2b-it",
+    "intermediate_size": 9216,
+    "hidden_size": 2304
+  },
+  "gemma_sculpt": {
+    "model_id": "dystrio/gemma-2-2b-it-sculpt-default",
+    "intermediate_size": 7936,
+    "hidden_size": 2304
+  },
+  "gemma_production": {
+    "model_id": "dystrio/gemma-2-2b-it-sculpt-production",
+    "intermediate_size": 7296,
+    "hidden_size": 2304
+  },
+  "gemma_throughput": {
+    "model_id": "dystrio/gemma-2-2b-it-sculpt-throughput",
+    "intermediate_size": 6528,
+    "hidden_size": 2304
+  },
+  "gemma_experimental": {
+    "model_id": "dystrio/gemma-2-2b-it-sculpt-experimental",
+    "intermediate_size": 4864,
+    "hidden_size": 2304
+  },
+  "llama32": {
+    "model_id": "meta-llama/Llama-3.2-3B-Instruct",
+    "intermediate_size": 8192,
+    "hidden_size": 3072
+  },
+  "llama32_sculpt": {
+    "model_id": "dystrio/Llama-3.2-3B-Instruct-sculpt-default",
+    "intermediate_size": 7296,
+    "hidden_size": 3072
+  },
+  "llama32_production": {
+    "model_id": "dystrio/Llama-3.2-3B-Instruct-sculpt-production",
+    "intermediate_size": 6784,
+    "hidden_size": 3072
+  },
+  "llama32_throughput": {
+    "model_id": "dystrio/Llama-3.2-3B-Instruct-sculpt-throughput",
+    "intermediate_size": 6144,
+    "hidden_size": 3072
+  },
+  "llama32_experimental": {
+    "model_id": "dystrio/Llama-3.2-3B-Instruct-sculpt-experimental",
+    "intermediate_size": 4992,
+    "hidden_size": 3072
+  },
+  "qwen3b": {
+    "model_id": "Qwen/Qwen2.5-3B-Instruct",
+    "intermediate_size": 11008,
+    "hidden_size": 2048
+  },
+  "qwen3b_sculpt": {
+    "model_id": "dystrio/Qwen2.5-3B-Instruct-sculpt-default",
+    "intermediate_size": 9728,
+    "hidden_size": 2048
+  },
+  "qwen3b_production": {
+    "model_id": "dystrio/Qwen2.5-3B-Instruct-sculpt-production",
+    "intermediate_size": 9088,
+    "hidden_size": 2048
+  },
+  "qwen3b_throughput": {
+    "model_id": "dystrio/Qwen2.5-3B-Instruct-sculpt-throughput",
+    "intermediate_size": 8320,
+    "hidden_size": 2048
+  },
+  "qwen3b_experimental": {
+    "model_id": "dystrio/Qwen2.5-3B-Instruct-sculpt-experimental",
+    "intermediate_size": 7168,
+    "hidden_size": 2048
+  },
+  "mistral7b": {
+    "model_id": "mistralai/Mistral-7B-Instruct-v0.3",
+    "intermediate_size": 14336,
+    "hidden_size": 4096
+  },
+  "mistral7b_sculpt": {
+    "model_id": "dystrio/Mistral-7B-Instruct-v0.3-sculpt-default",
+    "intermediate_size": 12288,
+    "hidden_size": 4096
+  },
+  "mistral7b_production": {
+    "model_id": "dystrio/Mistral-7B-Instruct-v0.3-sculpt-production",
+    "intermediate_size": 11264,
+    "hidden_size": 4096
+  },
+  "mistral7b_throughput": {
+    "model_id": "dystrio/Mistral-7B-Instruct-v0.3-sculpt-throughput",
+    "intermediate_size": 10112,
+    "hidden_size": 4096
+  },
+  "mistral7b_experimental": {
+    "model_id": "dystrio/Mistral-7B-Instruct-v0.3-sculpt-experimental",
+    "intermediate_size": 8960,
+    "hidden_size": 4096
+  },
+  "llama31": {
+    "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+    "intermediate_size": 14336,
+    "hidden_size": 4096
+  },
+  "llama31_sculpt": {
+    "model_id": "dystrio/Llama-3.1-8B-Instruct-sculpt-default",
+    "intermediate_size": 12288,
+    "hidden_size": 4096
+  },
+  "llama31_production": {
+    "model_id": "dystrio/Llama-3.1-8B-Instruct-sculpt-production",
+    "intermediate_size": 10112,
+    "hidden_size": 4096
+  },
+  "llama31_throughput": {
+    "model_id": "dystrio/Llama-3.1-8B-Instruct-sculpt-throughput",
+    "intermediate_size": 8960,
+    "hidden_size": 4096
+  },
+  "llama31_experimental": {
+    "model_id": "dystrio/Llama-3.1-8B-Instruct-sculpt-experimental",
+    "intermediate_size": 8704,
+    "hidden_size": 4096
+  },
+  "qwen7b": {
+    "model_id": "Qwen/Qwen2.5-7B-Instruct",
+    "intermediate_size": 18944,
+    "hidden_size": 3584
+  },
+  "qwen7b_sculpt": {
+    "model_id": "dystrio/Qwen2.5-7B-Instruct-sculpt-default",
+    "intermediate_size": 16768,
+    "hidden_size": 3584
+  },
+  "qwen7b_production": {
+    "model_id": "dystrio/Qwen2.5-7B-Instruct-sculpt-production",
+    "intermediate_size": 12544,
+    "hidden_size": 3584
+  },
+  "qwen7b_throughput": {
+    "model_id": "dystrio/Qwen2.5-7B-Instruct-sculpt-throughput",
+    "intermediate_size": 11392,
+    "hidden_size": 3584
+  }
+}

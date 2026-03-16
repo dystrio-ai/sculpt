@@ -114,6 +114,10 @@ def sculpt(
         False, "--distill",
         help="Enable knowledge distillation during repair (teacher = uncompressed model).",
     ),
+    distill_alpha: Optional[float] = typer.Option(
+        None, "--distill-alpha",
+        help="Force distillation alpha at all compression levels (bypasses adaptive threshold).",
+    ),
 ) -> None:
     """Compile a model across a Pareto frontier of quality vs speed."""
     log = logging.getLogger("dystrio.sculpt")
@@ -136,8 +140,10 @@ def sculpt(
         log.info("  time_budget:   %.1fh", max_compile_hours)
     if policy is not None:
         log.info("  policy:        %s (override)", policy)
+    if distill_alpha is not None:
+        distill = True
     if distill:
-        log.info("  distill:       enabled")
+        log.info("  distill:       enabled (alpha=%s)", distill_alpha or "adaptive")
 
     # Resolve optional policy override
     policy_override = None
@@ -199,6 +205,7 @@ def sculpt(
         outdir=outpath,
         calib=calib_cfg,
         distill=distill,
+        distill_alpha=distill_alpha,
     )
 
     selected = search.run()

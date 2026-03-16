@@ -186,6 +186,7 @@ def compile_model(
     allow_escalation: bool = True,
     calib: Optional[CalibConfig] = None,
     distill: bool = False,
+    distill_alpha_override: Optional[float] = None,
 ) -> CompileResult:
     """Compile a model at a specific keep_frac.
 
@@ -241,7 +242,9 @@ def compile_model(
     teacher_model = None
     distill_alpha = 0.0
     if distill:
-        if policy is not None and policy.distill_alpha > 0.0:
+        if distill_alpha_override is not None:
+            distill_alpha = distill_alpha_override
+        elif policy is not None and policy.distill_alpha > 0.0:
             distill_alpha = policy.distill_alpha
         elif keep_frac <= DISTILL_THRESHOLD:
             distill_alpha = 0.5
