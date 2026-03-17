@@ -78,10 +78,31 @@ def get_text_config(model: nn.Module):
 def load_model_and_tokenizer(
     model_id: str, device: str, dtype: torch.dtype,
 ):
+    from transformers import AutoConfig
+
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tok.pad_token_id is None:
         tok.pad_token_id = tok.eos_token_id if tok.eos_token_id is not None else 0
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=dtype, trust_remote_code=True,
-    ).to(device)
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=dtype, trust_remote_code=True,
+        ).to(device)
+    except AttributeError:
+        # Multimodal wrappers (e.g. Qwen3.5) expose a composite config
+        # that lacks top-level text attributes like vocab_size.
+        # Load the full model and verify it has a CausalLM head.
+        from transformers import AutoModel
+        _log.warning(
+            "AutoModelForCausalLM failed for %s — falling back to AutoModel",
+            model_id,
+        )
+        model = AutoModel.from_pretrained(
+            model_id, torch_dtype=dtype, trust_remote_code=True,
+        ).to(device)
+        if not hasattr(model, "lm_head") and not hasattr(model, "output"):
+            _log.warning(
+                "loaded model has no lm_head — perplexity evaluation "
+                "will rely on model(**inp) returning loss"
+            )
     return model, tok
