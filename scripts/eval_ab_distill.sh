@@ -20,8 +20,6 @@ MODELS=(
 
 VARIANTS=("nodistill" "distill")
 
-TIERS=("sculpt-conservative" "sculpt-balanced" "sculpt-aggressive")
-
 for m in "${MODELS[@]}"; do
   for v in "${VARIANTS[@]}"; do
     RUN_DIR="${ZOO_DIR}/${m}_${v}"
@@ -30,9 +28,11 @@ for m in "${MODELS[@]}"; do
       continue
     fi
 
-    for tier in "${TIERS[@]}"; do
-      MODEL_DIR="${RUN_DIR}/${tier}/model"
-      EVAL_OUT="${RUN_DIR}/${tier}/evals"
+    for tier_dir in "$RUN_DIR"/frontier_*/; do
+      [ -d "$tier_dir" ] || continue
+      tier=$(basename "$tier_dir")
+      MODEL_DIR="${tier_dir}model"
+      EVAL_OUT="${tier_dir}evals"
 
       if [ ! -d "$MODEL_DIR" ]; then
         echo "$(date) SKIP: $MODEL_DIR does not exist" | tee -a "$EVAL_LOG"
