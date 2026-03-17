@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from . import __version__
+from ._model import get_layers, get_text_config
 from .policy import E2E_PROFILES, compute_e2e_speedup
 from ._bench import LATENCY_WARMUP, LATENCY_MEASURE
 
@@ -219,17 +220,21 @@ def emit_frontier_point(
     model_dir.mkdir(parents=True, exist_ok=True)
 
     # Patch config.intermediate_size to match actual (compressed) FFN width.
-    old_intermediate = getattr(model.config, "intermediate_size", None)
+    text_cfg = get_text_config(model)
+    old_intermediate = getattr(text_cfg, "intermediate_size", None)
     new_intermediate = None
-    if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
-        gate = model.model.layers[0].mlp.gate_proj
+    try:
+        layers = get_layers(model)
+        gate = layers[0].mlp.gate_proj
         new_intermediate = gate.out_features if hasattr(gate, "out_features") else gate.weight.shape[0]
+    except (RuntimeError, AttributeError, IndexError):
+        pass
     if new_intermediate is not None and old_intermediate != new_intermediate:
         _log.info(
             "patching config.intermediate_size: %s -> %s",
             old_intermediate, new_intermediate,
         )
-        model.config.intermediate_size = int(new_intermediate)
+        text_cfg.intermediate_size = int(new_intermediate)
         if hasattr(model.config, "text_config") and model.config.text_config is not None:
             model.config.text_config.intermediate_size = int(new_intermediate)
 

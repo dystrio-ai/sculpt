@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import torch
 
-from ._model import load_model_and_tokenizer, resolve_dtype
+from ._model import load_model_and_tokenizer, resolve_dtype, get_mlp, get_text_config
 from ._data import CalibConfig, load_text_sets, deterministic_subset
 from ._eval import eval_perplexity
 from ._bench import (
@@ -200,7 +200,7 @@ def compile_model(
 
     _log.info("loading model %s (keep_frac=%.3f)", model_id, keep_frac)
     model, tok = load_model_and_tokenizer(model_id, device, dtype)
-    num_layers = model.config.num_hidden_layers
+    num_layers = get_text_config(model).num_hidden_layers
     layers = list(range(num_layers))
 
     if texts is None:
@@ -262,7 +262,7 @@ def compile_model(
 
     original_ffn_dims: Dict[int, int] = {}
     for li in layers:
-        original_ffn_dims[li] = model.model.layers[li].mlp.gate_proj.out_features
+        original_ffn_dims[li] = get_mlp(model, li).gate_proj.out_features
 
     if layer_order is not None and keep_frac < 1.0:
         compressible = [li for li in layer_order if li in set(layers)]

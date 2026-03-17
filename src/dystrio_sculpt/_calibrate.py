@@ -7,6 +7,8 @@ from typing import Dict, Sequence
 
 import torch
 
+from ._model import get_layers
+
 
 @torch.no_grad()
 def collect_ffn_importance_swiglu(
@@ -14,7 +16,7 @@ def collect_ffn_importance_swiglu(
     max_len: int, device: str,
 ) -> torch.Tensor:
     """Per-neuron magnitude importance: imp[j] = mean |act(gate)*up|_j."""
-    layer = model.model.layers[layer_idx]
+    layer = get_layers(model)[layer_idx]
     mlp = layer.mlp
     ffn = mlp.gate_proj.out_features
     imp = torch.zeros(ffn, device=device, dtype=torch.float32)
@@ -44,7 +46,7 @@ def collect_block_geometry_swiglu(
     max_len: int, device: str, block_size: int, max_tokens: int = 30_000,
 ) -> Dict[str, object]:
     """Block-level covariance of SwiGLU activations (3 features per block)."""
-    layer = model.model.layers[layer_idx]
+    layer = get_layers(model)[layer_idx]
     mlp = layer.mlp
     ffn = mlp.gate_proj.out_features
     n_blocks = math.ceil(ffn / block_size)
@@ -112,7 +114,7 @@ def collect_block_operator_sensitivity_swiglu(
     max_len: int, device: str, block_size: int, max_tokens: int = 30_000,
 ) -> Dict[str, object]:
     """Operator fidelity: how much zeroing each block changes MLP output."""
-    layer = model.model.layers[layer_idx]
+    layer = get_layers(model)[layer_idx]
     mlp = layer.mlp
     ffn = mlp.gate_proj.out_features
     n_blocks = math.ceil(ffn / block_size)

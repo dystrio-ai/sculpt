@@ -13,6 +13,8 @@ from typing import Any, Callable, Dict, Optional, Sequence
 import torch
 import torch.nn.functional as F
 
+from ._model import get_mlp
+
 _log = logging.getLogger(__name__)
 
 
@@ -27,7 +29,7 @@ def _snapshot_trainable(model, layers: Sequence[int]) -> Dict[str, torch.Tensor]
     """Save a CPU copy of all trainable MLP parameters for the given layers."""
     snap: Dict[str, torch.Tensor] = {}
     for li in layers:
-        mlp = model.model.layers[li].mlp
+        mlp = get_mlp(model, li)
         for name, p in mlp.named_parameters():
             key = f"layers.{li}.mlp.{name}"
             snap[key] = p.data.detach().cpu().clone()
@@ -39,7 +41,7 @@ def _restore_trainable(
 ) -> None:
     """Restore MLP parameters from a CPU snapshot."""
     for li in layers:
-        mlp = model.model.layers[li].mlp
+        mlp = get_mlp(model, li)
         for name, p in mlp.named_parameters():
             key = f"layers.{li}.mlp.{name}"
             if key in snap:
@@ -105,7 +107,7 @@ def repair_layers(
         p.requires_grad = False
     params = []
     for li in layers:
-        for p in model.model.layers[li].mlp.parameters():
+        for p in get_mlp(model, li).parameters():
             p.requires_grad = True
             params.append(p)
 

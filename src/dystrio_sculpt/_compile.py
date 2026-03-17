@@ -7,6 +7,8 @@ from typing import Dict, List, Tuple
 
 import torch
 
+from ._model import get_mlp
+
 
 def select_blocks_magnitude(
     importance: torch.Tensor, block_size: int, keep_frac: float,
@@ -36,7 +38,7 @@ def compress_mlp_layer_swiglu_inplace(
     dtype: torch.dtype, device: str,
 ) -> Dict[str, int]:
     """Replace gate/up/down projections with physically smaller Linear layers."""
-    mlp = model.model.layers[layer_idx].mlp
+    mlp = get_mlp(model, layer_idx)
     old_gate, old_up, old_down = mlp.gate_proj, mlp.up_proj, mlp.down_proj
     hidden = old_gate.in_features
     ffn_kept = int(kept_idx.numel())
