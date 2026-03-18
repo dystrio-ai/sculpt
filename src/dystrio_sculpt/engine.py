@@ -183,7 +183,7 @@ def _create_teacher(
     prefer_quantized = False
     if torch.cuda.is_available():
         allocated_gb = torch.cuda.memory_allocated() / (1024 ** 3)
-        total_gb = torch.cuda.get_device_properties(0).total_mem / (1024 ** 3)
+        total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
         if allocated_gb > total_gb * 0.45:
             prefer_quantized = True
             _log.info(
