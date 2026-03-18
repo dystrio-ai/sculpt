@@ -15,6 +15,7 @@ import torch
 from .structural import (
     prescan_structural_artifacts,
     select_blocks_structural,
+    CrossLayerNoveltyTracker,
 )
 from .magnitude import select_for_layer_magnitude
 from .._calibrate import (
@@ -36,11 +37,20 @@ def select_for_layer(
     selector: str = "structural",
     prescan_cache: Optional[Dict[int, Dict[str, Any]]] = None,
     rng: np.random.RandomState | None = None,
+    cross_layer_novelty: Optional[np.ndarray] = None,
+    adapter=None,
 ) -> Tuple[List[int], torch.Tensor, Dict[str, object]]:
     """Select blocks for a single layer using the chosen selector.
 
     When *prescan_cache* contains an entry for *layer_idx* and the selector
     is structural, cached tensors are used instead of live calibration.
+
+    *cross_layer_novelty*, when provided, is a per-block multiplier from a
+    CrossLayerNoveltyTracker that boosts blocks not frequently selected in
+    previously compressed layers.
+
+    When *adapter* is provided, calibration is dispatched through it instead
+    of calling the SwiGLU-specific functions directly.
     """
     if selector == "structural":
         if prescan_cache is not None and layer_idx in prescan_cache:
@@ -49,6 +59,19 @@ def select_for_layer(
             block_energy = pre["block_energy"]
             block_sensitivity = pre["block_sensitivity"]
             feature_multiplier = pre.get("feature_multiplier", 3)
+        elif adapter is not None:
+            geom = adapter.collect_block_geometry(
+                model, tokenizer, layer_idx, texts_cal, max_len, device,
+                block_size=BLOCK_SIZE, max_tokens=30_000,
+            )
+            sens = adapter.collect_block_sensitivity(
+                model, tokenizer, layer_idx, texts_cal, max_len, device,
+                block_size=BLOCK_SIZE, max_tokens=30_000,
+            )
+            geom_D = geom["D"]
+            block_energy = geom.get("block_energy")
+            block_sensitivity = sens["block_sensitivity"]
+            feature_multiplier = geom.get("feature_multiplier", 3)
         else:
             geom = collect_block_geometry_swiglu(
                 model, tokenizer, layer_idx, texts_cal, max_len, device,
@@ -69,6 +92,7 @@ def select_for_layer(
             feature_multiplier=feature_multiplier,
             block_sensitivity=block_sensitivity,
             rng=rng,
+            cross_layer_novelty=cross_layer_novelty,
         )
         return kept_blocks, kept_idx.to(device), arts
 

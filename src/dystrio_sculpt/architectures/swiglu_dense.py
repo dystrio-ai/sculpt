@@ -1,0 +1,106 @@
+"""SwiGLU dense adapter for Llama, Mistral, Qwen, Phi, Gemma.
+
+Wraps existing _compile.py and _calibrate.py functions — no logic rewrite.
+This adapter handles all dense (non-MoE) models with SwiGLU FFN blocks
+that use the gate_proj / up_proj / down_proj naming convention.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Sequence, Tuple
+
+import torch
+
+from .base import ArchitectureAdapter
+from .descriptor import OptimizationTarget
+
+
+class SwiGLUDenseAdapter(ArchitectureAdapter):
+    """Adapter for dense transformer models with SwiGLU MLP blocks."""
+
+    def supported_targets(self) -> List[OptimizationTarget]:
+        return [OptimizationTarget.MLP_BLOCK]
+
+    # ── Layer access ──────────────────────────────────────────────────────
+
+    def get_num_layers(self, model) -> int:
+        return model.config.num_hidden_layers
+
+    def get_mlp(self, model, layer_idx: int):
+        return model.model.layers[layer_idx].mlp
+
+    def get_ffn_size(self, model, layer_idx: int) -> int:
+        return model.model.layers[layer_idx].mlp.gate_proj.out_features
+
+    # ── Compression ───────────────────────────────────────────────────────
+
+    def compress_layer(
+        self, model, layer_idx: int, kept_idx: torch.Tensor,
+        dtype: torch.dtype, device: str,
+    ) -> Dict[str, int]:
+        from .._compile import compress_mlp_layer_swiglu_inplace
+        return compress_mlp_layer_swiglu_inplace(model, layer_idx, kept_idx, dtype, device)
+
+    # ── Calibration ───────────────────────────────────────────────────────
+
+    def collect_block_geometry(
+        self, model, tokenizer, layer_idx: int, texts: Sequence[str],
+        max_len: int, device: str, block_size: int, max_tokens: int = 30_000,
+    ) -> Dict[str, Any]:
+        from .._calibrate import collect_block_geometry_swiglu
+        return collect_block_geometry_swiglu(
+            model, tokenizer, layer_idx, texts, max_len, device,
+            block_size=block_size, max_tokens=max_tokens,
+        )
+
+    def collect_block_sensitivity(
+        self, model, tokenizer, layer_idx: int, texts: Sequence[str],
+        max_len: int, device: str, block_size: int, max_tokens: int = 30_000,
+    ) -> Dict[str, Any]:
+        from .._calibrate import collect_block_operator_sensitivity_swiglu
+        return collect_block_operator_sensitivity_swiglu(
+            model, tokenizer, layer_idx, texts, max_len, device,
+            block_size=block_size, max_tokens=max_tokens,
+        )
+
+    def collect_importance(
+        self, model, tokenizer, layer_idx: int, texts: Sequence[str],
+        max_len: int, device: str,
+    ) -> torch.Tensor:
+        from .._calibrate import collect_ffn_importance_swiglu
+        return collect_ffn_importance_swiglu(
+            model, tokenizer, layer_idx, texts, max_len, device,
+        )
+
+    # ── Repair support ────────────────────────────────────────────────────
+
+    def snapshot_trainable(
+        self, model, layers: Sequence[int],
+    ) -> Dict[str, torch.Tensor]:
+        snap: Dict[str, torch.Tensor] = {}
+        for li in layers:
+            mlp = model.model.layers[li].mlp
+            for name, p in mlp.named_parameters():
+                key = f"layers.{li}.mlp.{name}"
+                snap[key] = p.data.detach().cpu().clone()
+        return snap
+
+    def restore_trainable(
+        self, model, layers: Sequence[int],
+        snap: Dict[str, torch.Tensor],
+    ) -> None:
+        for li in layers:
+            mlp = model.model.layers[li].mlp
+            for name, p in mlp.named_parameters():
+                key = f"layers.{li}.mlp.{name}"
+                if key in snap:
+                    p.data.copy_(snap[key].to(p.device))
+
+    def get_trainable_params(
+        self, model, layers: Sequence[int],
+    ) -> list[torch.nn.Parameter]:
+        params = []
+        for li in layers:
+            for p in model.model.layers[li].mlp.parameters():
+                params.append(p)
+        return params

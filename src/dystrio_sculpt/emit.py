@@ -212,7 +212,7 @@ def emit_frontier_point(
 ) -> Path:
     """Save a single frontier point: model weights, metrics, and manifest.
 
-    *label* is a human-friendly name like ``frontier_0_conservative``.
+    *label* is a human-friendly name like ``frontier_0_default``.
     Returns the path to the emitted directory.
     """
     point_dir = outdir / label

@@ -168,7 +168,110 @@ def risk_aware_keep_candidates(risk: float) -> List[float]:
     suitable for < 5% downstream degradation targets.
     """
     if risk <= 0.35:
-        return [0.95, 0.90, 0.85, 0.78, 0.70, 0.62, 0.55]
+        return [0.95, 0.90, 0.85, 0.78, 0.70, 0.62, 0.55, 0.48]
     if risk >= 0.65:
-        return [0.95, 0.92, 0.88, 0.84, 0.80, 0.76, 0.72]
+        return [0.95, 0.92, 0.88, 0.84, 0.80, 0.76, 0.72, 0.66]
     return [0.95, 0.90, 0.88, 0.82, 0.75, 0.70, 0.66, 0.62]
+
+
+# ── Layer protection ──────────────────────────────────────────────────────────
+
+
+DEFAULT_PROTECTION_THRESHOLD = 0.70
+
+
+def protected_layers(
+    prescan_cache: Dict[int, Dict[str, Any]],
+    threshold: float = DEFAULT_PROTECTION_THRESHOLD,
+) -> List[int]:
+    """Return layer indices whose risk score exceeds *threshold*.
+
+    Protected layers should be skipped during compression (keep_frac=1.0)
+    because their structural risk is too high for safe pruning.  This
+    corresponds to the production practice of leaving final/deep blocks
+    untouched to preserve semantic integrity.
+    """
+    result: List[int] = []
+    for li in sorted(prescan_cache.keys()):
+        pre = prescan_cache[li]
+        bs = pre.get("block_sensitivity")
+        D = pre.get("D")
+        if bs is None or D is None:
+            continue
+        risk, _ = layer_risk_score(bs, D, pre.get("block_energy"))
+        if risk >= threshold:
+            result.append(li)
+    return result
+
+
+# ── Risk-weighted keep_frac schedule ──────────────────────────────────────────
+
+
+def risk_weighted_keep_schedule(
+    prescan_cache: Dict[int, Dict[str, Any]],
+    aggressiveness: float,
+    floor: float = 0.30,
+    ceiling: float = 1.0,
+    protection_threshold: float = DEFAULT_PROTECTION_THRESHOLD,
+) -> Dict[int, float]:
+    """Derive per-layer keep_frac from risk scores and a single scalar.
+
+    Ensures **total weight reduction** matches what uniform compression at
+    the same keep_frac would produce.  Protected layers (risk above
+    threshold) stay at 1.0, and non-protected layers compensate so the
+    whole-model average equals the target.  Within non-protected layers,
+    keep_frac is distributed proportionally to risk: safe layers are
+    compressed harder, risky layers lighter.
+    """
+    target_kf = max(floor, 1.0 - aggressiveness)
+
+    if aggressiveness <= 0:
+        return {li: ceiling for li in sorted(prescan_cache.keys())}
+
+    layers_sorted = sorted(prescan_cache.keys())
+    risks: Dict[int, float] = {}
+    protected: List[int] = []
+
+    for li in layers_sorted:
+        pre = prescan_cache[li]
+        bs = pre.get("block_sensitivity")
+        D = pre.get("D")
+        if bs is None or D is None:
+            protected.append(li)
+            continue
+        risk, _ = layer_risk_score(bs, D, pre.get("block_energy"))
+        if risk >= protection_threshold:
+            protected.append(li)
+        else:
+            risks[li] = risk
+
+    if not risks:
+        return {li: ceiling for li in layers_sorted}
+
+    n_total = len(layers_sorted)
+    n_protected = len(protected)
+    n_compressible = n_total - n_protected
+
+    compensated_target = (target_kf * n_total - ceiling * n_protected) / n_compressible
+    compensated_target = max(floor, min(ceiling, compensated_target))
+
+    risk_vals = np.array([risks[li] for li in sorted(risks.keys())])
+    risk_min, risk_max = float(risk_vals.min()), float(risk_vals.max())
+    risk_range = max(risk_max - risk_min, 1e-9)
+
+    normed = {li: (risks[li] - risk_min) / risk_range for li in risks}
+
+    span = ceiling - floor
+    raw = {li: floor + normed[li] * span for li in risks}
+    raw_mean = sum(raw.values()) / len(raw)
+    shift = compensated_target - raw_mean
+
+    schedule: Dict[int, float] = {}
+    for li in layers_sorted:
+        if li in protected or li not in risks:
+            schedule[li] = ceiling
+        else:
+            keep = raw[li] + shift
+            schedule[li] = round(max(floor, min(ceiling, keep)), 4)
+
+    return schedule

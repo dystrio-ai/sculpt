@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from dystrio_sculpt.dataset import build_record, append_local, push_to_hub, LOCAL_CACHE
+from dystrio_sculpt.efficiency_dataset import build_record, append_local, push_to_hub, LOCAL_CACHE
 
 ZOO_DIR = Path("/data/zoo_ab")
 

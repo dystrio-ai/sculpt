@@ -27,6 +27,7 @@ def validate_saved_model(
 
     model = AutoModelForCausalLM.from_pretrained(
         str(model_dir), torch_dtype=torch.bfloat16, trust_remote_code=True,
+        ignore_mismatched_sizes=True,
     ).to(device)
     tok = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
 

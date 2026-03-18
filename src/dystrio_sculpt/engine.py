@@ -7,6 +7,7 @@ best-checkpoint restore, and staged rollback with never-ship-worse invariant.
 from __future__ import annotations
 
 import copy
+import gc
 import json
 import logging
 import math
@@ -28,9 +29,10 @@ from ._bench import (
 )
 from ._compile import compress_mlp_layer_swiglu_inplace
 from .selectors import select_for_layer, BLOCK_SIZE
-from .selectors.structural import prescan_structural_artifacts
+from .selectors.structural import prescan_structural_artifacts, CrossLayerNoveltyTracker
 from .repair import repair_layers, _snapshot_trainable, _restore_trainable
 from .policy import RepairPolicy, auto_select_policy, build_policy_ladder, escalate_policy, HELPFUL_THRESHOLD
+from .architectures.base import ArchitectureAdapter
 
 _log = logging.getLogger(__name__)
 
@@ -251,12 +253,19 @@ def compile_model(
     calib: Optional[CalibConfig] = None,
     distill: bool = False,
     distill_alpha_override: Optional[float] = None,
+    keep_schedule: Optional[Dict[int, float]] = None,
+    adapter: Optional[ArchitectureAdapter] = None,
 ) -> CompileResult:
     """Compile a model at a specific keep_frac.
 
     Orchestrates: load -> prescan -> staged compress -> repair -> eval.
     Uses *policy* for all repair hyperparameters.  If a stage fails, attempts
     one downshift to a more conservative policy before marking as failed.
+
+    When *keep_schedule* is provided, each layer uses its own keep_frac
+    from the schedule (a dict mapping layer index to keep_frac).  The
+    scalar *keep_frac* is still stored in the result for labeling but
+    per-layer values take precedence during compression.
     """
     wall_t0 = time.time()
     setup_determinism(seed, deterministic)
@@ -294,7 +303,7 @@ def compile_model(
         _log.info("running structural prescan on %d layers", num_layers)
         prescan_cache = prescan_structural_artifacts(
             model, tok, layers, texts["cal"], MAX_LEN, device,
-            block_size=BLOCK_SIZE,
+            block_size=BLOCK_SIZE, adapter=adapter,
         )
 
     # Distillation: create a frozen teacher from the original model before compression.
@@ -322,7 +331,12 @@ def compile_model(
 
     original_ffn_dims: Dict[int, int] = {}
     for li in layers:
-        original_ffn_dims[li] = get_mlp(model, li).gate_proj.out_features
+        if adapter is not None:
+            original_ffn_dims[li] = adapter.get_ffn_size(model, li)
+        else:
+            original_ffn_dims[li] = get_mlp(model, li).gate_proj.out_features
+
+    novelty_tracker = CrossLayerNoveltyTracker() if selector == "structural" else None
 
     if layer_order is not None and keep_frac < 1.0:
         compressible = [li for li in layer_order if li in set(layers)]
@@ -393,20 +407,46 @@ def compile_model(
         _log.info("stage %d/%d: layers %s", si + 1, len(chunks), chunk)
 
         # Save pre-stage snapshot for rollback
-        pre_stage_snap = _snapshot_trainable(model, compressed_so_far + chunk) if compressed_so_far else None
+        if compressed_so_far:
+            if adapter is not None:
+                pre_stage_snap = adapter.snapshot_trainable(model, compressed_so_far + chunk)
+            else:
+                pre_stage_snap = _snapshot_trainable(model, compressed_so_far + chunk)
+        else:
+            pre_stage_snap = None
 
         for li in chunk:
-            kept_blocks, kept_idx, _ = select_for_layer(
-                model, tok, li, texts["cal"], keep_frac,
+            layer_kf = keep_schedule[li] if keep_schedule and li in keep_schedule else keep_frac
+            if layer_kf >= 1.0:
+                _log.info("layer %d: keep_frac=%.3f (protected, skipping)", li, layer_kf)
+                continue
+
+            n_blocks_li = original_ffn_dims[li] // BLOCK_SIZE
+            novelty = (
+                novelty_tracker.novelty_multiplier(n_blocks_li)
+                if novelty_tracker is not None else None
+            )
+
+            kept_blocks, kept_idx, sel_arts = select_for_layer(
+                model, tok, li, texts["cal"], layer_kf,
                 MAX_LEN, device, selector=selector,
                 prescan_cache=prescan_cache, rng=rng,
+                cross_layer_novelty=novelty, adapter=adapter,
             )
-            rep = compress_mlp_layer_swiglu_inplace(model, li, kept_idx, dtype, device)
+
+            if novelty_tracker is not None:
+                block_adj = sel_arts.get("block_adj_norm") if sel_arts else None
+                novelty_tracker.record(kept_blocks, n_blocks_li, block_adj=block_adj)
+
+            if adapter is not None:
+                rep = adapter.compress_layer(model, li, kept_idx, dtype, device)
+            else:
+                rep = compress_mlp_layer_swiglu_inplace(model, li, kept_idx, dtype, device)
             compile_report[str(li)] = {
                 "kept_blocks": len(kept_blocks),
                 "original_ffn": original_ffn_dims[li],
                 "ffn_kept": rep["ffn_kept"],
-                "keep_frac": keep_frac,
+                "keep_frac": layer_kf,
             }
         compressed_so_far.extend(chunk)
 
@@ -443,6 +483,7 @@ def compile_model(
                 max_grad_norm=current_policy.max_grad_norm,
                 save_best=True, pre_repair_metric=stage_ppl,
                 teacher_model=teacher_model, distill_alpha=distill_alpha,
+                adapter=adapter,
             )
             total_repair_steps += int(sr["steps"])
             if sr.get("early_stopped"):
@@ -465,7 +506,10 @@ def compile_model(
                     si + 1, sr.get("repaired_ok"), post_ppl,
                 )
                 if pre_stage_snap is not None:
-                    _restore_trainable(model, compressed_so_far, pre_stage_snap)
+                    if adapter is not None:
+                        adapter.restore_trainable(model, compressed_so_far, pre_stage_snap)
+                    else:
+                        _restore_trainable(model, compressed_so_far, pre_stage_snap)
 
                 from .policy import _estimate_param_billions
                 param_b = _estimate_param_billions(model)
@@ -491,6 +535,7 @@ def compile_model(
                         max_grad_norm=fallback.max_grad_norm,
                         save_best=True, pre_repair_metric=stage_ppl,
                         teacher_model=teacher_model, distill_alpha=distill_alpha,
+                        adapter=adapter,
                     )
                     total_repair_steps += int(sr2["steps"])
                     if not sr2.get("repaired_ok", True):
@@ -578,6 +623,7 @@ def compile_model(
             max_grad_norm=current_policy.max_grad_norm,
             save_best=True, pre_repair_metric=pre_final_ppl,
             teacher_model=teacher_model, distill_alpha=distill_alpha,
+            adapter=adapter,
         )
         total_repair_steps += int(fr["steps"])
         if fr.get("early_stopped"):
@@ -600,6 +646,17 @@ def compile_model(
 
     sculpt_num_params = sum(p.numel() for p in model.parameters())
     sculpt_weights_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+
+    # Free compilation artifacts before the full eval to avoid OOM on large models.
+    # Move model to CPU, wipe GPU, then bring it back. Without this, repair
+    # dicts and snapshot tensors keep ~50+ GiB pinned and the final eval OOMs
+    # on 12B+ models (A100-80GB).
+    del chunks
+    gc.collect()
+    if torch.cuda.is_available():
+        model.cpu()
+        torch.cuda.empty_cache()
+        model.to(device)
 
     # Final evaluation + benchmark (full token budget)
     metrics_post = _collect_metrics(model, tok, texts, device, policy.final_eval_max_tokens)
@@ -629,6 +686,7 @@ def compile_model(
     config = {
         "model_id": model_id,
         "keep_frac": keep_frac,
+        "keep_schedule": {str(k): v for k, v in keep_schedule.items()} if keep_schedule else None,
         "seed": seed,
         "deterministic": deterministic,
         "device": device,

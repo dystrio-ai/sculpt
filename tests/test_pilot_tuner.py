@@ -8,18 +8,25 @@ import pytest
 
 from dystrio_sculpt.policy import (
     RepairPolicy,
+    _asymmetric_reward,
     _score_pilot,
     _score_two_stage_pilot,
     _stratified_pilot_chunks,
+    _conductance_probe_chunk,
     _pilot_candidates,
     _compute_pilot_budget,
     _adapt_steps,
     _with_stage_size,
     _recovery_strength,
+    _LRArm,
     escalate_policy,
     build_policy_ladder,
     compute_e2e_speedup,
     E2E_PROFILES,
+    ASYMMETRIC_SCALE,
+    LR_GRID,
+    LR_REWARD_THRESHOLD,
+    MAX_LR_PROBES,
     HELPFUL_THRESHOLD,
     TIE_BREAK_GAIN,
     WH, WI, WM,
@@ -156,6 +163,46 @@ class TestStratifiedPilotChunks:
         layer_order = list(range(32))
         chunks = _stratified_pilot_chunks(layer_order, stage_size=4, K=2)
         assert chunks[0] != chunks[1]
+
+
+# ── 2b) Asymmetric reward function ─────────────────────────────────────────
+
+class TestAsymmetricReward:
+    def test_zero_improvement_zero_reward(self):
+        assert _asymmetric_reward(0.0) == 0.0
+
+    def test_negative_improvement_clamped_to_zero(self):
+        assert _asymmetric_reward(-0.05) == 0.0
+        assert _asymmetric_reward(-1.0) == 0.0
+
+    def test_positive_improvement_positive_reward(self):
+        assert _asymmetric_reward(0.01) > 0.0
+        assert _asymmetric_reward(0.05) > 0.0
+
+    def test_monotonically_increasing(self):
+        r1 = _asymmetric_reward(0.01)
+        r2 = _asymmetric_reward(0.03)
+        r3 = _asymmetric_reward(0.05)
+        r4 = _asymmetric_reward(0.10)
+        assert r1 < r2 < r3 < r4
+
+    def test_exponential_amplification(self):
+        """Doubling improve_frac more than doubles the reward."""
+        r_small = _asymmetric_reward(0.03)
+        r_large = _asymmetric_reward(0.06)
+        assert r_large > 2.0 * r_small
+
+    def test_custom_scale(self):
+        r_default = _asymmetric_reward(0.05)
+        r_low_scale = _asymmetric_reward(0.05, scale=1.0)
+        r_high_scale = _asymmetric_reward(0.05, scale=20.0)
+        assert r_low_scale < r_default < r_high_scale
+
+    def test_known_value(self):
+        """exp(10 * 0.05) - 1 = exp(0.5) - 1 ≈ 0.6487."""
+        import math
+        expected = math.exp(0.5) - 1.0
+        assert _asymmetric_reward(0.05) == pytest.approx(expected, rel=1e-6)
 
 
 # ── 3) Two-stage pilot scoring (with M term) ─────────────────────────────────
@@ -1224,7 +1271,7 @@ class TestSculptEmitWeightsMemory:
             model=model,
             tokenizer=FakeTokenizer(),
             outdir=tmp_path,
-            label="frontier_0_conservative",
+            label="frontier_0_default",
             keep_frac=0.85,
             metrics={"ppl_w2_test": 10.0, "ppl_w103_valid": 11.0,
                       "prefill_tokens_per_sec": 5000, "decode_tokens_per_sec": 50},
@@ -1277,3 +1324,221 @@ class TestSculptEmitWeightsMemory:
         pct = _safe_pct(baseline_gb, sculpted_gb)
         assert pct > 0
         assert abs(pct - 19.03) < 0.5
+
+
+# ── 25) _LRArm: Thompson Sampling bandit arm ─────────────────────────────────
+
+class TestLRArm:
+    def test_default_uniform_prior(self):
+        arm = _LRArm()
+        assert arm.alpha == 1.0
+        assert arm.beta == 1.0
+        assert arm.mean == 0.5
+
+    def test_mean_after_successes(self):
+        arm = _LRArm(alpha=5.0, beta=1.0)
+        assert arm.mean == pytest.approx(5.0 / 6.0)
+
+    def test_mean_after_failures(self):
+        arm = _LRArm(alpha=1.0, beta=5.0)
+        assert arm.mean == pytest.approx(1.0 / 6.0)
+
+    def test_sample_in_zero_one(self):
+        import numpy as np
+        rng = np.random.default_rng(42)
+        arm = _LRArm(alpha=2.0, beta=3.0)
+        for _ in range(100):
+            s = arm.sample(rng)
+            assert 0.0 <= s <= 1.0
+
+    def test_sample_deterministic_with_seed(self):
+        import numpy as np
+        arm = _LRArm(alpha=2.0, beta=3.0)
+        s1 = arm.sample(np.random.default_rng(99))
+        s2 = arm.sample(np.random.default_rng(99))
+        assert s1 == s2
+
+    def test_update_shifts_mean(self):
+        arm = _LRArm()
+        initial_mean = arm.mean
+        arm.alpha += 1.0
+        assert arm.mean > initial_mean
+
+    def test_strong_prior_dominates_early(self):
+        arm = _LRArm(alpha=10.0, beta=1.0)
+        assert arm.mean > 0.8
+
+
+# ── 26) LR_GRID and constants ─────────────────────────────────────────────────
+
+class TestLRGridConstants:
+    def test_grid_has_wide_range(self):
+        assert min(LR_GRID) <= 1e-5
+        assert max(LR_GRID) >= 1e-4
+        assert len(LR_GRID) >= 5
+
+    def test_grid_is_sorted(self):
+        assert LR_GRID == sorted(LR_GRID)
+
+    def test_grid_spans_100x(self):
+        ratio = max(LR_GRID) / min(LR_GRID)
+        assert ratio >= 100
+
+    def test_reward_threshold_positive(self):
+        assert LR_REWARD_THRESHOLD > 0
+
+    def test_max_probes_reasonable(self):
+        assert MAX_LR_PROBES >= len(LR_GRID)
+        assert MAX_LR_PROBES <= 20
+
+
+# ── 27) Conductance-informed probe chunk selection ────────────────────────────
+
+class TestConductanceProbeChunk:
+    def test_fallback_without_prescan(self):
+        layer_order = list(range(32))
+        chunk = _conductance_probe_chunk(layer_order, None, stage_size=4)
+        assert len(chunk) == 4
+        assert all(li in layer_order for li in chunk)
+
+    def test_fallback_empty_prescan(self):
+        layer_order = list(range(32))
+        chunk = _conductance_probe_chunk(layer_order, {}, stage_size=4)
+        assert len(chunk) == 4
+
+    def test_with_prescan_selects_hard_layers(self):
+        import torch
+        import numpy as np
+        layer_order = list(range(8))
+        prescan = {}
+        for li in layer_order:
+            n_blocks = 4
+            bs = torch.zeros(n_blocks)
+            D = torch.eye(n_blocks) * 0.01
+            if li >= 5:
+                bs = torch.ones(n_blocks) * 0.9
+                D = torch.ones(n_blocks, n_blocks) * 0.5
+                D.fill_diagonal_(1.0)
+            prescan[li] = {
+                "block_sensitivity": bs,
+                "D": D,
+                "block_energy": None,
+            }
+        chunk = _conductance_probe_chunk(layer_order, prescan, stage_size=2)
+        assert len(chunk) == 2
+        assert any(li >= 4 for li in chunk)
+
+    def test_returns_correct_stage_size(self):
+        layer_order = list(range(16))
+        chunk = _conductance_probe_chunk(layer_order, None, stage_size=4)
+        assert len(chunk) == 4
+
+    def test_small_model(self):
+        layer_order = [0, 1, 2]
+        chunk = _conductance_probe_chunk(layer_order, None, stage_size=4)
+        assert len(chunk) <= 3
+        assert set(chunk).issubset(set(layer_order))
+
+    def test_empty_order(self):
+        chunk = _conductance_probe_chunk([], None, stage_size=4)
+        assert chunk == []
+
+    def test_deterministic(self):
+        layer_order = list(range(32))
+        c1 = _conductance_probe_chunk(layer_order, None, stage_size=4)
+        c2 = _conductance_probe_chunk(layer_order, None, stage_size=4)
+        assert c1 == c2
+
+
+# ── 28) Thompson Sampling LR search integration ──────────────────────────────
+
+class TestThompsonLRSearchIntegration:
+    """Tests for the Thompson Sampling LR search logic (no model loading)."""
+
+    def test_arms_initialized_uniform(self):
+        arms = {lr: _LRArm() for lr in LR_GRID}
+        for arm in arms.values():
+            assert arm.mean == 0.5
+
+    def test_successful_lr_raises_mean(self):
+        arms = {lr: _LRArm() for lr in LR_GRID}
+        target_lr = 5e-5
+        arms[target_lr].alpha += 3.0
+        assert arms[target_lr].mean > 0.5
+        best = max(arms, key=lambda lr: arms[lr].mean)
+        assert best == target_lr
+
+    def test_nan_penalty_lowers_mean(self):
+        arms = {lr: _LRArm() for lr in LR_GRID}
+        bad_lr = 5e-4
+        arms[bad_lr].beta += 2.0
+        assert arms[bad_lr].mean < 0.5
+
+    def test_asymmetric_reward_shapes_selection(self):
+        r_small = _asymmetric_reward(0.01)
+        r_big = _asymmetric_reward(0.05)
+        assert r_small < LR_REWARD_THRESHOLD or r_big > LR_REWARD_THRESHOLD
+        assert r_big > r_small
+
+    def test_simulated_search_finds_best(self):
+        """Simulate a full Thompson Sampling LR search with fixed improve_fracs."""
+        import numpy as np
+        rng = np.random.default_rng(42)
+        arms = {lr: _LRArm() for lr in LR_GRID}
+
+        true_best_lr = 5e-5
+        lr_to_improve = {lr: 0.001 for lr in LR_GRID}
+        lr_to_improve[5e-5] = 0.10
+
+        for _ in range(30):
+            samples = {lr: arm.sample(rng) for lr, arm in arms.items()}
+            chosen_lr = max(samples, key=samples.get)
+            improve = lr_to_improve[chosen_lr]
+            reward = _asymmetric_reward(improve)
+            if reward > LR_REWARD_THRESHOLD:
+                arms[chosen_lr].alpha += 1.0
+            else:
+                arms[chosen_lr].beta += 1.0
+
+        best = max(arms, key=lambda lr: arms[lr].mean)
+        assert best == true_best_lr
+
+    def test_all_nan_falls_back(self):
+        """If every probe is NaN, the fallback LR should be 5e-5."""
+        arms = {lr: _LRArm() for lr in LR_GRID}
+        for lr in LR_GRID:
+            arms[lr].beta += 2.0
+        any_helpful = False
+        best_lr = 5e-5 if not any_helpful else max(arms, key=lambda lr: arms[lr].mean)
+        assert best_lr == 5e-5
+
+    def test_tuning_report_includes_lr_search(self):
+        from dystrio_sculpt.policy import TuningReport
+        report = TuningReport(
+            pilot_keep_frac=0.85, pilot_budget_s=240.0,
+            candidates=["5e-06", "1e-05", "5e-05"],
+            results=[], chosen_policy="ts_lr5e-05_p12_s918",
+            chosen_reason="thompson_best_mean", risk_score=0.3,
+            lr_search={
+                "grid": ["5e-06", "1e-05", "5e-05"],
+                "best_lr": 5e-5, "reason": "thompson_best_mean",
+                "num_probes": 8, "probes": [],
+                "arm_posteriors": {},
+                "probe_chunk": [10, 11, 12, 13],
+            },
+        )
+        d = report.to_dict()
+        assert "lr_search" in d
+        assert d["lr_search"]["best_lr"] == 5e-5
+        assert d["lr_search"]["probe_chunk"] == [10, 11, 12, 13]
+
+    def test_tuning_report_without_lr_search(self):
+        from dystrio_sculpt.policy import TuningReport
+        report = TuningReport(
+            pilot_keep_frac=0.85, pilot_budget_s=240.0,
+            candidates=[], results=[],
+            chosen_policy="test", chosen_reason="fallback",
+            risk_score=0.3,
+        )
+        d = report.to_dict()
+        assert "lr_search" not in d

@@ -76,7 +76,8 @@ def sanitize_model_id(model_id: str) -> str:
 def model_shortname(model_id: str) -> str:
     """Derive a display-friendly short name from a model id."""
     base = model_id.rsplit("/", 1)[-1].lower()
-    for tag in ("baseline", "conservative", "balanced", "aggressive"):
+    for tag in ("baseline", "default", "production", "throughput", "experimental", "frontier",
+                 "conservative", "balanced", "aggressive"):
         if tag in base:
             return tag
     parts = base.replace("-", "_").split("_")
@@ -95,6 +96,7 @@ def _load_model(model_id: str, device: str, dtype_str: str):
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_id, torch_dtype=dtype, device_map=device, trust_remote_code=True,
+        ignore_mismatched_sizes=True,
     )
     model.eval()
     if tokenizer.pad_token is None:

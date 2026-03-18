@@ -242,7 +242,7 @@ def push_results(sculpt_out: Path) -> None:
     try:
         src_root = Path(__file__).resolve().parent.parent / "src"
         sys.path.insert(0, str(src_root))
-        from dystrio_sculpt.dataset import append_local, push_to_hub, build_record
+        from dystrio_sculpt.efficiency_dataset import append_local, push_to_hub, build_record
 
         # Walk frontier directories and collect records
         for frontier_dir in sorted(sculpt_out.glob("frontier_*")):

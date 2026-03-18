@@ -1,7 +1,11 @@
-"""Frontier search: SLO-driven Safe Bracket Search (SBS) over uniform keep_frac.
+"""Frontier search: Thompson Sampling Search (TSS) over uniform keep_frac.
 
 Default objective: find the **fastest safe keep_frac** under a quality ceiling,
 then emit up to N named points around the safe optimum.
+
+Uses Thompson Sampling with Beta-conjugate posteriors (inspired by AB-MCTS,
+Sakana AI, arXiv:2503.04412) to adaptively interleave exploration of new
+keep_frac candidates with bisection refinement of the safe/unsafe bracket.
 
 Uses structural risk score from prescan artifacts to steer the initial bracket,
 repair policy selection, and stage ordering.
@@ -9,6 +13,7 @@ repair policy selection, and stage ordering.
 
 from __future__ import annotations
 
+import gc
 import logging
 import time
 from dataclasses import dataclass, field
@@ -22,13 +27,107 @@ from ._model import load_model_and_tokenizer, resolve_dtype
 from ._data import CalibConfig, load_text_sets
 from .engine import CompileResult, compile_model, _collect_metrics, setup_determinism, MAX_LEN
 from .policy import RepairPolicy, auto_select_policy
-from .risk import model_risk_score, risk_aware_keep_candidates, layer_compressibility_order
+from .risk import (
+    model_risk_score,
+    risk_aware_keep_candidates,
+    layer_compressibility_order,
+    risk_weighted_keep_schedule,
+    protected_layers,
+    DEFAULT_PROTECTION_THRESHOLD,
+)
 from .selectors import BLOCK_SIZE
 from .selectors.structural import prescan_structural_artifacts
 
 _log = logging.getLogger(__name__)
 
 DEFAULT_PPL_CEILING = 2.0
+
+
+# ── Thompson Sampling primitives ─────────────────────────────────────────────
+
+
+@dataclass
+class BetaArm:
+    """Conjugate Beta posterior for a Bernoulli bandit arm.
+
+    Jeffrey's prior (a=0.5, b=0.5) provides a minimally informative
+    starting point.  After observing a reward r in [0,1], the posterior
+    updates as a += r, b += (1 - r).
+
+    Inspired by AB-MCTS-A (Sakana AI, arXiv:2503.04412).
+    """
+
+    a: float = 0.5
+    b: float = 0.5
+
+    def sample(self, rng: Optional[np.random.RandomState] = None) -> float:
+        """Draw a single Thompson sample from the posterior."""
+        if rng is not None:
+            return float(rng.beta(self.a, self.b))
+        return float(np.random.beta(self.a, self.b))
+
+    def update(self, reward: float) -> None:
+        """Bayesian update with an observed reward in [0, 1]."""
+        self.a += reward
+        self.b += (1.0 - reward)
+
+    @property
+    def mean(self) -> float:
+        return self.a / (self.a + self.b)
+
+    @property
+    def n_obs(self) -> float:
+        """Effective number of observations (excludes prior mass)."""
+        return self.a + self.b - 1.0
+
+
+def _safety_reward(pt: "FrontierPoint", ceiling: float) -> float:
+    """Quality-weighted safety reward in [0, 1].
+
+    Maps ppl_ratio linearly: 1.0 at baseline quality (ratio=1.0),
+    0.0 at 1.5x the ceiling.  Failed points always return 0.
+    """
+    if pt.failed:
+        return 0.0
+    ratio = pt.ppl_ratio
+    if ratio <= 1.0:
+        return 1.0
+    upper = ceiling * 1.5
+    if ratio >= upper:
+        return 0.0
+    return max(0.0, 1.0 - (ratio - 1.0) / (upper - 1.0))
+
+
+# ── Speed profiles ────────────────────────────────────────────────────────────
+
+
+SPEED_PROFILES: Dict[str, Dict[str, float]] = {
+    "balanced": {"prefill_weight": 0.5, "decode_weight": 0.5},
+    "prefill_heavy": {"prefill_weight": 0.8, "decode_weight": 0.2},
+    "decode_heavy": {"prefill_weight": 0.2, "decode_weight": 0.8},
+    "rag": {"prefill_weight": 0.75, "decode_weight": 0.25},
+    "chatbot": {"prefill_weight": 0.25, "decode_weight": 0.75},
+    "throughput": {"prefill_weight": 0.6, "decode_weight": 0.4},
+    "latency": {"prefill_weight": 0.4, "decode_weight": 0.6},
+}
+
+
+def blended_speedup(
+    prefill_speedup: float,
+    decode_speedup: float,
+    prefill_weight: float = 0.5,
+    decode_weight: float = 0.5,
+) -> float:
+    """Compute workload-weighted speedup from prefill and decode components."""
+    total = prefill_weight + decode_weight
+    if total < 1e-9:
+        return prefill_speedup
+    pw = prefill_weight / total
+    dw = decode_weight / total
+    return pw * prefill_speedup + dw * decode_speedup
+
+
+# ── Data classes ─────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -49,13 +148,14 @@ class FrontierPoint:
     failed: bool = False
     failure_reason: str = ""
     risk_score: float = 0.0
+    blended_speedup: float = 0.0
 
 
 def _is_safe(pt: FrontierPoint, ceiling: float) -> bool:
     return not pt.failed and pt.ppl_ratio <= ceiling
 
 
-_ORDERED_TIER_NAMES = ["conservative", "balanced", "aggressive"]
+_ORDERED_TIER_NAMES = ["default", "production", "throughput", "experimental", "frontier"]
 
 
 def _assign_labels(
@@ -63,10 +163,10 @@ def _assign_labels(
 ) -> None:
     """Assign semantic labels by keep_frac order (descending).
 
-    Highest keep_frac = conservative, next = balanced, next = aggressive.
+    Highest keep_frac = default (free-lunch), next = production, etc.
     Points above the quality ceiling are excluded from named tiers and
     given generic ``point_N`` labels.  With only 1 point, it gets
-    "balanced" if safe, "conservative" otherwise.
+    "production" if safe, "default" otherwise.
     """
     if not selected:
         return
@@ -77,9 +177,9 @@ def _assign_labels(
     if len(selected) == 1:
         pt = selected[0]
         if ceiling and _is_safe(pt, ceiling):
-            pt.label = "frontier_0_balanced"
+            pt.label = "frontier_0_production"
         else:
-            pt.label = "frontier_0_conservative"
+            pt.label = "frontier_0_default"
         return
 
     # Separate safe (under ceiling) from unsafe points
@@ -101,16 +201,21 @@ def _assign_labels(
 
 
 class FrontierSearch:
-    """Safe Bracket Search (SBS) over uniform keep_frac in [0.4, 1.0].
+    """Thompson Sampling Search (TSS) over uniform keep_frac in [0.4, 1.0].
 
     Algorithm:
       1. Compute baseline and structural prescan.
       2. Derive model risk score from prescan artifacts.
       3. Choose initial keep candidates based on risk.
       4. Auto-select repair policy (risk-aware).
-      5. Evaluate candidates in descending order; track safe/unsafe bracket.
-      6. Bisect the bracket to find the fastest safe keep_frac.
-      7. Emit up to n_frontier named points under the quality ceiling.
+      5. Adaptively interleave candidate exploration and bracket bisection
+         using Thompson Sampling with Beta-conjugate posteriors.
+      6. Emit up to n_frontier named points under the quality ceiling.
+
+    The explore/exploit decision is governed by two Beta-Bernoulli arms:
+    one for exploring new keep_frac candidates, one for bisecting the
+    current safe/unsafe bracket.  Rewards are quality-weighted safety
+    scores, so the algorithm naturally converges on the boundary region.
     """
 
     def __init__(
@@ -135,9 +240,14 @@ class FrontierSearch:
         calib: Optional[CalibConfig] = None,
         distill: bool = False,
         distill_alpha: Optional[float] = None,
+        speed_profile: Optional[str] = None,
+        use_risk_schedule: bool = False,
+        protection_threshold: Optional[float] = None,
+        adapter=None,
     ):
         self.model_id = model_id
         self.n_frontier = n_frontier
+        self.adapter = adapter
         # Default quality ceiling
         if max_ppl_multiplier is None or max_ppl_multiplier <= 0:
             self.max_ppl_multiplier = DEFAULT_PPL_CEILING
@@ -161,6 +271,17 @@ class FrontierSearch:
         self.calib = calib
         self.distill = distill
         self.distill_alpha = distill_alpha
+
+        # Speed profile for workload-aware scoring
+        if speed_profile and speed_profile in SPEED_PROFILES:
+            self._speed_weights = SPEED_PROFILES[speed_profile]
+        else:
+            self._speed_weights = SPEED_PROFILES["balanced"]
+        self._speed_profile_name = speed_profile or "balanced"
+
+        # Per-layer keep_frac schedule options
+        self.use_risk_schedule = use_risk_schedule
+        self.protection_threshold = protection_threshold
 
         self.texts: Optional[Dict[str, List[str]]] = None
         self.prescan_cache: Optional[Dict[int, Dict[str, Any]]] = None
@@ -222,6 +343,7 @@ class FrontierSearch:
         self.prescan_cache = prescan_structural_artifacts(
             model, tok, list(range(num_layers)), self.texts["cal"],
             MAX_LEN, self.device, block_size=BLOCK_SIZE,
+            adapter=self.adapter,
         )
         _log.info("prescan cached %d layers", len(self.prescan_cache))
         del model, tok
@@ -272,14 +394,34 @@ class FrontierSearch:
         self._tuning_report = self.pilot_report
         _log.info("policy auto-selected: %s", self.policy.name)
 
+    def _build_keep_schedule(self, keep_frac: float) -> Optional[Dict[int, float]]:
+        """Build per-layer keep_frac schedule from risk scores if enabled."""
+        if not self.use_risk_schedule or not self.prescan_cache:
+            return None
+        threshold = self.protection_threshold or DEFAULT_PROTECTION_THRESHOLD
+        return risk_weighted_keep_schedule(
+            self.prescan_cache,
+            aggressiveness=1.0 - keep_frac,
+            protection_threshold=threshold,
+        )
+
+    def _blended(self, prefill_su: float, decode_su: float) -> float:
+        return blended_speedup(
+            prefill_su, decode_su,
+            self._speed_weights["prefill_weight"],
+            self._speed_weights["decode_weight"],
+        )
+
     def _evaluate(self, keep_frac: float) -> FrontierPoint:
         assert self.texts is not None
         assert self.baseline_metrics is not None
         assert self.policy is not None
 
+        schedule = self._build_keep_schedule(keep_frac)
+        mode = "risk_schedule" if schedule else "uniform"
         _log.info(
-            "[search] evaluating keep_frac=%.3f policy=%s",
-            keep_frac, self.policy.name,
+            "[search] evaluating keep_frac=%.3f policy=%s mode=%s profile=%s",
+            keep_frac, self.policy.name, mode, self._speed_profile_name,
         )
 
         failure_subdir = (self.outdir / f"_failed_kf{keep_frac:.3f}") if self.outdir else None
@@ -308,9 +450,14 @@ class FrontierSearch:
                 allow_escalation=not self._escalation_applied,
                 distill=self.distill,
                 distill_alpha_override=self.distill_alpha,
+                keep_schedule=schedule,
+                adapter=self.adapter,
             )
         except Exception as exc:
             _log.error("compile_model failed for kf=%.3f: %s", keep_frac, exc)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             point = FrontierPoint(
                 keep_frac=keep_frac, ppl_w103=float("inf"), ppl_w2=float("inf"),
                 prefill_tps=0.0, decode_tps=0.0, prefill_speedup=0.0,
@@ -336,6 +483,14 @@ class FrontierSearch:
                 self.policy.name, keep_frac,
             )
 
+        # Move model to CPU to free GPU for subsequent iterations.
+        # The model is still accessible for the emit step (saving to disk).
+        if result.model is not None:
+            result.model.cpu()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         m = result.metrics_post
         base = self.baseline_metrics
         prefill_speedup = m["prefill_tokens_per_sec"] / max(1e-9, base["prefill_tokens_per_sec"])
@@ -357,6 +512,7 @@ class FrontierSearch:
             failed=failed,
             failure_reason=result.failure["reason"] if result.failure else "",
             risk_score=self.risk_score,
+            blended_speedup=self._blended(prefill_speedup, decode_speedup),
         )
         self.evaluated.append(point)
 
@@ -374,7 +530,7 @@ class FrontierSearch:
         safe = self._safe_points()
         if not safe:
             return None
-        return max(safe, key=lambda p: p.prefill_speedup)
+        return max(safe, key=lambda p: p.blended_speedup)
 
     def _best_quality(self) -> Optional[FrontierPoint]:
         safe = self._safe_points()
@@ -386,7 +542,7 @@ class FrontierSearch:
         return min(safe, key=lambda p: p.ppl_ratio)
 
     def run(self) -> List[FrontierPoint]:
-        """Execute the Safe Bracket Search. Returns selected frontier points."""
+        """Execute Thompson Sampling Search. Returns selected frontier points."""
         self._setup()
         self._compute_baseline()
         self._compute_prescan()
@@ -401,31 +557,88 @@ class FrontierSearch:
         candidates.sort(reverse=True)
         _log.info("initial candidates (risk=%.3f): %s", self.risk_score, candidates)
 
-        # Phase 1: Evaluate candidates in descending order
+        rng = np.random.RandomState(self.seed) if self.deterministic else None
+
+        # Thompson Sampling state: two arms for explore vs exploit
+        explore_arm = BetaArm()
+        exploit_arm = BetaArm()
+        remaining = list(candidates)
         k_safe_best: Optional[float] = None
         k_unsafe: Optional[float] = None
+
         _over_ceiling_extras = 0
         _MAX_OVER_CEILING_EXTRAS = 1
         _MIN_PREFILL_DELTA_FOR_EXTRA = 0.005
         _prev_prefill_speedup: float = 0.0
+        min_resolution = 0.03
+        max_iterations = len(candidates) + 6
 
-        for kf in candidates:
+        for iteration in range(max_iterations):
             if self._time_exceeded():
-                _log.info("time budget reached during initial sweep")
+                _log.info("time budget reached at iteration %d", iteration)
                 break
-            pt = self._evaluate(kf)
 
-            if _is_safe(pt, ceiling):
-                if k_safe_best is None or pt.prefill_speedup > self._fastest_safe().prefill_speedup:
-                    k_safe_best = kf
+            # Determine available actions
+            can_explore = len(remaining) > 0
+            has_bracket = k_safe_best is not None and k_unsafe is not None
+            can_exploit = has_bracket and (k_safe_best - k_unsafe) >= min_resolution
+
+            if not can_explore and not can_exploit:
+                break
+
+            # Thompson Sampling: sample both arms, pick the winner
+            if not can_exploit:
+                action = "explore"
+            elif not can_explore:
+                action = "exploit"
             else:
-                if not pt.failed and pt.ppl_ratio <= reject_margin * 1.5:
+                e_sample = explore_arm.sample(rng)
+                x_sample = exploit_arm.sample(rng)
+                action = "explore" if e_sample >= x_sample else "exploit"
+
+            if action == "explore":
+                kf = remaining.pop(0)
+            else:
+                mid = round((k_safe_best + k_unsafe) / 2, 3)
+                if any(abs(p.keep_frac - mid) < 0.005 for p in self.evaluated):
+                    if remaining:
+                        action = "explore"
+                        kf = remaining.pop(0)
+                    else:
+                        break
+                else:
+                    kf = mid
+
+            pt = self._evaluate(kf)
+            reward = _safety_reward(pt, ceiling)
+
+            # Update bracket
+            if _is_safe(pt, ceiling):
+                if k_safe_best is None or kf < k_safe_best:
+                    k_safe_best = kf
+            elif not pt.failed:
+                if pt.ppl_ratio <= reject_margin * 1.5:
+                    if k_unsafe is None or kf > k_unsafe:
+                        k_unsafe = kf
+
+            # Update the arm that was used
+            if action == "explore":
+                explore_arm.update(reward)
+            else:
+                exploit_arm.update(reward)
+
+            # Early rejection (explore path only): prune remaining candidates
+            # that would be even more aggressive than a point already far over
+            # the ceiling.  Preserves the over-ceiling-extras heuristic.
+            if (
+                action == "explore"
+                and not pt.failed
+                and pt.ppl_ratio > reject_margin
+                and kf < 0.80
+            ):
+                if k_unsafe is None or kf > k_unsafe:
                     k_unsafe = kf
 
-            # Early reject: if ppl_ratio way above ceiling, don't go lower.
-            # Exception: continue if close to ceiling, repair is helpful, AND
-            # speed is improving.  Hard-capped at 1 extra candidate.
-            if not pt.failed and pt.ppl_ratio > reject_margin and kf < 0.80:
                 close_to_ceiling = pt.ppl_ratio <= ceiling * 1.10
                 helpful_count = 0
                 total_improve = 0.0
@@ -435,7 +648,9 @@ class FrontierSearch:
                             helpful_count += 1
                         total_improve += s.get("improve_frac", 0.0)
                 repair_shows_promise = helpful_count >= 1 or total_improve >= 0.005
-                speed_improving = pt.prefill_speedup >= _prev_prefill_speedup + _MIN_PREFILL_DELTA_FOR_EXTRA
+                speed_improving = (
+                    pt.prefill_speedup >= _prev_prefill_speedup + _MIN_PREFILL_DELTA_FOR_EXTRA
+                )
 
                 if (
                     close_to_ceiling
@@ -452,7 +667,6 @@ class FrontierSearch:
                         pt.prefill_speedup - _prev_prefill_speedup, kf,
                         _over_ceiling_extras, _MAX_OVER_CEILING_EXTRAS,
                     )
-                    k_unsafe = kf
                 else:
                     reason = "far_from_ceiling" if not close_to_ceiling else (
                         "no_helpful_repair" if not repair_shows_promise else (
@@ -460,37 +674,24 @@ class FrontierSearch:
                         )
                     )
                     _log.info(
-                        "[search] window: stop (reason=%s, ratio=%.3f, kf=%.3f)",
-                        reason, pt.ppl_ratio, kf,
+                        "[search] window: pruning remaining below kf=%.3f "
+                        "(reason=%s, ratio=%.3f)",
+                        kf, reason, pt.ppl_ratio,
                     )
-                    k_unsafe = kf
-                    break
+                    remaining = [r for r in remaining if r > kf]
 
             _prev_prefill_speedup = pt.prefill_speedup
 
-        # Phase 2: Bisect bracket [k_unsafe, k_safe_best] to refine boundary
-        min_resolution = 0.03
-        max_bisections = 6
+            _log.info(
+                "[search] iter=%d action=%s kf=%.3f reward=%.3f "
+                "arms=(explore=%.3f, exploit=%.3f) bracket=[%s, %s]",
+                iteration, action, kf, reward,
+                explore_arm.mean, exploit_arm.mean,
+                f"{k_unsafe:.3f}" if k_unsafe is not None else "?",
+                f"{k_safe_best:.3f}" if k_safe_best is not None else "?",
+            )
 
-        if k_safe_best is not None and k_unsafe is not None:
-            lo, hi = k_unsafe, k_safe_best
-            for _ in range(max_bisections):
-                if self._time_exceeded():
-                    _log.info("time budget reached during bisection")
-                    break
-                if hi - lo < min_resolution:
-                    break
-                mid = round((lo + hi) / 2, 3)
-                already = any(abs(p.keep_frac - mid) < 0.005 for p in self.evaluated)
-                if already:
-                    break
-                pt = self._evaluate(mid)
-                if _is_safe(pt, ceiling):
-                    hi = mid
-                else:
-                    lo = mid
-
-        # Phase 3: Select points to emit
+        # ── Selection phase ──────────────────────────────────────────────
         safe = self._safe_points()
         viable = [p for p in self.evaluated if not p.failed]
 
@@ -502,12 +703,13 @@ class FrontierSearch:
             )
             if viable:
                 best_viable = min(viable, key=lambda p: p.ppl_ratio)
-                best_viable.label = "frontier_0_conservative"
+                best_viable.label = "frontier_0_default"
                 return [best_viable]
             _log.error("no viable points at all")
             return []
 
-        # Build selection: best quality, fastest safe, then fill
+        # Build selection: best quality + fastest safe, then fill evenly
+        # across the keep_frac range so tiers cover a smooth quality gradient.
         best_q = self._best_quality()
         fastest_s = self._fastest_safe()
         selected_set: Dict[float, FrontierPoint] = {}
@@ -517,31 +719,36 @@ class FrontierSearch:
         if fastest_s is not None and fastest_s.keep_frac not in selected_set:
             selected_set[fastest_s.keep_frac] = fastest_s
 
-        # Fill remaining slots from safe points sorted by descending speedup
-        safe_by_speed = sorted(safe, key=lambda p: -p.prefill_speedup)
-        for pt in safe_by_speed:
-            if len(selected_set) >= self.n_frontier:
-                break
-            if pt.keep_frac not in selected_set:
-                selected_set[pt.keep_frac] = pt
+        # Fill remaining slots by spacing evenly across the keep_frac range
+        remaining_slots = self.n_frontier - len(selected_set)
+        candidates = sorted(
+            [p for p in safe if p.keep_frac not in selected_set],
+            key=lambda p: -p.keep_frac,
+        )
+        if remaining_slots > 0 and candidates:
+            step = max(1, len(candidates) // (remaining_slots + 1))
+            for i in range(step - 1, len(candidates), step):
+                if len(selected_set) >= self.n_frontier:
+                    break
+                selected_set[candidates[i].keep_frac] = candidates[i]
 
         selected = sorted(selected_set.values(), key=lambda p: -p.keep_frac)
 
-        # Apply target_prefill_speedup filter if set
+        # Apply target speedup filter (uses blended metric)
         if self.target_prefill_speedup is not None:
-            filtered = [p for p in selected if p.prefill_speedup >= self.target_prefill_speedup]
+            filtered = [p for p in selected if p.blended_speedup >= self.target_prefill_speedup]
             if filtered:
                 selected = filtered
 
         selected = selected[:self.n_frontier]
 
-        # Assign semantic labels (never label above-ceiling as "balanced")
+        # Assign semantic labels (never label above-ceiling as named tier)
         _assign_labels(selected, ceiling)
 
         _log.info(
-            "SBS complete: %d evaluated, %d safe, %d selected  "
-            "(risk=%.3f, ceiling=%.2fx)",
+            "TSS complete: %d evaluated, %d safe, %d selected  "
+            "(risk=%.3f, ceiling=%.2fx, explore_arm=%.3f, exploit_arm=%.3f)",
             len(self.evaluated), len(safe), len(selected),
-            self.risk_score, ceiling,
+            self.risk_score, ceiling, explore_arm.mean, exploit_arm.mean,
         )
         return selected
