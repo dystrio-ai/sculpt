@@ -56,10 +56,14 @@ def _find_layers(model: nn.Module) -> nn.ModuleList:
 
 
 def get_layers(model: nn.Module) -> nn.ModuleList:
-    """Return the decoder layer list (cached on the model instance)."""
-    if not hasattr(model, "_sculpt_layers"):
-        model._sculpt_layers = _find_layers(model)
-    return model._sculpt_layers
+    """Return the decoder layer list (cached on the model instance).
+
+    Uses object.__setattr__ to avoid nn.Module registering the cache
+    as a submodule, which causes tied-weight errors during model save.
+    """
+    if not hasattr(model, "_sculpt_layers_ref"):
+        object.__setattr__(model, "_sculpt_layers_ref", _find_layers(model))
+    return model._sculpt_layers_ref
 
 
 def get_mlp(model: nn.Module, layer_idx: int) -> Any:
