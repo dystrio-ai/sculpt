@@ -163,6 +163,70 @@ def _write_failure(outdir: Optional[Path], keep_frac: float, reason: str, detail
         json.dump(fail, f, indent=2)
 
 
+def _create_teacher(
+    student: torch.nn.Module,
+    model_id: str,
+    device: str,
+    dtype: torch.dtype,
+    distill_alpha: float,
+) -> Optional[torch.nn.Module]:
+    """Create a frozen teacher model for knowledge distillation.
+
+    First tries a memory-efficient 8-bit reload from HuggingFace (halves the
+    teacher's VRAM footprint).  Falls back to a full-precision deepcopy if
+    bitsandbytes is unavailable or loading fails.
+    """
+    _log.info("creating teacher model for distillation (alpha=%.2f)", distill_alpha)
+
+    # Estimate whether deepcopy would OOM.  Rough heuristic: if the student
+    # already uses > 50% of GPU memory, prefer the quantised teacher.
+    prefer_quantized = False
+    if torch.cuda.is_available():
+        allocated_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+        total_gb = torch.cuda.get_device_properties(0).total_mem / (1024 ** 3)
+        if allocated_gb > total_gb * 0.45:
+            prefer_quantized = True
+            _log.info(
+                "teacher: preferring 8-bit reload (%.1f/%.1f GB used)",
+                allocated_gb, total_gb,
+            )
+
+    if prefer_quantized:
+        try:
+            from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+            import bitsandbytes  # noqa: F401 — just verify it's importable
+
+            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+            _log.info("teacher: loading %s in 8-bit quantization", model_id)
+            teacher = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                quantization_config=bnb_config,
+                torch_dtype=dtype,
+                trust_remote_code=True,
+                device_map=device,
+            )
+            teacher.eval()
+            for p in teacher.parameters():
+                p.requires_grad = False
+            if torch.cuda.is_available():
+                t_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+                _log.info("teacher loaded (8-bit): %.1f GB total allocated", t_gb)
+            return teacher
+        except ImportError:
+            _log.warning(
+                "bitsandbytes not available — falling back to full-precision deepcopy"
+            )
+        except Exception as exc:
+            _log.warning("8-bit teacher load failed (%s) — falling back to deepcopy", exc)
+
+    _log.info("teacher: using full-precision deepcopy")
+    teacher = copy.deepcopy(student)
+    for p in teacher.parameters():
+        p.requires_grad = False
+    teacher.eval()
+    return teacher
+
+
 def compile_model(
     model_id: str,
     keep_frac: float,
@@ -254,11 +318,7 @@ def compile_model(
                 keep_frac, DISTILL_THRESHOLD,
             )
         if distill_alpha > 0.0:
-            _log.info("creating teacher model for distillation (alpha=%.2f)", distill_alpha)
-            teacher_model = copy.deepcopy(model)
-            for p in teacher_model.parameters():
-                p.requires_grad = False
-            teacher_model.eval()
+            teacher_model = _create_teacher(model, model_id, device, dtype, distill_alpha)
 
     original_ffn_dims: Dict[int, int] = {}
     for li in layers:
@@ -278,9 +338,15 @@ def compile_model(
             pilot_report=pilot_report,
         )
 
-    # Deterministic cheap-eval subsets
+    # Deterministic cheap-eval subsets.
+    # When a workload-specific eval set exists, use it for repair early stopping
+    # so the optimization signal matches the target distribution.
     cheap_w103 = deterministic_subset(texts["eval_w103"], policy.cheap_eval_texts, seed)
     cheap_w2 = deterministic_subset(texts["eval_w2"], policy.cheap_eval_texts, seed)
+    cheap_workload = (
+        deterministic_subset(texts["eval_workload"], policy.cheap_eval_texts, seed)
+        if "eval_workload" in texts else None
+    )
 
     # Staged compression with rollback support
     stage_size = policy.stage_size
@@ -297,12 +363,23 @@ def compile_model(
     _consec_fail_count = 0
 
     def _curve_fn(opt_step: int) -> Dict[str, float]:
-        return {
+        metrics: Dict[str, float] = {
             "ppl_w2_test": cheap_eval(model, tok, cheap_w2, device, current_policy.cheap_eval_max_tokens),
-            "ppl_w103_valid": cheap_eval(
-                model, tok, cheap_w103, device, current_policy.cheap_eval_max_tokens,
-            ),
         }
+        if cheap_workload is not None:
+            # Use workload-matched eval for repair early stopping.
+            # Report under ppl_w103_valid so existing early-stop logic triggers on it.
+            metrics["ppl_w103_valid"] = cheap_eval(
+                model, tok, cheap_workload, device, current_policy.cheap_eval_max_tokens,
+            )
+            metrics["ppl_w103_reference"] = cheap_eval(
+                model, tok, cheap_w103, device, current_policy.cheap_eval_max_tokens,
+            )
+        else:
+            metrics["ppl_w103_valid"] = cheap_eval(
+                model, tok, cheap_w103, device, current_policy.cheap_eval_max_tokens,
+            )
+        return metrics
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -333,7 +410,8 @@ def compile_model(
             }
         compressed_so_far.extend(chunk)
 
-        stage_ppl = cheap_eval(model, tok, cheap_w103, device, current_policy.cheap_eval_max_tokens)
+        _eval_texts = cheap_workload if cheap_workload is not None else cheap_w103
+        stage_ppl = cheap_eval(model, tok, _eval_texts, device, current_policy.cheap_eval_max_tokens)
         _log.info("stage %d post-compile ppl_w103=%.2f", si + 1, stage_ppl)
 
         if STAGE_GUARDRAIL > 0 and stage_ppl > STAGE_GUARDRAIL:
@@ -378,7 +456,7 @@ def compile_model(
             stage_nan_inf = sr.get("nan_inf_detected", False)
             stage_early_stop = sr.get("early_stop_triggered", False)
 
-            post_ppl = cheap_eval(model, tok, cheap_w103, device, current_policy.cheap_eval_max_tokens)
+            post_ppl = cheap_eval(model, tok, _eval_texts, device, current_policy.cheap_eval_max_tokens)
 
             if not sr.get("repaired_ok", True) or math.isnan(post_ppl) or math.isinf(post_ppl):
                 _log.warning(
@@ -486,7 +564,7 @@ def compile_model(
     if current_policy.steps > 0 and not guardrail_failed and compressed_so_far:
         final_steps = max(current_policy.steps, current_policy.steps * len(chunks) // 2)
         warmup_final = min(100, final_steps // 5)
-        pre_final_ppl = cheap_eval(model, tok, cheap_w103, device, policy.cheap_eval_max_tokens)
+        pre_final_ppl = cheap_eval(model, tok, _eval_texts, device, policy.cheap_eval_max_tokens)
         _log.info("final repair: %d steps on %d layers", final_steps, len(compressed_so_far))
         fr = repair_layers(
             model=model, tokenizer=tok, texts_train=texts["train"],

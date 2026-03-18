@@ -82,17 +82,23 @@ def sculpt(
         help="Override auto-selected repair policy (advanced). "
              "Format: ss<N>_lr<X>_p<Y> or policy index 0-3.",
     ),
-    calib_dataset: str = typer.Option(
-        "wikitext", "--calib-dataset",
-        help="HF dataset for calibration corpus.",
+    workload: Optional[str] = typer.Option(
+        None, "--workload",
+        help="Workload preset: code, chat, or general. "
+             "Sets calibration/repair corpus to match the target distribution. "
+             "Individual --calib-* flags override the preset.",
     ),
-    calib_config: str = typer.Option(
-        "wikitext-2-raw-v1", "--calib-config",
-        help="HF dataset config name.",
+    calib_dataset: Optional[str] = typer.Option(
+        None, "--calib-dataset",
+        help="HF dataset for calibration corpus (overrides --workload).",
     ),
-    calib_split: str = typer.Option(
-        "train", "--calib-split",
-        help="HF dataset split.",
+    calib_config: Optional[str] = typer.Option(
+        None, "--calib-config",
+        help="HF dataset config name (overrides --workload).",
+    ),
+    calib_split: Optional[str] = typer.Option(
+        None, "--calib-split",
+        help="HF dataset split (overrides --workload).",
     ),
     calib_num_samples: Optional[int] = typer.Option(
         None, "--calib-num-samples",
@@ -106,9 +112,9 @@ def sculpt(
         None, "--calib-seed",
         help="Seed for calibration sampling (default: same as --seed).",
     ),
-    calib_text_field: str = typer.Option(
-        "text", "--calib-text-field",
-        help="Name of the text column in the HF dataset.",
+    calib_text_field: Optional[str] = typer.Option(
+        None, "--calib-text-field",
+        help="Name of the text column in the HF dataset (overrides --workload).",
     ),
     distill: bool = typer.Option(
         False, "--distill",
@@ -117,6 +123,10 @@ def sculpt(
     distill_alpha: Optional[float] = typer.Option(
         None, "--distill-alpha",
         help="Force distillation alpha at all compression levels (bypasses adaptive threshold).",
+    ),
+    push_dataset: bool = typer.Option(
+        True, "--push-dataset/--no-push-dataset",
+        help="Push results to the Dystrio Efficiency Dataset on HuggingFace.",
     ),
 ) -> None:
     """Compile a model across a Pareto frontier of quality vs speed."""
@@ -168,17 +178,30 @@ def sculpt(
     from .search import FrontierSearch
     from .emit import emit_frontier_point, emit_run_metadata
     from .validate import validate_saved_model
-    from ._data import CalibConfig
+    from ._data import CalibConfig, calib_config_for_workload
+    from .dataset import record_from_frontier_point, push_record, append_local
 
-    calib_cfg = CalibConfig(
-        dataset=calib_dataset,
-        config=calib_config,
-        split=calib_split,
-        text_field=calib_text_field,
-        num_samples=calib_num_samples,
-        seq_len=calib_seq_len,
-        seed=calib_seed if calib_seed is not None else 0,
-    )
+    # Resolve workload preset, then layer on any explicit --calib-* overrides
+    if workload is not None:
+        calib_cfg = calib_config_for_workload(workload)
+        log.info("  workload:      %s", workload)
+    else:
+        calib_cfg = CalibConfig()
+
+    if calib_dataset is not None:
+        calib_cfg.dataset = calib_dataset
+    if calib_config is not None:
+        calib_cfg.config = calib_config
+    if calib_split is not None:
+        calib_cfg.split = calib_split
+    if calib_text_field is not None:
+        calib_cfg.text_field = calib_text_field
+    if calib_num_samples is not None:
+        calib_cfg.num_samples = calib_num_samples
+    if calib_seq_len is not None:
+        calib_cfg.seq_len = calib_seq_len
+    if calib_seed is not None:
+        calib_cfg.seed = calib_seed
 
     outpath = Path(outdir)
     outpath.mkdir(parents=True, exist_ok=True)
@@ -190,7 +213,7 @@ def sculpt(
         **calib_cfg.to_dict(),
     })
 
-    log.info("  calib:         %s / %s / %s", calib_dataset, calib_config, calib_split)
+    log.info("  calib:         %s / %s / %s", calib_cfg.dataset, calib_cfg.config, calib_cfg.split)
 
     search = FrontierSearch(
         model_id=model_id,
@@ -249,6 +272,19 @@ def sculpt(
         if not ok:
             log.error("validation FAILED for %s — model may be corrupt", pt.label)
             raise typer.Exit(code=2)
+
+        search_meta = {
+            "candidates": [p.keep_frac for p in search.evaluated],
+            "ceiling": search.max_ppl_multiplier,
+            "risk_score": search.risk_score,
+        }
+        ds_record = record_from_frontier_point(
+            pt, cr, search.baseline_metrics or {}, search_meta=search_meta,
+        )
+        if push_dataset:
+            push_record(ds_record)
+        else:
+            append_local(ds_record)
 
         del cr.model
         cr.model = None

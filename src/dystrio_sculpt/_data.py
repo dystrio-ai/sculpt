@@ -21,6 +21,40 @@ DEFAULT_EVAL_CONFIG = "wikitext-103-raw-v1"
 DEFAULT_EVAL_SPLIT = "validation"
 
 
+# Workload presets: map workload name -> CalibConfig kwargs.
+# Users can always override individual fields via --calib-* flags.
+WORKLOAD_PRESETS: Dict[str, Dict[str, str]] = {
+    "general": {
+        "dataset": DEFAULT_CALIB_DATASET,
+        "config": DEFAULT_CALIB_CONFIG,
+        "split": DEFAULT_CALIB_SPLIT,
+        "text_field": DEFAULT_CALIB_TEXT_FIELD,
+    },
+    "code": {
+        "dataset": "bigcode/the-stack-smol",
+        "config": "default",
+        "split": "train",
+        "text_field": "content",
+    },
+    "chat": {
+        "dataset": "tatsu-lab/alpaca",
+        "config": "default",
+        "split": "train",
+        "text_field": "text",
+    },
+}
+
+
+def calib_config_for_workload(workload: str) -> "CalibConfig":
+    """Return a CalibConfig for a named workload preset."""
+    if workload not in WORKLOAD_PRESETS:
+        raise ValueError(
+            f"Unknown workload {workload!r}. "
+            f"Available: {list(WORKLOAD_PRESETS.keys())}"
+        )
+    return CalibConfig(**WORKLOAD_PRESETS[workload])
+
+
 @dataclass
 class CalibConfig:
     """Calibration corpus configuration — fully describes where text comes from."""
@@ -102,6 +136,12 @@ def load_text_sets(
 
     When *calib* is None or uses default settings, this produces the same
     wikitext-based splits as the original hardcoded implementation.
+
+    When a non-default corpus is used, an additional ``eval_workload`` key
+    is returned containing held-out texts from the workload corpus.  The
+    engine uses this for repair early stopping so the optimization signal
+    matches the target distribution.  WikiText eval sets are always
+    included for cross-run comparability.
     """
     is_default = (
         calib is None
@@ -127,7 +167,6 @@ def load_text_sets(
     else:
         assert calib is not None
         corpus = load_calibration_corpus(calib, n_cal, n_train)
-        # Eval still comes from wikitext-103 for comparable PPL measurement
         w103_val = load_dataset(
             DEFAULT_EVAL_DATASET, DEFAULT_EVAL_CONFIG, split=DEFAULT_EVAL_SPLIT,
         )
@@ -141,11 +180,41 @@ def load_text_sets(
             "eval_w103": _collect_texts(w103_val, n_eval),
         }
 
-    _log.info(
-        "texts loaded: cal=%d train=%d eval_w2=%d eval_w103=%d",
-        len(result["cal"]), len(result["train"]),
-        len(result["eval_w2"]), len(result["eval_w103"]),
-    )
+        # Build held-out eval set from the workload corpus so repair
+        # optimizes for the right distribution, not WikiText.
+        try:
+            _log.info(
+                "loading workload eval split from %s / %s",
+                calib.dataset, calib.config,
+            )
+            eval_split = "validation" if calib.split == "train" else "test"
+            try:
+                eval_ds = load_dataset(calib.dataset, calib.config, split=eval_split)
+            except (ValueError, KeyError):
+                eval_ds = load_dataset(calib.dataset, calib.config, split=calib.split)
+            workload_eval = _collect_texts(eval_ds, n_eval, field=calib.text_field)
+            if len(workload_eval) >= 20:
+                result["eval_workload"] = workload_eval
+                _log.info("workload eval loaded: %d texts", len(workload_eval))
+            else:
+                _log.warning(
+                    "workload eval too small (%d texts), falling back to train holdout",
+                    len(workload_eval),
+                )
+                holdout = _deterministic_sample(corpus["train"], n_eval, calib.seed + 99)
+                result["eval_workload"] = holdout
+        except Exception as exc:
+            _log.warning("failed to load workload eval: %s — using train holdout", exc)
+            holdout = _deterministic_sample(corpus["train"], n_eval, calib.seed + 99)
+            result["eval_workload"] = holdout
+
+    parts = ["cal=%d", "train=%d", "eval_w2=%d", "eval_w103=%d"]
+    vals = [len(result["cal"]), len(result["train"]),
+            len(result["eval_w2"]), len(result["eval_w103"])]
+    if "eval_workload" in result:
+        parts.append("eval_workload=%d")
+        vals.append(len(result["eval_workload"]))
+    _log.info("texts loaded: " + " ".join(parts), *vals)
     return result
 
 

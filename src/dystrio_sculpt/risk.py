@@ -162,9 +162,13 @@ def layer_compressibility_order(
 
 
 def risk_aware_keep_candidates(risk: float) -> List[float]:
-    """Return initial keep_frac candidates adapted to structural risk."""
+    """Return initial keep_frac candidates adapted to structural risk.
+
+    Higher keep_frac values (0.95, 0.92) produce gentler compression
+    suitable for < 5% downstream degradation targets.
+    """
     if risk <= 0.35:
-        return [0.85, 0.78, 0.70, 0.62, 0.55]
+        return [0.95, 0.90, 0.85, 0.78, 0.70, 0.62, 0.55]
     if risk >= 0.65:
-        return [0.92, 0.88, 0.84, 0.80, 0.76, 0.72]
-    return [0.88, 0.82, 0.75, 0.70, 0.66, 0.62]
+        return [0.95, 0.92, 0.88, 0.84, 0.80, 0.76, 0.72]
+    return [0.95, 0.90, 0.88, 0.82, 0.75, 0.70, 0.66, 0.62]
