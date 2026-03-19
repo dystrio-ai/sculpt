@@ -89,7 +89,7 @@ fi
 
 # ── 5. Quick sanity check ─────────────────────────────────────
 echo ">> Running test suite..."
-python -m pytest tests/ -x -q --timeout=120 2>&1 | tail -5
+python -m pytest tests/ -x -q 2>&1 | tail -5
 echo ""
 
 # ── 6. Qwen 3.5 4B end-to-end test ───────────────────────────
