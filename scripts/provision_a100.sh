@@ -92,26 +92,26 @@ echo ">> Running test suite..."
 python -m pytest tests/ -x -q 2>&1 | tail -5
 echo ""
 
-# ── 6. Qwen 3.5 4B end-to-end test ───────────────────────────
+# ── 6. Qwen 3.5 9B sculpt run ────────────────────────────────
 #
-# Validates the full pipeline on a Qwen3.5 model (same DeltaNet
-# architecture as 27B). Small enough for fast iteration (~30-45 min)
-# but big enough for compression results to be meaningful.
+# 2.27M downloads, 108 quantized variants — popular local-inference
+# model. Fits A100 80GB with distillation. Threshold 0.85 to build
+# a full degradation curve across keep_frac values.
 #
 echo "============================================================"
-echo "  END-TO-END TEST: Qwen 3.5 4B"
+echo "  SCULPT: Qwen 3.5 9B (threshold=0.85 for full curve)"
 echo "  $(date)"
 echo "============================================================"
 
 dystrio sculpt \
-    --model-id Qwen/Qwen3.5-4B \
+    --model-id Qwen/Qwen3.5-9B \
     --workload general_v2 \
     --distill-alpha 0.5 \
-    --frontier 3 \
-    --downstream-threshold 0.95 \
-    --outdir sculpt_out_qwen35_4b \
+    --frontier 4 \
+    --downstream-threshold 0.85 \
+    --outdir sculpt_out_qwen35_9b \
     --push-dataset \
-    2>&1 | tee qwen35_4b_run.log
+    2>&1 | tee qwen35_9b_run.log
 
 TEST_EXIT=$?
 
@@ -119,23 +119,23 @@ echo ""
 echo "============================================================"
 echo "  RUN COMPLETE"
 echo "  $(date)"
-echo "  Qwen 3.5 4B:  exit=$TEST_EXIT"
+echo "  Qwen 3.5 9B:  exit=$TEST_EXIT"
 echo "============================================================"
 
 if [ $TEST_EXIT -eq 0 ]; then
     echo ""
     echo ">> Results pushed to dystrio/efficiency-dataset"
-    echo ">> Model artifacts in: sculpt_out_qwen35_4b/"
+    echo ">> Model artifacts in: sculpt_out_qwen35_9b/"
     echo ""
     echo "Next steps:"
     echo "  1. Run lm_eval on frontier points:"
-    echo "     lm_eval --model hf --model_args pretrained=sculpt_out_qwen35_4b/frontier_0_default/model \\"
+    echo "     lm_eval --model hf --model_args pretrained=sculpt_out_qwen35_9b/frontier_0_default/model \\"
     echo "       --tasks arc_challenge,hellaswag,mmlu,truthfulqa_mc2,winogrande,gsm8k \\"
     echo "       --batch_size auto --device cuda"
     echo ""
-    echo "  2. If results look good, run the 27B flagship on H200:"
+    echo "  2. Run the 27B flagship on H200:"
     echo "     bash scripts/run_qwen35_27b.sh"
 else
     echo ""
-    echo "!! TEST FAILED (exit=$TEST_EXIT). Check qwen35_4b_run.log"
+    echo "!! RUN FAILED (exit=$TEST_EXIT). Check qwen35_9b_run.log"
 fi
