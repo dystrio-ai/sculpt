@@ -92,68 +92,50 @@ echo ">> Running test suite..."
 python -m pytest tests/ -x -q --timeout=120 2>&1 | tail -5
 echo ""
 
-# ── 6. Gemma 2B test run (validation) ─────────────────────────
+# ── 6. Qwen 3.5 4B end-to-end test ───────────────────────────
+#
+# Validates the full pipeline on a Qwen3.5 model (same DeltaNet
+# architecture as 27B). Small enough for fast iteration (~30-45 min)
+# but big enough for compression results to be meaningful.
+#
 echo "============================================================"
-echo "  STAGE 1: Gemma 2B validation run"
+echo "  END-TO-END TEST: Qwen 3.5 4B"
 echo "  $(date)"
 echo "============================================================"
 
 dystrio sculpt \
-    --model-id google/gemma-2-2b-it \
+    --model-id Qwen/Qwen3.5-4B \
     --workload general_v2 \
     --distill-alpha 0.5 \
     --frontier 3 \
     --downstream-threshold 0.95 \
-    --outdir sculpt_out_gemma2b_test \
-    --no-push-dataset \
-    2>&1 | tee gemma2b_test.log
-
-GEMMA_EXIT=$?
-
-if [ $GEMMA_EXIT -ne 0 ]; then
-    echo ""
-    echo "!! Gemma 2B test FAILED (exit=$GEMMA_EXIT). Stopping."
-    echo "!! Check gemma2b_test.log for details."
-    exit 1
-fi
-
-echo ""
-echo ">> Gemma 2B test PASSED."
-echo ""
-
-# ── 7. Qwen 3.5 27B flagship run ─────────────────────────────
-echo "============================================================"
-echo "  STAGE 2: Qwen 3.5 27B flagship run"
-echo "  $(date)"
-echo "============================================================"
-
-dystrio sculpt \
-    --model-id Qwen/Qwen3.5-27B \
-    --workload general_v2 \
-    --distill-alpha 0.5 \
-    --frontier 4 \
-    --downstream-threshold 0.95 \
-    --outdir sculpt_out_qwen35_27b \
+    --outdir sculpt_out_qwen35_4b \
     --push-dataset \
-    2>&1 | tee qwen35_27b_run.log
+    2>&1 | tee qwen35_4b_run.log
 
-QWEN_EXIT=$?
+TEST_EXIT=$?
 
 echo ""
 echo "============================================================"
 echo "  RUN COMPLETE"
 echo "  $(date)"
-echo "  Gemma 2B:   exit=$GEMMA_EXIT"
-echo "  Qwen 3.5:   exit=$QWEN_EXIT"
+echo "  Qwen 3.5 4B:  exit=$TEST_EXIT"
 echo "============================================================"
 
-if [ $QWEN_EXIT -eq 0 ]; then
+if [ $TEST_EXIT -eq 0 ]; then
     echo ""
     echo ">> Results pushed to dystrio/efficiency-dataset"
-    echo ">> Model artifacts in: sculpt_out_qwen35_27b/"
+    echo ">> Model artifacts in: sculpt_out_qwen35_4b/"
     echo ""
-    echo "Next: run lm_eval on the frontier points:"
-    echo "  lm_eval --model hf --model_args pretrained=sculpt_out_qwen35_27b/frontier_0_default/model \\"
-    echo "    --tasks arc_challenge,hellaswag,mmlu,truthfulqa_mc2,winogrande,gsm8k \\"
-    echo "    --batch_size auto --device cuda"
+    echo "Next steps:"
+    echo "  1. Run lm_eval on frontier points:"
+    echo "     lm_eval --model hf --model_args pretrained=sculpt_out_qwen35_4b/frontier_0_default/model \\"
+    echo "       --tasks arc_challenge,hellaswag,mmlu,truthfulqa_mc2,winogrande,gsm8k \\"
+    echo "       --batch_size auto --device cuda"
+    echo ""
+    echo "  2. If results look good, run the 27B flagship on H200:"
+    echo "     bash scripts/run_qwen35_27b.sh"
+else
+    echo ""
+    echo "!! TEST FAILED (exit=$TEST_EXIT). Check qwen35_4b_run.log"
 fi
