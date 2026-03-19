@@ -121,9 +121,14 @@ echo ""
 
 # ── 7. Qwen 3.5 27B flagship run ─────────────────────────────
 echo "============================================================"
-echo "  STAGE 2: Qwen 3.5 27B flagship run"
+echo "  STAGE 2: Qwen 2.5 32B flagship run"
 echo "  $(date)"
 echo "============================================================"
+echo ""
+echo "  NOTE: Qwen3.5-27B uses Gated DeltaNet (non-standard arch)"
+echo "  and needs a dedicated adapter. Using Qwen2.5-32B-Instruct"
+echo "  which is fully supported (SwiGLU dense, qwen2 model_type)."
+echo ""
 
 dystrio sculpt \
     --model-id Qwen/Qwen2.5-32B-Instruct \
@@ -131,9 +136,9 @@ dystrio sculpt \
     --distill-alpha 0.5 \
     --frontier 4 \
     --downstream-threshold 0.95 \
-    --outdir sculpt_out_qwen27b \
+    --outdir sculpt_out_qwen32b \
     --push-dataset \
-    2>&1 | tee qwen27b_run.log
+    2>&1 | tee qwen32b_run.log
 
 QWEN_EXIT=$?
 
@@ -142,16 +147,16 @@ echo "============================================================"
 echo "  RUN COMPLETE"
 echo "  $(date)"
 echo "  Gemma 2B:  exit=$GEMMA_EXIT"
-echo "  Qwen 27B:  exit=$QWEN_EXIT"
+echo "  Qwen 32B:  exit=$QWEN_EXIT"
 echo "============================================================"
 
 if [ $QWEN_EXIT -eq 0 ]; then
     echo ""
     echo ">> Results pushed to dystrio/efficiency-dataset"
-    echo ">> Model artifacts in: sculpt_out_qwen27b/"
+    echo ">> Model artifacts in: sculpt_out_qwen32b/"
     echo ""
     echo "Next: run lm_eval on the frontier points:"
-    echo "  lm_eval --model hf --model_args pretrained=sculpt_out_qwen27b/frontier_0_default/model \\"
+    echo "  lm_eval --model hf --model_args pretrained=sculpt_out_qwen32b/frontier_0_default/model \\"
     echo "    --tasks arc_challenge,hellaswag,mmlu,truthfulqa_mc2,winogrande,gsm8k \\"
     echo "    --batch_size auto --device cuda"
 fi
