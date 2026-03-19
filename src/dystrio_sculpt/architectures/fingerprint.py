@@ -18,6 +18,8 @@ _KNOWN_ARCHITECTURES = {
     "llama":    ("llama",    MlpType.SWIGLU, True,  "silu"),
     "mistral":  ("mistral",  MlpType.SWIGLU, True,  "silu"),
     "qwen2":    ("qwen",     MlpType.SWIGLU, True,  "silu"),
+    "qwen3_5":  ("qwen",     MlpType.SWIGLU, True,  "silu"),
+    "qwen3_5_text": ("qwen", MlpType.SWIGLU, True,  "silu"),
     "phi3":     ("phi",      MlpType.SWIGLU, True,  "silu"),
     "phi":      ("phi",      MlpType.SWIGLU, True,  "silu"),
     "gemma":    ("gemma",    MlpType.SWIGLU, True,  "gelu_pytorch_tanh"),
@@ -42,12 +44,16 @@ _DENSE_SWIGLU_FAMILIES = {"llama", "mistral", "qwen", "phi", "gemma", "starcoder
 def _extract_num_params(config) -> Optional[int]:
     """Best-effort parameter count from config alone."""
     try:
-        h = config.hidden_size
-        L = config.num_hidden_layers
-        V = config.vocab_size
-        I = getattr(config, "intermediate_size", 4 * h)
-        # Rough: 2*V*h (embed+lm_head) + L*(4*h*h + 3*h*I) for SwiGLU
-        gated = getattr(config, "hidden_act", "") in ("silu", "swish")
+        cfg = config
+        if hasattr(config, "text_config") and config.text_config is not None:
+            tc = config.text_config
+            if getattr(tc, "hidden_size", 0) > 0:
+                cfg = tc
+        h = cfg.hidden_size
+        L = cfg.num_hidden_layers
+        V = cfg.vocab_size
+        I = getattr(cfg, "intermediate_size", 4 * h)
+        gated = getattr(cfg, "hidden_act", "") in ("silu", "swish")
         mlp_factor = 3 if gated else 2
         return 2 * V * h + L * (4 * h * h + mlp_factor * h * I)
     except Exception:
@@ -63,29 +69,83 @@ def fingerprint(model_id: str) -> ArchitectureDescriptor:
     from transformers import AutoConfig
 
     _log.info("fingerprinting %s", model_id)
-    config = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
+    config = None
+    config_dict: Optional[dict] = None
 
-    model_type = getattr(config, "model_type", None) or ""
-    config_class = type(config).__name__
+    try:
+        config = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
+    except (ValueError, KeyError):
+        try:
+            config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        except (ValueError, KeyError, OSError):
+            pass
 
-    hidden_size = getattr(config, "hidden_size", 0)
-    num_layers = getattr(config, "num_hidden_layers", 0)
-    intermediate_size = getattr(config, "intermediate_size", 0)
-    num_attention_heads = getattr(config, "num_attention_heads", 0)
-    num_kv_heads = getattr(config, "num_key_value_heads", None)
-    vocab_size = getattr(config, "vocab_size", 0)
-    activation = getattr(config, "hidden_act", "unknown")
-    tie_embeddings = getattr(config, "tie_word_embeddings", False)
+    if config is None:
+        # AutoConfig can't handle this model_type (newer than installed
+        # transformers). Fall back to reading config.json as raw JSON.
+        _log.info("AutoConfig failed — falling back to raw config.json")
+        import json
+        from huggingface_hub import hf_hub_download
+        cfg_path = hf_hub_download(model_id, "config.json")
+        with open(cfg_path) as f:
+            config_dict = json.load(f)
 
-    context_length = (
-        getattr(config, "max_position_embeddings", None)
-        or getattr(config, "max_sequence_length", None)
-        or getattr(config, "n_positions", None)
-    )
+    if config_dict is not None:
+        # Raw dict path: extract fields manually, supporting nested text_config
+        tc = config_dict.get("text_config", config_dict)
+        if tc.get("hidden_size", 0) > 0:
+            text_d = tc
+        else:
+            text_d = config_dict
+        model_type = text_d.get("model_type") or config_dict.get("model_type", "")
+        config_class = "raw_json"
+        hidden_size = text_d.get("hidden_size", 0)
+        num_layers = text_d.get("num_hidden_layers", 0)
+        intermediate_size = text_d.get("intermediate_size", 0)
+        num_attention_heads = text_d.get("num_attention_heads", 0)
+        num_kv_heads = text_d.get("num_key_value_heads")
+        vocab_size = text_d.get("vocab_size", 0)
+        activation = text_d.get("hidden_act", "unknown")
+        tie_embeddings = config_dict.get("tie_word_embeddings", False)
+        context_length = (
+            text_d.get("max_position_embeddings")
+            or text_d.get("max_sequence_length")
+        )
+        num_experts = text_d.get("num_local_experts") or text_d.get("num_experts")
+        num_experts_per_tok = text_d.get("num_experts_per_tok")
+    else:
+        model_type = getattr(config, "model_type", None) or ""
+        config_class = type(config).__name__
 
-    # MoE detection
-    num_experts = getattr(config, "num_local_experts", None) or getattr(config, "num_experts", None)
-    num_experts_per_tok = getattr(config, "num_experts_per_tok", None)
+        # Multimodal models (e.g. Qwen3.5) nest text attributes inside text_config.
+        text_cfg = config
+        if hasattr(config, "text_config") and config.text_config is not None:
+            tc = config.text_config
+            if getattr(tc, "hidden_size", 0) > 0:
+                text_cfg = tc
+                tc_model_type = getattr(tc, "model_type", None)
+                if tc_model_type:
+                    model_type = tc_model_type
+                _log.info("using nested text_config (model_type=%s)", model_type)
+
+        hidden_size = getattr(text_cfg, "hidden_size", 0)
+        num_layers = getattr(text_cfg, "num_hidden_layers", 0)
+        intermediate_size = getattr(text_cfg, "intermediate_size", 0)
+        num_attention_heads = getattr(text_cfg, "num_attention_heads", 0)
+        num_kv_heads = getattr(text_cfg, "num_key_value_heads", None)
+        vocab_size = getattr(text_cfg, "vocab_size", 0)
+        activation = getattr(text_cfg, "hidden_act", "unknown")
+        tie_embeddings = getattr(config, "tie_word_embeddings", False)
+
+    if config is not None:
+        context_length = (
+            getattr(config, "max_position_embeddings", None)
+            or getattr(config, "max_sequence_length", None)
+            or getattr(config, "n_positions", None)
+        )
+        num_experts = getattr(config, "num_local_experts", None) or getattr(config, "num_experts", None)
+        num_experts_per_tok = getattr(config, "num_experts_per_tok", None)
+
     is_moe = num_experts is not None and num_experts > 1
 
     # Lookup known architecture
