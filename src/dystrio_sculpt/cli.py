@@ -336,6 +336,37 @@ def sculpt(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    # Record ALL evaluated points (including UNSAFE) to the efficiency dataset
+    # so we build a full degradation curve, not just the safe frontier.
+    selected_kfs = {pt.keep_frac for pt in selected}
+    search_meta_all = {
+        "candidates": [p.keep_frac for p in search.evaluated],
+        "ceiling": search.max_ppl_multiplier,
+        "risk_score": search.risk_score,
+    }
+    n_extra = 0
+    for pt in search.evaluated:
+        if pt.keep_frac in selected_kfs or pt.failed:
+            continue
+        cr = pt.compile_result
+        if cr is None:
+            continue
+        ds_record = record_from_frontier_point(
+            pt, cr, search.baseline_metrics or {},
+            search_meta=search_meta_all,
+            workload=mixture_wl or workload,
+            baseline_downstream_accuracy=search._baseline_downstream,
+        )
+        ds_record["notes"] = f"UNSAFE (below threshold) — collected for degradation curve"
+        if push_dataset:
+            push_record(ds_record)
+        else:
+            append_local(ds_record)
+        n_extra += 1
+
+    if n_extra:
+        log.info("recorded %d additional UNSAFE points for degradation curve", n_extra)
+
     log.info("=" * 80)
     log.info(
         "Sculpt complete: %d points emitted to %s  (risk=%.3f, ceiling=%.2fx)",
