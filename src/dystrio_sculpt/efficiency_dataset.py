@@ -106,13 +106,21 @@ def build_record(
     steady_state_alloc_gb: Optional[float] = None,
     compile_time_s: Optional[float] = None,
     risk_score: Optional[float] = None,
-    # Downstream benchmarks (lm-eval)
+    # Downstream benchmarks (lm-eval, populated by post-sculpt eval or auto-push)
     arc_challenge_acc_norm: Optional[float] = None,
     hellaswag_acc_norm: Optional[float] = None,
     mmlu_acc: Optional[float] = None,
     truthfulqa_mc2_acc: Optional[float] = None,
+    winogrande_acc: Optional[float] = None,
+    gsm8k_acc: Optional[float] = None,
     eval_engine: Optional[str] = None,
     eval_date: Optional[str] = None,
+    # Downstream probe (cheap in-search SLO, ~250 questions, MMLU weighted 2x)
+    downstream_probe_accuracy: Optional[float] = None,
+    downstream_probe_mmlu: Optional[float] = None,
+    downstream_probe_hellaswag: Optional[float] = None,
+    downstream_probe_arc: Optional[float] = None,
+    baseline_downstream_probe_accuracy: Optional[float] = None,
 
     # 5. Decision trace
     search_candidates: Optional[List[float]] = None,
@@ -127,6 +135,8 @@ def build_record(
     record_type: str = "sculpt_run",
     run_id: Optional[str] = None,
     timestamp: Optional[str] = None,
+    notes: Optional[str] = None,
+    workload: Optional[str] = None,
     **extra: Any,
 ) -> Dict[str, Any]:
     """Build a single canonical dataset record.
@@ -211,8 +221,15 @@ def build_record(
         "hellaswag_acc_norm": hellaswag_acc_norm,
         "mmlu_acc": mmlu_acc,
         "truthfulqa_mc2_acc": truthfulqa_mc2_acc,
+        "winogrande_acc": winogrande_acc,
+        "gsm8k_acc": gsm8k_acc,
         "eval_engine": eval_engine,
         "eval_date": eval_date,
+        "downstream_probe_accuracy": downstream_probe_accuracy,
+        "downstream_probe_mmlu": downstream_probe_mmlu,
+        "downstream_probe_hellaswag": downstream_probe_hellaswag,
+        "downstream_probe_arc": downstream_probe_arc,
+        "baseline_downstream_probe_accuracy": baseline_downstream_probe_accuracy,
 
         "search_candidates": search_candidates,
         "search_ceiling": search_ceiling,
@@ -221,6 +238,8 @@ def build_record(
         "guardrail_failed": guardrail_failed,
         "failure_reason": failure_reason,
         "pilot_report": pilot_report,
+        "notes": notes,
+        "workload": workload,
     }
 
     if extra:
@@ -234,10 +253,13 @@ def record_from_frontier_point(
     compile_result,
     baseline_metrics: Dict[str, float],
     search_meta: Optional[Dict[str, Any]] = None,
+    workload: Optional[str] = None,
+    baseline_downstream_accuracy: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Build a dataset record from a FrontierSearch result.
 
     Called automatically by the emit pipeline after each frontier point.
+    Captures downstream probe scores from the FrontierPoint when available.
     """
     import torch
     from . import __version__
@@ -327,6 +349,22 @@ def record_from_frontier_point(
         compile_time_s=cr.wall_time_s if cr else None,
         risk_score=frontier_point.risk_score,
 
+        # Downstream probe scores (from in-search SLO, MMLU weighted 2x)
+        downstream_probe_accuracy=frontier_point.downstream_score,
+        downstream_probe_mmlu=(
+            frontier_point.downstream_detail.get("mmlu_accuracy")
+            if frontier_point.downstream_detail else None
+        ),
+        downstream_probe_hellaswag=(
+            frontier_point.downstream_detail.get("hellaswag_accuracy")
+            if frontier_point.downstream_detail else None
+        ),
+        downstream_probe_arc=(
+            frontier_point.downstream_detail.get("arc_accuracy")
+            if frontier_point.downstream_detail else None
+        ),
+        baseline_downstream_probe_accuracy=baseline_downstream_accuracy,
+
         search_candidates=search_meta.get("candidates") if search_meta else None,
         search_ceiling=search_meta.get("ceiling") if search_meta else None,
         search_risk_score=search_meta.get("risk_score") if search_meta else None,
@@ -334,6 +372,7 @@ def record_from_frontier_point(
         guardrail_failed=cr.guardrail_failed if cr else False,
         failure_reason=cr.failure.get("reason") if cr and cr.failure else None,
         pilot_report=cr.pilot_report if cr else None,
+        workload=workload,
     )
 
 
@@ -371,27 +410,53 @@ def push_to_hub(
     private: bool = True,
     token: Optional[str] = None,
 ) -> str:
-    """Push records to HuggingFace as a dataset.
+    """Push records to HuggingFace as a dataset, merging with existing data.
 
-    If *records* is None, loads from the local cache.
+    If *records* is None, loads from the local cache.  Pulls existing records
+    from HF first and deduplicates by (model_id, tier, keep_frac, timestamp)
+    to avoid losing data when pushing from a fresh machine.
+
     Returns the dataset URL.
     """
-    from datasets import Dataset, DatasetDict
+    from datasets import Dataset, DatasetDict, load_dataset as hf_load
 
     if records is None:
         records = load_local()
 
-    if not records:
-        raise ValueError("No records to push")
-
     token = token or os.environ.get("HF_TOKEN")
 
-    ds = Dataset.from_list(records)
+    # Pull existing records from HF and merge to prevent data loss
+    existing: List[Dict[str, Any]] = []
+    try:
+        remote_ds = hf_load(repo_id, split="optimization_runs", token=token)
+        existing = [dict(r) for r in remote_ds]
+        _log.info("pulled %d existing records from HF", len(existing))
+    except Exception as exc:
+        _log.info("no existing HF dataset (first push or repo missing): %s", exc)
+
+    # Deduplicate: build a key set from existing records
+    def _dedup_key(r: Dict) -> str:
+        return f"{r.get('model_id', '')}|{r.get('tier', '')}|{r.get('keep_frac', '')}|{r.get('timestamp', '')}"
+
+    seen = {_dedup_key(r) for r in existing}
+    merged = list(existing)
+    new_count = 0
+    for r in records:
+        key = _dedup_key(r)
+        if key not in seen:
+            merged.append(r)
+            seen.add(key)
+            new_count += 1
+
+    if not merged:
+        raise ValueError("No records to push")
+
+    ds = Dataset.from_list(merged)
     ds_dict = DatasetDict({"optimization_runs": ds})
     ds_dict.push_to_hub(repo_id, private=private, token=token)
 
     url = f"https://huggingface.co/datasets/{repo_id}"
-    _log.info("pushed %d records to %s", len(records), url)
+    _log.info("pushed %d records (%d new) to %s", len(merged), new_count, url)
     return url
 
 

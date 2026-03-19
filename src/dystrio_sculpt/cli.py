@@ -147,6 +147,11 @@ def sculpt(
         help="Risk score above which layers skip compression entirely. "
              "[default: 0.70]",
     ),
+    downstream_threshold: Optional[float] = typer.Option(
+        None, "--downstream-threshold",
+        help="Downstream accuracy retention required for 'safe' classification. "
+             "E.g. 0.95 means keep >= 95%% of baseline accuracy. [default: 0.95]",
+    ),
 ) -> None:
     """Compile a model across a Pareto frontier of quality vs speed."""
     log = logging.getLogger("dystrio.sculpt")
@@ -179,6 +184,8 @@ def sculpt(
         log.info("  risk_schedule: enabled")
     if protection_threshold is not None:
         log.info("  protection:    %.2f", protection_threshold)
+    if downstream_threshold is not None:
+        log.info("  downstream_th: %.2f", downstream_threshold)
 
     # Resolve optional policy override
     policy_override = None
@@ -203,13 +210,18 @@ def sculpt(
     from .search import FrontierSearch
     from .emit import emit_frontier_point, emit_run_metadata
     from .validate import validate_saved_model
-    from ._data import CalibConfig, calib_config_for_workload
+    from ._data import CalibConfig, calib_config_for_workload, is_mixture_workload
     from .efficiency_dataset import record_from_frontier_point, push_record, append_local
 
     # Resolve workload preset, then layer on any explicit --calib-* overrides
+    mixture_wl: Optional[str] = None
     if workload is not None:
+        if is_mixture_workload(workload):
+            mixture_wl = workload
+            log.info("  workload:      %s (mixture)", workload)
+        else:
+            log.info("  workload:      %s", workload)
         calib_cfg = calib_config_for_workload(workload)
-        log.info("  workload:      %s", workload)
     else:
         calib_cfg = CalibConfig()
 
@@ -257,6 +269,8 @@ def sculpt(
         speed_profile=speed_profile,
         use_risk_schedule=use_risk_schedule,
         protection_threshold=protection_threshold,
+        downstream_threshold=downstream_threshold,
+        mixture_workload=mixture_wl,
     )
 
     selected = search.run()
@@ -307,7 +321,10 @@ def sculpt(
             "risk_score": search.risk_score,
         }
         ds_record = record_from_frontier_point(
-            pt, cr, search.baseline_metrics or {}, search_meta=search_meta,
+            pt, cr, search.baseline_metrics or {},
+            search_meta=search_meta,
+            workload=mixture_wl or workload,
+            baseline_downstream_accuracy=search._baseline_downstream,
         )
         if push_dataset:
             push_record(ds_record)

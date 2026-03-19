@@ -58,7 +58,7 @@ MAX_PARAMS_B = 15  # skip models > 15B params (single-GPU constraint)
 MIN_DOWNLOADS_WEEK = 500
 
 # lm-eval tasks for downstream evaluation
-EVAL_TASKS = "arc_challenge,hellaswag,mmlu,truthfulqa_mc2"
+EVAL_TASKS = "arc_challenge,hellaswag,mmlu,truthfulqa_mc2,winogrande,gsm8k"
 
 # ---------------------------------------------------------------------------
 # Model discovery

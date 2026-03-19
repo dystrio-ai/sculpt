@@ -32,7 +32,7 @@ MODELS=(
 
 WORKLOADS=("general" "code" "chat")
 
-EVAL_TASKS="arc_challenge,hellaswag,mmlu,truthfulqa_mc2"
+EVAL_TASKS="arc_challenge,hellaswag,mmlu,truthfulqa_mc2,winogrande,gsm8k"
 
 echo "$(date) === WORKLOAD A/B TEST START ===" | tee -a "$LOG"
 

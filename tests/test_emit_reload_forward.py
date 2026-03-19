@@ -75,6 +75,7 @@ class TinyCompressedCausalLM(TinyCausalLM):
         mlp.up_proj = nn.Linear(dim, compressed_ffn, bias=False)
         mlp.down_proj = nn.Linear(compressed_ffn, dim, bias=False)
         self.config.intermediate_size = dim * 2  # stale — original width
+        self.config.text_config = None  # no nested config; prevents MagicMock auto-creation
 
 
 class TestEmitArtifacts:

@@ -24,8 +24,11 @@ import numpy as np
 import torch
 
 from ._model import load_model_and_tokenizer, resolve_dtype
-from ._data import CalibConfig, load_text_sets
+from ._data import CalibConfig, load_text_sets, is_mixture_workload
 from .engine import CompileResult, compile_model, _collect_metrics, setup_determinism, MAX_LEN
+from ._downstream_eval import (
+    DownstreamProbe, load_downstream_probe, eval_downstream_accuracy,
+)
 from .policy import RepairPolicy, auto_select_policy
 from .risk import (
     model_risk_score,
@@ -41,6 +44,7 @@ from .selectors.structural import prescan_structural_artifacts
 _log = logging.getLogger(__name__)
 
 DEFAULT_PPL_CEILING = 2.0
+DEFAULT_DOWNSTREAM_THRESHOLD = 0.95  # safe = retains >= 95% of baseline accuracy
 
 
 # ── Thompson Sampling primitives ─────────────────────────────────────────────
@@ -84,11 +88,14 @@ class BetaArm:
 def _safety_reward(pt: "FrontierPoint", ceiling: float) -> float:
     """Quality-weighted safety reward in [0, 1].
 
-    Maps ppl_ratio linearly: 1.0 at baseline quality (ratio=1.0),
-    0.0 at 1.5x the ceiling.  Failed points always return 0.
+    When downstream_score is available (from the mini-benchmark probe),
+    uses it directly: reward = downstream_score (which is already in [0,1]).
+    Falls back to PPL-based reward when no downstream score exists.
     """
     if pt.failed:
         return 0.0
+    if pt.downstream_score is not None:
+        return pt.downstream_score
     ratio = pt.ppl_ratio
     if ratio <= 1.0:
         return 1.0
@@ -149,10 +156,27 @@ class FrontierPoint:
     failure_reason: str = ""
     risk_score: float = 0.0
     blended_speedup: float = 0.0
+    downstream_score: Optional[float] = None
+    downstream_detail: Optional[Dict[str, float]] = None
 
 
-def _is_safe(pt: FrontierPoint, ceiling: float) -> bool:
-    return not pt.failed and pt.ppl_ratio <= ceiling
+def _is_safe(
+    pt: FrontierPoint,
+    ceiling: float,
+    baseline_downstream: Optional[float] = None,
+    downstream_threshold: float = DEFAULT_DOWNSTREAM_THRESHOLD,
+) -> bool:
+    """A point is safe if it retains sufficient quality.
+
+    When downstream accuracy is available, uses it as primary signal:
+    safe = accuracy >= baseline_accuracy * threshold.
+    Falls back to PPL ceiling when no downstream score exists.
+    """
+    if pt.failed:
+        return False
+    if pt.downstream_score is not None and baseline_downstream is not None:
+        return pt.downstream_score >= baseline_downstream * downstream_threshold
+    return pt.ppl_ratio <= ceiling
 
 
 _ORDERED_TIER_NAMES = ["default", "production", "throughput", "experimental", "frontier"]
@@ -244,11 +268,13 @@ class FrontierSearch:
         use_risk_schedule: bool = False,
         protection_threshold: Optional[float] = None,
         adapter=None,
+        downstream_threshold: Optional[float] = None,
+        mixture_workload: Optional[str] = None,
     ):
         self.model_id = model_id
         self.n_frontier = n_frontier
         self.adapter = adapter
-        # Default quality ceiling
+        # Default quality ceiling (PPL fallback)
         if max_ppl_multiplier is None or max_ppl_multiplier <= 0:
             self.max_ppl_multiplier = DEFAULT_PPL_CEILING
             self._ceiling_is_default = True
@@ -271,6 +297,10 @@ class FrontierSearch:
         self.calib = calib
         self.distill = distill
         self.distill_alpha = distill_alpha
+        self.mixture_workload = mixture_workload
+
+        # Downstream SLO threshold (e.g. 0.95 = keep >=95% of baseline accuracy)
+        self.downstream_threshold = downstream_threshold or DEFAULT_DOWNSTREAM_THRESHOLD
 
         # Speed profile for workload-aware scoring
         if speed_profile and speed_profile in SPEED_PROFILES:
@@ -295,6 +325,8 @@ class FrontierSearch:
         self._start_time: float = 0.0
         self._escalation_applied: bool = False
         self._tuning_report: Optional[Dict[str, Any]] = None
+        self._downstream_probe: Optional[DownstreamProbe] = None
+        self._baseline_downstream: Optional[float] = None
 
     def _time_exceeded(self) -> bool:
         if self.max_compile_hours is None:
@@ -307,8 +339,14 @@ class FrontierSearch:
         setup_determinism(self.seed, self.deterministic)
         _log.info("loading datasets")
         self.texts = load_text_sets(
-            self.n_texts_cal, self.n_texts_train, self.n_texts_eval, calib=self.calib,
+            self.n_texts_cal, self.n_texts_train, self.n_texts_eval,
+            calib=self.calib, mixture_workload=self.mixture_workload,
         )
+        try:
+            self._downstream_probe = load_downstream_probe(seed=self.seed)
+        except Exception as exc:
+            _log.warning("downstream probe load failed: %s — using PPL fallback", exc)
+            self._downstream_probe = DownstreamProbe(questions=[])
 
     def _compute_baseline(self) -> None:
         _log.info("computing baseline (no compression)")
@@ -321,6 +359,22 @@ class FrontierSearch:
         )
         if torch.cuda.is_available():
             self.baseline_metrics["cuda_allocated_baseline_bytes"] = torch.cuda.memory_allocated()
+
+        # Run downstream probe on the uncompressed model to establish baseline
+        if self._downstream_probe and self._downstream_probe.questions:
+            _log.info("running downstream probe on baseline model (%d questions)",
+                       len(self._downstream_probe.questions))
+            bl_result = eval_downstream_accuracy(model, tok, self._downstream_probe, self.device)
+            self._baseline_downstream = bl_result["accuracy"]
+            self._downstream_probe.baseline_accuracy = bl_result["accuracy"]
+            _log.info(
+                "baseline downstream: accuracy=%.4f (MMLU=%.4f HS=%.4f ARC=%.4f)",
+                bl_result["accuracy"],
+                bl_result.get("mmlu_accuracy", 0.0),
+                bl_result.get("hellaswag_accuracy", 0.0),
+                bl_result.get("arc_accuracy", 0.0),
+            )
+
         _log.info(
             "baseline: ppl_w103=%.2f  prefill=%.0f tok/s  decode=%.0f tok/s",
             self.baseline_metrics["ppl_w103_valid"],
@@ -483,19 +537,44 @@ class FrontierSearch:
                 self.policy.name, keep_frac,
             )
 
-        # Move model to CPU to free GPU for subsequent iterations.
-        # The model is still accessible for the emit step (saving to disk).
-        if result.model is not None:
-            result.model.cpu()
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
         m = result.metrics_post
         base = self.baseline_metrics
         prefill_speedup = m["prefill_tokens_per_sec"] / max(1e-9, base["prefill_tokens_per_sec"])
         decode_speedup = m["decode_tokens_per_sec"] / max(1e-9, base["decode_tokens_per_sec"])
         ppl_ratio = m["ppl_w103_valid"] / max(1e-9, base_ppl)
+
+        # Run downstream probe on the compressed model (before moving to CPU)
+        ds_score: Optional[float] = None
+        ds_detail: Optional[Dict[str, float]] = None
+        if (
+            self._downstream_probe
+            and self._downstream_probe.questions
+            and result.model is not None
+            and not (result.guardrail_failed or result.failure is not None)
+        ):
+            try:
+                ds_result = eval_downstream_accuracy(
+                    result.model, result.tokenizer,
+                    self._downstream_probe, self.device,
+                )
+                ds_score = ds_result["accuracy"]
+                ds_detail = ds_result
+                _log.info(
+                    "downstream probe kf=%.3f: accuracy=%.4f (MMLU=%.4f HS=%.4f ARC=%.4f)",
+                    keep_frac, ds_score,
+                    ds_result.get("mmlu_accuracy", 0.0),
+                    ds_result.get("hellaswag_accuracy", 0.0),
+                    ds_result.get("arc_accuracy", 0.0),
+                )
+            except Exception as exc:
+                _log.warning("downstream probe failed for kf=%.3f: %s", keep_frac, exc)
+
+        # Move model to CPU to free GPU for subsequent iterations.
+        if result.model is not None:
+            result.model.cpu()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         failed = result.guardrail_failed or result.failure is not None
         point = FrontierPoint(
@@ -513,18 +592,30 @@ class FrontierSearch:
             failure_reason=result.failure["reason"] if result.failure else "",
             risk_score=self.risk_score,
             blended_speedup=self._blended(prefill_speedup, decode_speedup),
+            downstream_score=ds_score,
+            downstream_detail=ds_detail,
         )
         self.evaluated.append(point)
 
-        safe_str = "SAFE" if _is_safe(point, self.max_ppl_multiplier) else "OVER_CEILING"
+        safe = self._is_safe_point(point)
+        safe_str = "SAFE" if safe else "OVER_CEILING"
+        ds_str = f"  downstream={ds_score:.4f}" if ds_score is not None else ""
         _log.info(
-            "keep_frac=%.3f  ppl_ratio=%.3f  prefill_speedup=%.2fx  [%s]  (%.0fs)",
-            keep_frac, ppl_ratio, prefill_speedup, safe_str, result.wall_time_s,
+            "keep_frac=%.3f  ppl_ratio=%.3f  prefill_speedup=%.2fx%s  [%s]  (%.0fs)",
+            keep_frac, ppl_ratio, prefill_speedup, ds_str, safe_str, result.wall_time_s,
         )
         return point
 
+    def _is_safe_point(self, pt: FrontierPoint) -> bool:
+        """Check safety using downstream accuracy (primary) or PPL (fallback)."""
+        return _is_safe(
+            pt, self.max_ppl_multiplier,
+            baseline_downstream=self._baseline_downstream,
+            downstream_threshold=self.downstream_threshold,
+        )
+
     def _safe_points(self) -> List[FrontierPoint]:
-        return [p for p in self.evaluated if _is_safe(p, self.max_ppl_multiplier)]
+        return [p for p in self.evaluated if self._is_safe_point(p)]
 
     def _fastest_safe(self) -> Optional[FrontierPoint]:
         safe = self._safe_points()
@@ -539,6 +630,8 @@ class FrontierSearch:
             if not viable:
                 return None
             return min(viable, key=lambda p: p.ppl_ratio)
+        if any(p.downstream_score is not None for p in safe):
+            return max(safe, key=lambda p: p.downstream_score or 0.0)
         return min(safe, key=lambda p: p.ppl_ratio)
 
     def run(self) -> List[FrontierPoint]:
@@ -613,7 +706,7 @@ class FrontierSearch:
             reward = _safety_reward(pt, ceiling)
 
             # Update bracket
-            if _is_safe(pt, ceiling):
+            if self._is_safe_point(pt):
                 if k_safe_best is None or kf < k_safe_best:
                     k_safe_best = kf
             elif not pt.failed:
