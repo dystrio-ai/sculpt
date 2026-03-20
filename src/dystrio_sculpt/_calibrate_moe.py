@@ -146,6 +146,14 @@ def _get_experts_and_gate(moe_module):
     return experts, gate
 
 
+def _gate_logits(gate: torch.nn.Module, hidden: torch.Tensor) -> torch.Tensor:
+    """Call the gate and extract logits, handling gates that return tuples."""
+    out = gate(hidden)
+    if isinstance(out, tuple):
+        return out[0]
+    return out
+
+
 # ── Router-based calibration (works with fused experts) ───────────────
 
 @torch.no_grad()
@@ -188,7 +196,7 @@ def collect_router_logit_covariance(
         gate_param = next(gate.parameters())
         gate_dev = gate_param.device
         gate_dtype = gate_param.dtype
-        logits = gate(hidden.to(gate_dev, gate_dtype))
+        logits = _gate_logits(gate, hidden.to(gate_dev, gate_dtype))
         probs = F.softmax(logits.float(), dim=-1).to(torch.float64)
 
         sum_z += probs.sum(dim=0).to(device)
@@ -253,7 +261,7 @@ def collect_expert_utilization(
         gate_param = next(gate.parameters())
         gate_dev = gate_param.device
         gate_dtype = gate_param.dtype
-        logits = gate(hidden.to(gate_dev, gate_dtype))
+        logits = _gate_logits(gate, hidden.to(gate_dev, gate_dtype))
         weights = F.softmax(logits.float(), dim=-1)
         topk_weights, topk_indices = torch.topk(weights, top_k, dim=-1)
 
@@ -326,7 +334,7 @@ def collect_expert_sensitivity(
             T = budget
 
         gate_dtype = next(gate.parameters()).dtype
-        logits = gate(hidden.to(gate_dtype))
+        logits = _gate_logits(gate, hidden.to(gate_dtype))
         weights = F.softmax(logits.float(), dim=-1)
         topk_weights, topk_indices = torch.topk(weights, top_k, dim=-1)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -415,7 +423,7 @@ def collect_expert_covariance(
             T = budget
 
         gate_dtype = next(gate.parameters()).dtype
-        logits = gate(hidden.to(gate_dtype))
+        logits = _gate_logits(gate, hidden.to(gate_dtype))
         weights = F.softmax(logits.float(), dim=-1)
         topk_weights, topk_indices = torch.topk(weights, top_k, dim=-1)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -552,7 +560,7 @@ def collect_all_layers_covariance_and_utilization(
             gate_param = next(gate.parameters())
             gate_dev = gate_param.device
             gate_dtype = gate_param.dtype
-            logits = gate(hidden.to(gate_dev, gate_dtype))
+            logits = _gate_logits(gate, hidden.to(gate_dev, gate_dtype))
             probs = F.softmax(logits.float(), dim=-1)
 
             probs_d = probs.to(torch.float64)
