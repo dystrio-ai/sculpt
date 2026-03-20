@@ -29,6 +29,7 @@ _KNOWN_ARCHITECTURES = {
     "mixtral":  ("mixtral",  MlpType.SWIGLU, True,  "silu"),
     "deepseek": ("deepseek", MlpType.SWIGLU, True,  "silu"),
     "qwen2_moe": ("qwen_moe", MlpType.SWIGLU, True, "silu"),
+    "qwen3_5_moe": ("qwen_moe", MlpType.SWIGLU, True, "silu"),
     # Plain MLP (ungated)
     "gpt2":     ("gpt2",     MlpType.PLAIN,  False, "gelu_new"),
     "gptj":     ("gptj",     MlpType.PLAIN,  False, "gelu_new"),
@@ -167,7 +168,11 @@ def fingerprint(model_id: str) -> ArchitectureDescriptor:
 
     # Determine support state
     if is_moe:
-        support_state = SupportState.PARTIALLY_SUPPORTED
+        _moe_families = {"mixtral", "deepseek", "qwen_moe"}
+        if family in _moe_families and confidence >= 0.8:
+            support_state = SupportState.SUPPORTED
+        else:
+            support_state = SupportState.PARTIALLY_SUPPORTED
     elif family in _DENSE_SWIGLU_FAMILIES and confidence >= 0.8:
         support_state = SupportState.SUPPORTED
     elif mlp_type == MlpType.PLAIN:
