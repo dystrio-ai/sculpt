@@ -111,8 +111,13 @@ def _compute_raw_logits(hidden: torch.Tensor, gate_weight: torch.nn.Parameter) -
     - Tuple return values
     - Internal softmax (which we want to control ourselves)
     - Any router-specific post-processing
+
+    Handles device mismatches from device_map="auto" sharding.
     """
-    return F.linear(hidden.to(gate_weight.dtype), gate_weight)
+    return F.linear(
+        hidden.to(device=gate_weight.device, dtype=gate_weight.dtype),
+        gate_weight,
+    )
 
 
 def _get_num_experts(moe_module, model=None) -> int:
