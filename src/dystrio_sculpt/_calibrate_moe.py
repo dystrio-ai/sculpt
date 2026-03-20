@@ -10,10 +10,16 @@ Two calibration modes:
    Runs individual expert forwards to build output covariance. Used for
    expert-level structural compression (drop/merge).
 
-The router-based mode is preferred for the routing patch pipeline because:
-  - It works with fused experts (Qwen3.5 Qwen3_5MoeExperts, etc.)
-  - It's faster (no extra expert forward passes)
-  - It directly measures routing interchangeability
+Architecture reference (Qwen3.5-MoE / Qwen2MoE family):
+  layer.mlp = Qwen3_5MoeSparseMoeBlock
+    .gate   = Qwen3_5MoeTopKRouter  (has .weight nn.Parameter [num_experts, hidden])
+              forward() returns (post_softmax_logits, top_k_weights, top_k_indices)
+    .experts = Qwen3_5MoeExperts  (FUSED: .gate_up_proj, .down_proj as 3D Parameters)
+              NOT a ModuleList — cannot len() or index
+    .shared_expert = Qwen3_5MoeMLP
+    .shared_expert_gate = nn.Linear(hidden, 1)
+
+To get raw pre-softmax logits: F.linear(hidden, gate.weight)
 """
 
 from __future__ import annotations
@@ -31,11 +37,7 @@ _log = logging.getLogger(__name__)
 # ── Model structure helpers ───────────────────────────────────────────
 
 def _get_layers_module(model):
-    """Locate the decoder layer list, handling multimodal wrappers.
-
-    Tries common paths: model.model.layers, model.model.text_model.layers,
-    model.language_model.model.layers, model.text_model.model.layers.
-    """
+    """Locate the decoder layer list, handling multimodal wrappers."""
     candidates = []
     if hasattr(model, "model"):
         m = model.model
@@ -71,12 +73,7 @@ def _get_layers_module(model):
 
 
 def _get_moe_module(model, layer_idx: int):
-    """Locate the MoE module in a transformer layer.
-
-    Supports Mixtral (block_sparse_moe), Qwen-MoE (mlp.experts),
-    and DeepSeek (mlp.experts) naming conventions.
-    Handles multimodal model wrappers via _get_layers_module.
-    """
+    """Locate the MoE module (SparseMoeBlock) in a transformer layer."""
     layers = _get_layers_module(model)
     layer = layers[layer_idx]
     if hasattr(layer, "block_sparse_moe"):
@@ -95,18 +92,36 @@ def _get_gate(moe_module) -> torch.nn.Module:
     raise ValueError("Cannot find gate/router in MoE module")
 
 
-def _get_num_experts(moe_module, model=None) -> int:
-    """Get the number of experts, handling both ModuleList and fused implementations."""
-    experts = getattr(moe_module, "experts", None)
-    if experts is not None:
-        try:
-            return len(experts)
-        except TypeError:
-            pass
+def _get_gate_weight(moe_module) -> torch.nn.Parameter:
+    """Get the raw gate weight matrix for computing pre-softmax logits.
 
+    Works with both nn.Linear gates and TopKRouter gates that store
+    weight as a plain nn.Parameter.
+    """
+    gate = _get_gate(moe_module)
+    if hasattr(gate, "weight"):
+        return gate.weight
+    raise ValueError("Gate has no weight attribute")
+
+
+def _compute_raw_logits(hidden: torch.Tensor, gate_weight: torch.nn.Parameter) -> torch.Tensor:
+    """Compute raw pre-softmax router logits via F.linear.
+
+    Bypasses the router's forward() to avoid:
+    - Tuple return values
+    - Internal softmax (which we want to control ourselves)
+    - Any router-specific post-processing
+    """
+    return F.linear(hidden.to(gate_weight.dtype), gate_weight)
+
+
+def _get_num_experts(moe_module, model=None) -> int:
+    """Get the number of experts from the gate weight shape or config."""
     gate = _get_gate(moe_module)
     if hasattr(gate, "weight"):
         return gate.weight.shape[0]
+    if hasattr(gate, "num_experts"):
+        return gate.num_experts
 
     if model is not None:
         cfg = model.config
@@ -121,6 +136,9 @@ def _get_num_experts(moe_module, model=None) -> int:
 
 def _get_top_k(moe_module) -> int:
     """Get the number of experts selected per token."""
+    gate = _get_gate(moe_module)
+    if hasattr(gate, "top_k"):
+        return gate.top_k
     return getattr(moe_module, "num_experts_per_tok", None) or getattr(moe_module, "top_k", 2)
 
 
@@ -130,28 +148,21 @@ def _experts_are_iterable(moe_module) -> bool:
     if experts is None:
         return False
     try:
-        len(experts)
-        _ = experts[0]
+        n = len(experts)
+        if n > 0:
+            _ = experts[0]
         return True
     except (TypeError, IndexError, KeyError):
         return False
 
 
 def _get_experts_and_gate(moe_module):
-    """Extract expert list and gating network. For backward compat with iterable experts."""
+    """Extract expert module and gating network. For backward compat."""
     experts = getattr(moe_module, "experts", None)
     gate = _get_gate(moe_module)
     if experts is None:
         raise ValueError("Cannot find experts in MoE module")
     return experts, gate
-
-
-def _gate_logits(gate: torch.nn.Module, hidden: torch.Tensor) -> torch.Tensor:
-    """Call the gate and extract logits, handling gates that return tuples."""
-    out = gate(hidden)
-    if isinstance(out, tuple):
-        return out[0]
-    return out
 
 
 # ── Router-based calibration (works with fused experts) ───────────────
@@ -163,17 +174,13 @@ def collect_router_logit_covariance(
 ) -> Dict[str, Any]:
     """Build expert covariance from router logit correlation.
 
-    For each token, captures the full gate logit vector [n_experts].
-    Builds a covariance matrix over these logits across tokens.
-    Experts with correlated logits compete for the same tokens and
-    are candidates for routing canonicalization.
-
+    Computes raw pre-softmax logits via F.linear(hidden, gate.weight),
+    then builds a covariance matrix over softmax probabilities.
     Works with ANY expert implementation (fused or ModuleList).
     """
     moe = _get_moe_module(model, layer_idx)
-    gate = _get_gate(moe)
-    n_experts = _get_num_experts(moe, model)
-    top_k = _get_top_k(moe)
+    gate_weight = _get_gate_weight(moe)
+    n_experts = gate_weight.shape[0]
 
     sum_z = torch.zeros(n_experts, dtype=torch.float64, device=device)
     sum_zz = torch.zeros(n_experts, n_experts, dtype=torch.float64, device=device)
@@ -193,10 +200,7 @@ def collect_router_logit_covariance(
             hidden = hidden[:budget]
             T = budget
 
-        gate_param = next(gate.parameters())
-        gate_dev = gate_param.device
-        gate_dtype = gate_param.dtype
-        logits = _gate_logits(gate, hidden.to(gate_dev, gate_dtype))
+        logits = _compute_raw_logits(hidden, gate_weight)
         probs = F.softmax(logits.float(), dim=-1).to(torch.float64)
 
         sum_z += probs.sum(dim=0).to(device)
@@ -232,13 +236,13 @@ def collect_expert_utilization(
     model, tokenizer, layer_idx: int, texts: Sequence[str],
     max_len: int, device: str, max_tokens: int = 30_000,
 ) -> Dict[str, Any]:
-    """Measure per-expert utilization: selection frequency and average routing weight.
+    """Measure per-expert utilization using raw gate logits.
 
-    Works with ANY expert implementation (only uses the gate).
+    Works with ANY expert implementation (only uses gate.weight).
     """
     moe = _get_moe_module(model, layer_idx)
-    gate = _get_gate(moe)
-    n_experts = _get_num_experts(moe, model)
+    gate_weight = _get_gate_weight(moe)
+    n_experts = gate_weight.shape[0]
     top_k = _get_top_k(moe)
 
     expert_count = torch.zeros(n_experts, device=device, dtype=torch.float64)
@@ -258,10 +262,7 @@ def collect_expert_utilization(
             hidden = hidden[:budget]
             T = budget
 
-        gate_param = next(gate.parameters())
-        gate_dev = gate_param.device
-        gate_dtype = gate_param.dtype
-        logits = _gate_logits(gate, hidden.to(gate_dev, gate_dtype))
+        logits = _compute_raw_logits(hidden, gate_weight)
         weights = F.softmax(logits.float(), dim=-1)
         topk_weights, topk_indices = torch.topk(weights, top_k, dim=-1)
 
@@ -301,10 +302,7 @@ def collect_expert_sensitivity(
     model, tokenizer, layer_idx: int, texts: Sequence[str],
     max_len: int, device: str, max_tokens: int = 30_000,
 ) -> Dict[str, Any]:
-    """Expert operator sensitivity: how much does zeroing each expert change the MoE output?
-
-    REQUIRES iterable experts (ModuleList). Will raise TypeError on fused experts.
-    """
+    """Expert operator sensitivity. REQUIRES iterable experts (ModuleList)."""
     moe = _get_moe_module(model, layer_idx)
     if not _experts_are_iterable(moe):
         raise TypeError(
@@ -312,6 +310,7 @@ def collect_expert_sensitivity(
             "This model uses fused experts. Use router-based calibration instead."
         )
     experts, gate = _get_experts_and_gate(moe)
+    gate_weight = _get_gate_weight(moe)
     n_experts = len(experts)
     top_k = _get_top_k(moe)
 
@@ -333,8 +332,7 @@ def collect_expert_sensitivity(
             hidden = hidden[:budget]
             T = budget
 
-        gate_dtype = next(gate.parameters()).dtype
-        logits = _gate_logits(gate, hidden.to(gate_dtype))
+        logits = _compute_raw_logits(hidden, gate_weight)
         weights = F.softmax(logits.float(), dim=-1)
         topk_weights, topk_indices = torch.topk(weights, top_k, dim=-1)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -344,13 +342,10 @@ def collect_expert_sensitivity(
             tok_experts = topk_indices[t_idx]
             tok_weights = topk_weights[t_idx]
 
-            expert_outputs = []
             for k in range(top_k):
                 eidx = tok_experts[k].item()
                 exp_out = experts[eidx](tok_hidden).float()
-                expert_outputs.append((eidx, tok_weights[k].float(), exp_out))
-
-            for eidx, w, exp_out in expert_outputs:
+                w = tok_weights[k].float()
                 delta = w * exp_out
                 sensitivity[eidx] += delta.pow(2).sum().to(torch.float64)
                 energy[eidx] += exp_out.abs().mean().to(torch.float64)
@@ -383,10 +378,10 @@ def collect_expert_covariance(
     max_len: int, device: str, max_tokens: int = 30_000,
     n_features: int = 3,
 ) -> Dict[str, Any]:
-    """Expert-level covariance from expert outputs for Physarum structural selection.
+    """Expert-level covariance from expert outputs.
 
-    REQUIRES iterable experts (ModuleList). For fused experts, use
-    collect_router_logit_covariance instead.
+    REQUIRES iterable experts. Falls back to router logit covariance
+    for fused experts.
     """
     moe = _get_moe_module(model, layer_idx)
     if not _experts_are_iterable(moe):
@@ -399,6 +394,7 @@ def collect_expert_covariance(
         )
 
     experts, gate = _get_experts_and_gate(moe)
+    gate_weight = _get_gate_weight(moe)
     n_experts = len(experts)
     top_k = _get_top_k(moe)
     F_dim = n_features
@@ -422,8 +418,7 @@ def collect_expert_covariance(
             hidden = hidden[:budget]
             T = budget
 
-        gate_dtype = next(gate.parameters()).dtype
-        logits = _gate_logits(gate, hidden.to(gate_dtype))
+        logits = _compute_raw_logits(hidden, gate_weight)
         weights = F.softmax(logits.float(), dim=-1)
         topk_weights, topk_indices = torch.topk(weights, top_k, dim=-1)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -473,11 +468,10 @@ def collect_expert_covariance(
     N = max(total_tokens, 1)
     mean_z = sum_z / N
     D = (sum_zz / N) - mean_z.unsqueeze(1) * mean_z.unsqueeze(0)
-    block_energy = (sum_mag / N).cpu()
 
     return {
         "D": D.cpu(),
-        "block_energy": block_energy,
+        "block_energy": (sum_mag / N).cpu(),
         "n_blocks": n_experts,
         "feature_multiplier": F_dim,
     }
@@ -491,21 +485,22 @@ def collect_all_layers_covariance_and_utilization(
     max_len: int = 256, device: str = "cuda",
     max_tokens: int = 20_000,
 ) -> Dict[int, Dict[str, Any]]:
-    """Collect expert covariance + utilization for ALL MoE layers in a single forward sweep.
+    """Collect expert covariance + utilization for ALL MoE layers in one sweep.
 
-    Uses router logit correlation (not expert outputs), so it works with
+    Uses raw gate logits via F.linear(hidden, gate.weight) — works with
     any expert implementation including fused experts.
-
-    Returns: {layer_idx: {"covariance": {...}, "utilization": {...}}}
     """
     layers = _get_layers_module(model)
     n_layers = len(layers)
 
     moe_layers: Dict[int, Any] = {}
+    gate_weights: Dict[int, torch.nn.Parameter] = {}
     for li in range(n_layers):
         try:
             moe = _get_moe_module(model, li)
+            gw = _get_gate_weight(moe)
             moe_layers[li] = moe
+            gate_weights[li] = gw
         except ValueError:
             continue
 
@@ -513,9 +508,8 @@ def collect_all_layers_covariance_and_utilization(
         raise ValueError("No MoE layers found in model")
 
     first_li = next(iter(moe_layers))
-    first_moe = moe_layers[first_li]
-    n_experts = _get_num_experts(first_moe, model)
-    top_k = _get_top_k(first_moe)
+    n_experts = gate_weights[first_li].shape[0]
+    top_k = _get_top_k(moe_layers[first_li])
 
     _log.info(
         "batch calibration: %d MoE layers, %d experts, top-%d, max_tokens=%d",
@@ -536,14 +530,13 @@ def collect_all_layers_covariance_and_utilization(
     states: Dict[int, LayerState] = {}
     total_tokens = [0]
 
-    for li, moe in moe_layers.items():
-        gate = _get_gate(moe)
-        gate_device = next(gate.parameters()).device
-        states[li] = LayerState(gate_device)
+    for li in moe_layers:
+        gw_dev = gate_weights[li].device
+        states[li] = LayerState(gw_dev)
 
     hooks = []
 
-    def make_hook(layer_idx, moe_mod, state):
+    def make_hook(layer_idx, gw, state):
         def hook(module, inputs, output):
             if total_tokens[0] >= max_tokens:
                 return
@@ -556,11 +549,7 @@ def collect_all_layers_covariance_and_utilization(
                 hidden = hidden[:budget]
                 T = budget
 
-            gate = _get_gate(moe_mod)
-            gate_param = next(gate.parameters())
-            gate_dev = gate_param.device
-            gate_dtype = gate_param.dtype
-            logits = _gate_logits(gate, hidden.to(gate_dev, gate_dtype))
+            logits = _compute_raw_logits(hidden, gw)
             probs = F.softmax(logits.float(), dim=-1)
 
             probs_d = probs.to(torch.float64)
@@ -579,7 +568,7 @@ def collect_all_layers_covariance_and_utilization(
         return hook
 
     for li, moe in moe_layers.items():
-        h = moe.register_forward_hook(make_hook(li, moe, states[li]))
+        h = moe.register_forward_hook(make_hook(li, gate_weights[li], states[li]))
         hooks.append(h)
 
     model.eval()

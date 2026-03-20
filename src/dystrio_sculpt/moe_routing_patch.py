@@ -450,8 +450,9 @@ def bake_routing_patch(model, patch: RoutingPatch) -> int:
                     W[member].copy_(canonical_row)
                     layer_swaps += 1
 
-        if gate.bias is not None:
-            B = gate.bias.data
+        gate_bias = getattr(gate, "bias", None)
+        if gate_bias is not None:
+            B = gate_bias.data
             for ec in non_singleton:
                 if ec.canonical >= n_experts:
                     continue
