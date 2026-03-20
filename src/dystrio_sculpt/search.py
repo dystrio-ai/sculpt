@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,10 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+
+# Prevent CUDA memory fragmentation across multiple compile_model iterations.
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from ._model import load_model_and_tokenizer, resolve_dtype
 from ._data import CalibConfig, load_text_sets, is_mixture_workload
@@ -473,10 +478,20 @@ class FrontierSearch:
 
         schedule = self._build_keep_schedule(keep_frac)
         mode = "risk_schedule" if schedule else "uniform"
-        _log.info(
-            "[search] evaluating keep_frac=%.3f policy=%s mode=%s profile=%s",
-            keep_frac, self.policy.name, mode, self._speed_profile_name,
-        )
+        if torch.cuda.is_available():
+            gpu_alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+            gpu_resv = torch.cuda.memory_reserved() / (1024 ** 3)
+            _log.info(
+                "[search] evaluating keep_frac=%.3f policy=%s mode=%s profile=%s "
+                "(GPU: %.1f/%.1f GiB alloc/reserved)",
+                keep_frac, self.policy.name, mode, self._speed_profile_name,
+                gpu_alloc, gpu_resv,
+            )
+        else:
+            _log.info(
+                "[search] evaluating keep_frac=%.3f policy=%s mode=%s profile=%s",
+                keep_frac, self.policy.name, mode, self._speed_profile_name,
+            )
 
         failure_subdir = (self.outdir / f"_failed_kf{keep_frac:.3f}") if self.outdir else None
         base_ppl = self.baseline_metrics["ppl_w103_valid"]
@@ -509,9 +524,16 @@ class FrontierSearch:
             )
         except Exception as exc:
             _log.error("compile_model failed for kf=%.3f: %s", keep_frac, exc)
+            # Aggressive cleanup: force-free all CUDA tensors that the failed
+            # compile_model may have left behind (teacher model, optimizer
+            # states, activations).  Two gc passes are needed because the first
+            # breaks reference cycles and the second collects freed tensors.
+            gc.collect()
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                alloc_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+                _log.info("post-failure GPU cleanup: %.1f GiB allocated", alloc_gb)
             point = FrontierPoint(
                 keep_frac=keep_frac, ppl_w103=float("inf"), ppl_w2=float("inf"),
                 prefill_tps=0.0, decode_tps=0.0, prefill_speedup=0.0,
@@ -569,12 +591,17 @@ class FrontierSearch:
             except Exception as exc:
                 _log.warning("downstream probe failed for kf=%.3f: %s", keep_frac, exc)
 
-        # Move model to CPU to free GPU for subsequent iterations.
+        # Free GPU for subsequent iterations.  Move model to CPU (needed
+        # later only for selected frontier points), then aggressively clear
+        # GPU caches to combat fragmentation on 80 GB cards.
         if result.model is not None:
             result.model.cpu()
+        if hasattr(result, '_teacher') and result._teacher is not None:
+            del result._teacher
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
 
         failed = result.guardrail_failed or result.failure is not None
         point = FrontierPoint(
@@ -775,6 +802,15 @@ class FrontierSearch:
 
             _prev_prefill_speedup = pt.prefill_speedup
 
+            # Free models from failed points to reclaim CPU RAM and prevent
+            # CUDA context pollution on subsequent iterations.
+            for old_pt in self.evaluated:
+                if old_pt.failed and old_pt.compile_result is not None:
+                    if old_pt.compile_result.model is not None:
+                        del old_pt.compile_result.model
+                        old_pt.compile_result.model = None
+            gc.collect()
+
             _log.info(
                 "[search] iter=%d action=%s kf=%.3f reward=%.3f "
                 "arms=(explore=%.3f, exploit=%.3f) bracket=[%s, %s]",
@@ -788,6 +824,19 @@ class FrontierSearch:
         safe = self._safe_points()
         viable = [p for p in self.evaluated if not p.failed]
 
+        _log.info(
+            "[selection] evaluated=%d  safe=%d  viable=%d  failed=%d",
+            len(self.evaluated), len(safe), len(viable),
+            sum(1 for p in self.evaluated if p.failed),
+        )
+        for p in self.evaluated:
+            _log.info(
+                "  kf=%.3f failed=%s ppl_ratio=%.3f ds=%.4f guardrail=%s",
+                p.keep_frac, p.failed, p.ppl_ratio,
+                p.downstream_score if p.downstream_score is not None else -1.0,
+                p.failure_reason[:60] if p.failure_reason else "ok",
+            )
+
         if not safe:
             _log.warning(
                 "no point met quality ceiling (%.2fx) within budget; "
@@ -798,7 +847,7 @@ class FrontierSearch:
                 best_viable = min(viable, key=lambda p: p.ppl_ratio)
                 best_viable.label = "frontier_0_default"
                 return [best_viable]
-            _log.error("no viable points at all")
+            _log.error("no viable points at all — all %d evaluated points failed", len(self.evaluated))
             return []
 
         # Build selection: best quality + fastest safe, then fill evenly
@@ -837,6 +886,16 @@ class FrontierSearch:
 
         # Assign semantic labels (never label above-ceiling as named tier)
         _assign_labels(selected, ceiling)
+
+        # Free models from non-selected points to reclaim CPU RAM before
+        # the emission phase.
+        selected_kfs = {p.keep_frac for p in selected}
+        for p in self.evaluated:
+            if p.keep_frac not in selected_kfs and p.compile_result is not None:
+                if p.compile_result.model is not None:
+                    del p.compile_result.model
+                    p.compile_result.model = None
+        gc.collect()
 
         _log.info(
             "TSS complete: %d evaluated, %d safe, %d selected  "

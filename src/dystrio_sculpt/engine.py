@@ -329,6 +329,17 @@ def compile_model(
         if distill_alpha > 0.0:
             teacher_model = _create_teacher(model, model_id, device, dtype, distill_alpha)
 
+    def _cleanup_teacher():
+        """Free teacher model VRAM — called on both success and exception."""
+        nonlocal teacher_model
+        if teacher_model is not None:
+            teacher_model.cpu()
+            del teacher_model
+            teacher_model = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     original_ffn_dims: Dict[int, int] = {}
     for li in layers:
         if adapter is not None:
@@ -629,12 +640,7 @@ def compile_model(
         if fr.get("early_stopped"):
             any_early_stopped = True
 
-    # Free teacher model before benchmarks to reclaim VRAM
-    if teacher_model is not None:
-        del teacher_model
-        teacher_model = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    _cleanup_teacher()
 
     # Compile-phase VRAM peaks (covers staging + repair)
     peak_alloc_compile: Optional[int] = None
