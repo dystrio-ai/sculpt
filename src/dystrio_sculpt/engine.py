@@ -30,7 +30,7 @@ from ._bench import (
 from ._compile import compress_mlp_layer_swiglu_inplace
 from .selectors import select_for_layer, BLOCK_SIZE
 from .selectors.structural import prescan_structural_artifacts, CrossLayerNoveltyTracker
-from .repair import repair_layers, _snapshot_trainable, _restore_trainable
+from .repair import repair_layers, build_teacher_cache, _snapshot_trainable, _restore_trainable
 from .policy import RepairPolicy, auto_select_policy, build_policy_ladder, escalate_policy, HELPFUL_THRESHOLD
 from .architectures.base import ArchitectureAdapter
 
@@ -253,6 +253,7 @@ def compile_model(
     calib: Optional[CalibConfig] = None,
     distill: bool = False,
     distill_alpha_override: Optional[float] = None,
+    distill_cache: bool = True,
     keep_schedule: Optional[Dict[int, float]] = None,
     adapter: Optional[ArchitectureAdapter] = None,
 ) -> CompileResult:
@@ -313,6 +314,7 @@ def compile_model(
     # sufficient and the KL term adds noise.
     DISTILL_THRESHOLD = 0.65
     teacher_model = None
+    teacher_logit_cache = None
     distill_alpha = 0.0
     if distill:
         if distill_alpha_override is not None:
@@ -328,6 +330,18 @@ def compile_model(
             )
         if distill_alpha > 0.0:
             teacher_model = _create_teacher(model, model_id, device, dtype, distill_alpha)
+            if distill_cache and teacher_model is not None:
+                teacher_logit_cache = build_teacher_cache(
+                    teacher_model, tok, texts["train"],
+                    distill_temp=2.0, max_len=MAX_LEN, device=device,
+                )
+                _log.info("teacher cache ready — freeing teacher model from GPU")
+                teacher_model.cpu()
+                del teacher_model
+                teacher_model = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     def _cleanup_teacher():
         """Free teacher model VRAM — called on both success and exception."""
@@ -494,6 +508,7 @@ def compile_model(
                 max_grad_norm=current_policy.max_grad_norm,
                 save_best=True, pre_repair_metric=stage_ppl,
                 teacher_model=teacher_model, distill_alpha=distill_alpha,
+                teacher_cache=teacher_logit_cache,
                 adapter=adapter,
             )
             total_repair_steps += int(sr["steps"])
@@ -546,6 +561,7 @@ def compile_model(
                         max_grad_norm=fallback.max_grad_norm,
                         save_best=True, pre_repair_metric=stage_ppl,
                         teacher_model=teacher_model, distill_alpha=distill_alpha,
+                        teacher_cache=teacher_logit_cache,
                         adapter=adapter,
                     )
                     total_repair_steps += int(sr2["steps"])
@@ -634,6 +650,7 @@ def compile_model(
             max_grad_norm=current_policy.max_grad_norm,
             save_best=True, pre_repair_metric=pre_final_ppl,
             teacher_model=teacher_model, distill_alpha=distill_alpha,
+            teacher_cache=teacher_logit_cache,
             adapter=adapter,
         )
         total_repair_steps += int(fr["steps"])
@@ -713,6 +730,7 @@ def compile_model(
         "distillation": {
             "enabled": distill,
             "alpha": distill_alpha,
+            "cached": teacher_logit_cache is not None,
         },
     }
 

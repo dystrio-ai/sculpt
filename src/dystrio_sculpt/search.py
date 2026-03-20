@@ -269,6 +269,7 @@ class FrontierSearch:
         calib: Optional[CalibConfig] = None,
         distill: bool = False,
         distill_alpha: Optional[float] = None,
+        distill_cache: bool = True,
         speed_profile: Optional[str] = None,
         use_risk_schedule: bool = False,
         protection_threshold: Optional[float] = None,
@@ -302,6 +303,7 @@ class FrontierSearch:
         self.calib = calib
         self.distill = distill
         self.distill_alpha = distill_alpha
+        self.distill_cache = distill_cache
         self.mixture_workload = mixture_workload
 
         # Downstream SLO threshold (e.g. 0.95 = keep >=95% of baseline accuracy)
@@ -519,6 +521,7 @@ class FrontierSearch:
                 allow_escalation=not self._escalation_applied,
                 distill=self.distill,
                 distill_alpha_override=self.distill_alpha,
+                distill_cache=self.distill_cache,
                 keep_schedule=schedule,
                 adapter=self.adapter,
             )

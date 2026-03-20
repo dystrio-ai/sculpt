@@ -99,7 +99,7 @@ echo ""
 # a full degradation curve across keep_frac values.
 #
 echo "============================================================"
-echo "  SCULPT: Qwen 3.5 9B (threshold=0.85 for full curve)"
+echo "  SCULPT: Qwen 3.5 9B (distill-alpha=0.5, cached, threshold=0.85)"
 echo "  $(date)"
 echo "============================================================"
 
@@ -107,7 +107,8 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 dystrio sculpt \
     --model-id Qwen/Qwen3.5-9B \
     --workload general_v2 \
-    --distill \
+    --distill-alpha 0.5 \
+    --distill-cache \
     --frontier 4 \
     --downstream-threshold 0.85 \
     --outdir sculpt_out_qwen35_9b \

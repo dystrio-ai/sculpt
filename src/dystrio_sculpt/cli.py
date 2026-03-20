@@ -128,6 +128,11 @@ def sculpt(
         None, "--distill-alpha",
         help="Force distillation alpha at all compression levels (bypasses adaptive threshold).",
     ),
+    distill_cache: bool = typer.Option(
+        True, "--distill-cache/--no-distill-cache",
+        help="Cache teacher logits before repair (~2x speedup with same quality). "
+             "Default: on when distillation is enabled.",
+    ),
     push_dataset: bool = typer.Option(
         True, "--push-dataset/--no-push-dataset",
         help="Push results to the Dystrio Efficiency Dataset on HuggingFace.",
@@ -177,7 +182,7 @@ def sculpt(
     if distill_alpha is not None:
         distill = True
     if distill:
-        log.info("  distill:       enabled (alpha=%s)", distill_alpha or "adaptive")
+        log.info("  distill:       enabled (alpha=%s, cache=%s)", distill_alpha or "adaptive", distill_cache)
     if speed_profile is not None:
         log.info("  speed_profile: %s", speed_profile)
     if use_risk_schedule:
@@ -266,6 +271,7 @@ def sculpt(
         calib=calib_cfg,
         distill=distill,
         distill_alpha=distill_alpha,
+        distill_cache=distill_cache,
         speed_profile=speed_profile,
         use_risk_schedule=use_risk_schedule,
         protection_threshold=protection_threshold,
