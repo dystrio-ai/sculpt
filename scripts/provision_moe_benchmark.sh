@@ -86,10 +86,12 @@ fi
 source .venv/bin/activate
 
 pip install --upgrade pip setuptools wheel -q
-pip install -e ".[dev]" -q
-pip install accelerate huggingface_hub -q
 pip install vllm -q
 pip install lm_eval -q
+pip install -e ".[dev]" -q
+pip install accelerate huggingface_hub -q
+# Ensure transformers is vLLM-compatible (all tests use vLLM natively)
+pip install 'transformers>=4.56.0,<5' -q
 
 echo "   Python: $(python --version)"
 echo "   torch:  $(python -c 'import torch; print(torch.__version__)')"

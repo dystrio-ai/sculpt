@@ -3,10 +3,13 @@
 
 Validates the Physarum routing canonicalization patch across four dimensions:
 
-  1. Routing Determinism — identical inputs → identical outputs
-  2. Quality Preservation — full lm_eval benchmarks (MMLU, HellaSwag, ARC, etc.)
+  1. Routing Determinism — identical inputs → identical outputs (via vLLM)
+  2. Quality Preservation — full lm_eval benchmarks with vLLM backend
   3. vLLM Prefix Caching — throughput with shared-prefix workloads
-  4. nvfp4 Quantization Stability — determinism under 4-bit quantization
+  4. nvfp4 Quantization Stability — determinism under quantization
+
+All tests use vLLM natively (no transformers AutoModel), ensuring compatibility
+with Qwen3.5-MoE and matching production serving conditions.
 
 Usage:
     python scripts/benchmark_moe_routing.py \
@@ -31,7 +34,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
-import torch.nn.functional as F
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,7 +43,7 @@ logging.basicConfig(
 log = logging.getLogger("moe_benchmark")
 
 
-# ─── Test 1: Routing Determinism ─────────────────────────────────────
+# ─── Test texts ──────────────────────────────────────────────────────
 
 DETERMINISM_TEXTS = [
     "The quick brown fox jumps over the lazy dog.",
@@ -66,109 +68,202 @@ DETERMINISM_TEXTS = [
     "Once upon a time in a distant galaxy, a lone spaceship drifted through the cosmic void searching for a new home.",
 ]
 
+SYSTEM_PROMPT = (
+    "You are a helpful AI assistant specialized in answering questions about "
+    "science, technology, engineering, and mathematics. You provide clear, "
+    "accurate, and concise answers. When appropriate, you include relevant "
+    "examples and analogies to help explain complex concepts. You always "
+    "cite your sources when possible and acknowledge uncertainty when you "
+    "are not confident in your answer. Please respond thoughtfully."
+)
 
-def _load_model_for_determinism(model_path: str, dtype=torch.bfloat16):
-    """Load model with device_map=auto for multi-GPU inference."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+SHARED_PREFIX_QUERIES = [
+    "What is the Heisenberg uncertainty principle?",
+    "Explain how CRISPR gene editing works.",
+    "What causes auroras (northern/southern lights)?",
+    "How do quantum computers differ from classical computers?",
+    "Explain the concept of entropy in thermodynamics.",
+    "What is dark matter and why do scientists believe it exists?",
+    "How does mRNA vaccine technology work?",
+    "Explain the P vs NP problem in computer science.",
+    "What is the standard model of particle physics?",
+    "How do neural networks learn through backpropagation?",
+    "What is the significance of the Higgs boson?",
+    "Explain how blockchain consensus mechanisms work.",
+    "What causes tectonic plates to move?",
+    "How does LIGO detect gravitational waves?",
+    "What is the holographic principle in theoretical physics?",
+    "Explain the difference between supervised and unsupervised learning.",
+    "What is quantum entanglement?",
+    "How do black holes form and what happens at the event horizon?",
+    "Explain the central dogma of molecular biology.",
+    "What is the significance of Gödel's incompleteness theorems?",
+] * 3
 
-    log.info("loading model: %s", model_path)
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=dtype,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    model.eval()
-    return model, tokenizer
+UNIQUE_PROMPTS = [
+    f"Tell me about topic number {i} in great detail, covering all aspects." for i in range(60)
+]
 
 
-def _free_model(model):
-    """Aggressively free GPU memory."""
-    del model
+# ─── Helpers ─────────────────────────────────────────────────────────
+
+def _free_gpu():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 
-@torch.no_grad()
+def _create_vllm_engine(
+    model_path: str,
+    tensor_parallel_size: int = 4,
+    enable_prefix_caching: bool = False,
+    quantization: Optional[str] = None,
+    gpu_memory_utilization: float = 0.90,
+    max_model_len: int = 2048,
+):
+    from vllm import LLM
+    kwargs = dict(
+        model=model_path,
+        trust_remote_code=True,
+        tensor_parallel_size=tensor_parallel_size,
+        enable_prefix_caching=enable_prefix_caching,
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_model_len,
+    )
+    if quantization:
+        kwargs["quantization"] = quantization
+    return LLM(**kwargs)
+
+
+def _destroy_vllm_engine(llm):
+    del llm
+    _free_gpu()
+    time.sleep(5)
+
+
+# ─── Test 1: Routing Determinism ─────────────────────────────────────
+
 def test_determinism(
     model_path: str,
     output_dir: Path,
     label: str,
+    tensor_parallel_size: int = 4,
     n_runs: int = 5,
-    dtype=torch.bfloat16,
+    max_new_tokens: int = 32,
 ) -> Dict[str, Any]:
-    """Run multiple forward passes on diverse texts, measure logit divergence."""
+    """Run multiple generations on diverse texts, check output identity.
+
+    Uses vLLM with temperature=0. If routing is deterministic, identical
+    prompts produce bit-for-bit identical outputs across all runs.
+    Also collects prompt_logprobs for finer-grained divergence analysis.
+    """
     log.info("=== Test 1: Routing Determinism [%s] ===", label)
 
-    model, tokenizer = _load_model_for_determinism(model_path, dtype=dtype)
-    first_device = next(model.parameters()).device
+    from vllm import SamplingParams
+
+    t0 = time.time()
+    llm = _create_vllm_engine(model_path, tensor_parallel_size=tensor_parallel_size)
+    load_time = time.time() - t0
+    log.info("model loaded in %.0fs", load_time)
+
+    params = SamplingParams(
+        max_tokens=max_new_tokens,
+        temperature=0,
+        prompt_logprobs=1,
+    )
+
+    # Warmup
+    _ = llm.generate(DETERMINISM_TEXTS[:2], params)
+
     results_per_text = []
 
     for ti, text in enumerate(DETERMINISM_TEXTS):
-        inp = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-        inp = {k: v.to(first_device) for k, v in inp.items()}
-        seq_len = inp["input_ids"].shape[1]
+        runs_tokens = []
+        runs_text = []
+        runs_logprobs = []
 
-        all_logits = []
         for r in range(n_runs):
-            out = model(**inp, use_cache=False)
-            all_logits.append(out.logits.cpu().float())
+            outputs = llm.generate([text], params)
+            out = outputs[0]
+            gen_tokens = list(out.outputs[0].token_ids)
+            gen_text = out.outputs[0].text
+            runs_tokens.append(gen_tokens)
+            runs_text.append(gen_text)
 
-        max_diffs = []
-        mean_diffs = []
-        for i in range(n_runs):
-            for j in range(i + 1, n_runs):
-                diff = (all_logits[i] - all_logits[j]).abs()
-                max_diffs.append(diff.max().item())
-                mean_diffs.append(diff.mean().item())
+            if out.prompt_logprobs is not None:
+                prompt_lps = []
+                for pos_dict in out.prompt_logprobs:
+                    if pos_dict is not None:
+                        top_lp = max(pos_dict.values(), key=lambda x: x.logprob if hasattr(x, 'logprob') else x)
+                        lp_val = top_lp.logprob if hasattr(top_lp, 'logprob') else float(top_lp)
+                        prompt_lps.append(lp_val)
+                runs_logprobs.append(prompt_lps)
+
+        all_tokens_same = all(t == runs_tokens[0] for t in runs_tokens)
+        all_text_same = all(t == runs_text[0] for t in runs_text)
+        unique_outputs = len(set(str(t) for t in runs_tokens))
+
+        logprob_max_diff = 0.0
+        if len(runs_logprobs) >= 2:
+            for i in range(len(runs_logprobs)):
+                for j in range(i + 1, len(runs_logprobs)):
+                    min_len = min(len(runs_logprobs[i]), len(runs_logprobs[j]))
+                    for k in range(min_len):
+                        diff = abs(runs_logprobs[i][k] - runs_logprobs[j][k])
+                        logprob_max_diff = max(logprob_max_diff, diff)
 
         result = {
             "text_idx": ti,
             "text_preview": text[:80],
-            "seq_len": seq_len,
             "n_runs": n_runs,
-            "max_logit_diff": max(max_diffs) if max_diffs else 0.0,
-            "mean_logit_diff": sum(mean_diffs) / len(mean_diffs) if mean_diffs else 0.0,
-            "all_pairs_max_diffs": max_diffs,
-            "deterministic": max(max_diffs) < 1e-4 if max_diffs else True,
+            "all_tokens_identical": all_tokens_same,
+            "all_text_identical": all_text_same,
+            "unique_outputs": unique_outputs,
+            "logprob_max_diff": logprob_max_diff,
+            "generated_text_sample": runs_text[0][:200],
+            "deterministic": all_tokens_same,
         }
         results_per_text.append(result)
 
-        status = "PASS" if result["deterministic"] else "FAIL"
+        status = "PASS" if all_tokens_same else f"FAIL ({unique_outputs} unique)"
         log.info(
-            "  text %d/%d (len=%d): max_diff=%.2e [%s]",
-            ti + 1, len(DETERMINISM_TEXTS), seq_len,
-            result["max_logit_diff"], status,
+            "  text %d/%d: %s (logprob_diff=%.2e)",
+            ti + 1, len(DETERMINISM_TEXTS), status, logprob_max_diff,
         )
 
-    all_deterministic = all(r["deterministic"] for r in results_per_text)
-    overall_max_diff = max(r["max_logit_diff"] for r in results_per_text)
+    _destroy_vllm_engine(llm)
+
+    n_deterministic = sum(1 for r in results_per_text if r["deterministic"])
+    agreement_rate = n_deterministic / len(results_per_text)
+    overall_logprob_diff = max(r["logprob_max_diff"] for r in results_per_text)
 
     summary = {
         "label": label,
         "model_path": model_path,
-        "dtype": str(dtype),
         "n_texts": len(DETERMINISM_TEXTS),
         "n_runs_per_text": n_runs,
-        "overall_max_logit_diff": overall_max_diff,
-        "all_deterministic": all_deterministic,
-        "pass": all_deterministic,
+        "n_deterministic": n_deterministic,
+        "agreement_rate": agreement_rate,
+        "overall_logprob_max_diff": overall_logprob_diff,
+        "all_deterministic": n_deterministic == len(results_per_text),
+        "pass": n_deterministic == len(results_per_text),
+        "load_time_s": load_time,
         "per_text": results_per_text,
     }
 
     out_path = output_dir / f"determinism_{label}.json"
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
-    log.info("determinism [%s]: %s (max_diff=%.2e) → %s",
-             label, "PASS" if all_deterministic else "FAIL", overall_max_diff, out_path)
+    log.info(
+        "determinism [%s]: %d/%d texts deterministic (%.1f%%) → %s",
+        label, n_deterministic, len(results_per_text),
+        agreement_rate * 100, out_path,
+    )
 
-    _free_model(model)
     return summary
 
 
-# ─── Test 2: Quality Preservation via lm_eval ────────────────────────
+# ─── Test 2: Quality Preservation via lm_eval + vLLM ─────────────────
 
 LM_EVAL_TASKS = "mmlu,hellaswag,arc_challenge,truthfulqa_mc2,winogrande,gsm8k"
 
@@ -177,10 +272,10 @@ def test_quality_lm_eval(
     model_path: str,
     output_dir: Path,
     label: str,
+    tensor_parallel_size: int = 4,
     tasks: str = LM_EVAL_TASKS,
-    batch_size: str = "auto",
 ) -> Dict[str, Any]:
-    """Run lm_eval harness on a model."""
+    """Run lm_eval harness with vLLM backend."""
     log.info("=== Test 2: Quality [%s] ===", label)
     log.info("tasks: %s", tasks)
 
@@ -189,10 +284,16 @@ def test_quality_lm_eval(
 
     cmd = [
         sys.executable, "-m", "lm_eval",
-        "--model", "hf",
-        "--model_args", f"pretrained={model_path},dtype=bfloat16,trust_remote_code=True",
+        "--model", "vllm",
+        "--model_args", (
+            f"pretrained={model_path},"
+            f"tensor_parallel_size={tensor_parallel_size},"
+            "trust_remote_code=True,"
+            "gpu_memory_utilization=0.90,"
+            "max_model_len=2048"
+        ),
         "--tasks", tasks,
-        "--batch_size", batch_size,
+        "--batch_size", "auto",
         "--output_path", str(eval_output),
     ]
 
@@ -205,7 +306,8 @@ def test_quality_lm_eval(
     log.info("lm_eval [%s] completed in %.0fs (exit code %d)", label, elapsed, result.returncode)
 
     if result.returncode != 0:
-        log.error("lm_eval stderr:\n%s", result.stderr[-2000:] if result.stderr else "(empty)")
+        log.error("lm_eval stderr (last 2000 chars):\n%s", result.stderr[-2000:] if result.stderr else "(empty)")
+        log.error("lm_eval stdout (last 2000 chars):\n%s", result.stdout[-2000:] if result.stdout else "(empty)")
 
     results_file = None
     for p in eval_output.rglob("results.json"):
@@ -285,81 +387,29 @@ def compare_quality(original: Dict, patched: Dict, output_dir: Path) -> Dict[str
 
 # ─── Test 3: vLLM Prefix Caching ────────────────────────────────────
 
-SYSTEM_PROMPT = (
-    "You are a helpful AI assistant specialized in answering questions about "
-    "science, technology, engineering, and mathematics. You provide clear, "
-    "accurate, and concise answers. When appropriate, you include relevant "
-    "examples and analogies to help explain complex concepts. You always "
-    "cite your sources when possible and acknowledge uncertainty when you "
-    "are not confident in your answer. Please respond thoughtfully."
-)
-
-SHARED_PREFIX_QUERIES = [
-    "What is the Heisenberg uncertainty principle?",
-    "Explain how CRISPR gene editing works.",
-    "What causes auroras (northern/southern lights)?",
-    "How do quantum computers differ from classical computers?",
-    "Explain the concept of entropy in thermodynamics.",
-    "What is dark matter and why do scientists believe it exists?",
-    "How does mRNA vaccine technology work?",
-    "Explain the P vs NP problem in computer science.",
-    "What is the standard model of particle physics?",
-    "How do neural networks learn through backpropagation?",
-    "What is the significance of the Higgs boson?",
-    "Explain how blockchain consensus mechanisms work.",
-    "What causes tectonic plates to move?",
-    "How does LIGO detect gravitational waves?",
-    "What is the holographic principle in theoretical physics?",
-    "Explain the difference between supervised and unsupervised learning.",
-    "What is quantum entanglement?",
-    "How do black holes form and what happens at the event horizon?",
-    "Explain the central dogma of molecular biology.",
-    "What is the significance of Gödel's incompleteness theorems?",
-] * 3  # 60 requests total
-
-UNIQUE_PROMPTS = [
-    f"Tell me about topic number {i} in great detail, covering all aspects." for i in range(60)
-]
-
-
-def _try_vllm_import():
-    try:
-        import vllm
-        return True
-    except ImportError:
-        return False
-
-
 def _run_vllm_workload(
     model_path: str,
     prompts: List[str],
     enable_prefix_caching: bool,
     max_new_tokens: int = 64,
-    tensor_parallel_size: int = 1,
+    tensor_parallel_size: int = 4,
     quantization: Optional[str] = None,
-    gpu_memory_utilization: float = 0.90,
 ) -> Dict[str, Any]:
     """Run a vLLM workload and measure throughput/latency."""
-    from vllm import LLM, SamplingParams
+    from vllm import SamplingParams
 
     log.info(
         "  vLLM workload: %d prompts, prefix_cache=%s, quant=%s, tp=%d",
         len(prompts), enable_prefix_caching, quantization, tensor_parallel_size,
     )
 
-    llm_kwargs = dict(
-        model=model_path,
-        trust_remote_code=True,
+    t_load = time.time()
+    llm = _create_vllm_engine(
+        model_path,
         tensor_parallel_size=tensor_parallel_size,
         enable_prefix_caching=enable_prefix_caching,
-        gpu_memory_utilization=gpu_memory_utilization,
-        max_model_len=2048,
+        quantization=quantization,
     )
-    if quantization:
-        llm_kwargs["quantization"] = quantization
-
-    t_load = time.time()
-    llm = LLM(**llm_kwargs)
     load_time = time.time() - t_load
 
     params = SamplingParams(max_tokens=max_new_tokens, temperature=0)
@@ -367,12 +417,12 @@ def _run_vllm_workload(
     # Warmup
     _ = llm.generate(prompts[:2], params)
 
-    # Throughput: all prompts
+    # First pass: throughput
     t0 = time.time()
     outputs = llm.generate(prompts, params)
-    throughput_time = time.time() - t0
+    first_pass_time = time.time() - t0
     total_gen = sum(len(o.outputs[0].token_ids) for o in outputs)
-    throughput = total_gen / max(1e-9, throughput_time)
+    throughput_first = total_gen / max(1e-9, first_pass_time)
 
     # Latency: first 10 prompts individually
     latencies = []
@@ -386,32 +436,29 @@ def _run_vllm_workload(
     p95_idx = min(int(len(latencies) * 0.95), len(latencies) - 1)
     p95 = latencies[p95_idx] if latencies else 0.0
 
-    # Second pass: measure cache benefit (same prompts again)
+    # Second pass: same prompts again (measures cache benefit)
     t0 = time.time()
     outputs2 = llm.generate(prompts, params)
     second_pass_time = time.time() - t0
     total_gen2 = sum(len(o.outputs[0].token_ids) for o in outputs2)
     throughput_second = total_gen2 / max(1e-9, second_pass_time)
 
-    result = {
-        "throughput_first_pass_tok_s": round(throughput, 2),
+    _destroy_vllm_engine(llm)
+
+    return {
+        "throughput_first_pass_tok_s": round(throughput_first, 2),
         "throughput_second_pass_tok_s": round(throughput_second, 2),
-        "cache_speedup_ratio": round(throughput_second / max(throughput, 1e-9), 3),
+        "cache_speedup_ratio": round(throughput_second / max(throughput_first, 1e-9), 3),
         "latency_p50_s": round(p50, 4),
         "latency_p95_s": round(p95, 4),
         "total_generated_tokens": total_gen,
         "n_prompts": len(prompts),
         "load_time_s": round(load_time, 1),
+        "first_pass_time_s": round(first_pass_time, 2),
+        "second_pass_time_s": round(second_pass_time, 2),
         "enable_prefix_caching": enable_prefix_caching,
         "quantization": quantization,
     }
-
-    del llm
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return result
 
 
 def test_vllm_prefix_caching(
@@ -419,14 +466,9 @@ def test_vllm_prefix_caching(
     output_dir: Path,
     label: str,
     tensor_parallel_size: int = 4,
-    quantization: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Test prefix caching effectiveness with shared-prefix workloads."""
     log.info("=== Test 3: vLLM Prefix Caching [%s] ===", label)
-
-    if not _try_vllm_import():
-        log.warning("vLLM not installed, skipping prefix caching test")
-        return {"label": label, "skipped": True, "reason": "vllm not installed"}
 
     shared_prompts = [f"{SYSTEM_PROMPT}\n\nUser: {q}\nAssistant:" for q in SHARED_PREFIX_QUERIES]
     unique_prompts = [f"User: {q}\nAssistant:" for q in UNIQUE_PROMPTS]
@@ -446,7 +488,6 @@ def test_vllm_prefix_caching(
                     prompts=prompts,
                     enable_prefix_caching=cache_enabled,
                     tensor_parallel_size=tensor_parallel_size,
-                    quantization=quantization,
                 )
                 results[key] = r
                 log.info(
@@ -456,10 +497,9 @@ def test_vllm_prefix_caching(
                     r["cache_speedup_ratio"],
                 )
             except Exception as e:
-                log.error("  workload %s failed: %s", key, e)
+                log.error("  workload %s failed: %s", key, e, exc_info=True)
                 results[key] = {"error": str(e)}
 
-    # Compute cache benefit delta
     cache_benefit = {}
     for workload in ["shared_prefix", "unique_prefix"]:
         no_cache = results.get(f"{workload}_cache_False", {})
@@ -476,7 +516,6 @@ def test_vllm_prefix_caching(
     summary = {
         "label": label,
         "model_path": model_path,
-        "quantization": quantization,
         "tensor_parallel_size": tensor_parallel_size,
         "workload_results": results,
         "cache_benefit": cache_benefit,
@@ -490,76 +529,74 @@ def test_vllm_prefix_caching(
     return summary
 
 
-# ─── Test 4: nvfp4 Quantization Routing Stability ───────────────────
+# ─── Test 4: Quantized Routing Stability ─────────────────────────────
 
-def test_nvfp4_determinism(
+def test_quantized_determinism(
     model_path: str,
     output_dir: Path,
     label: str,
     tensor_parallel_size: int = 4,
+    n_runs: int = 5,
+    max_new_tokens: int = 32,
 ) -> Dict[str, Any]:
-    """Test routing determinism under quantization via vLLM."""
-    log.info("=== Test 4: nvfp4 Determinism [%s] ===", label)
+    """Test routing determinism under fp8 quantization via vLLM."""
+    log.info("=== Test 4: Quantized Determinism [%s] ===", label)
 
-    if not _try_vllm_import():
-        log.warning("vLLM not installed, skipping nvfp4 test")
-        return {"label": label, "skipped": True, "reason": "vllm not installed"}
+    from vllm import SamplingParams
 
-    from vllm import LLM, SamplingParams
-
-    # Try quantization methods in order of preference
-    quant_methods = ["fp8", "bitsandbytes"]
+    quant_methods = ["fp8", "compressed-tensors"]
     llm = None
     used_quant = None
 
     for qmethod in quant_methods:
         try:
             log.info("  trying quantization: %s", qmethod)
-            llm_kwargs = dict(
-                model=model_path,
-                trust_remote_code=True,
+            llm = _create_vllm_engine(
+                model_path,
                 tensor_parallel_size=tensor_parallel_size,
                 quantization=qmethod,
-                gpu_memory_utilization=0.90,
                 max_model_len=1024,
             )
-            llm = LLM(**llm_kwargs)
             used_quant = qmethod
             log.info("  using quantization: %s", qmethod)
             break
         except Exception as e:
-            log.warning("  %s failed: %s", qmethod, e)
+            log.warning("  %s not available: %s", qmethod, e)
             continue
 
     if llm is None:
-        log.warning("no quantization method available, skipping nvfp4 test")
+        log.warning("no quantization method available, skipping")
         return {"label": label, "skipped": True, "reason": "no quantization available"}
 
-    params = SamplingParams(max_tokens=1, temperature=0)
+    params = SamplingParams(max_tokens=max_new_tokens, temperature=0)
+
+    # Warmup
+    _ = llm.generate(DETERMINISM_TEXTS[:2], params)
 
     texts = DETERMINISM_TEXTS[:10]
-    n_runs = 5
     results_per_text = []
 
     for ti, text in enumerate(texts):
-        token_ids_runs = []
+        runs_tokens = []
         for r in range(n_runs):
             outputs = llm.generate([text], params)
-            generated = outputs[0].outputs[0].token_ids
-            token_ids_runs.append(list(generated))
+            gen_tokens = list(outputs[0].outputs[0].token_ids)
+            runs_tokens.append(gen_tokens)
 
-        all_same = all(t == token_ids_runs[0] for t in token_ids_runs)
+        all_same = all(t == runs_tokens[0] for t in runs_tokens)
+        unique_outputs = len(set(str(t) for t in runs_tokens))
         results_per_text.append({
             "text_idx": ti,
             "text_preview": text[:80],
             "n_runs": n_runs,
             "all_identical": all_same,
-            "unique_outputs": len(set(str(t) for t in token_ids_runs)),
+            "unique_outputs": unique_outputs,
         })
 
-        status = "PASS" if all_same else "DIVERGENT"
-        log.info("  text %d/%d: %s (%d unique outputs)",
-                 ti + 1, len(texts), status, results_per_text[-1]["unique_outputs"])
+        status = "PASS" if all_same else f"DIVERGENT ({unique_outputs} unique)"
+        log.info("  text %d/%d: %s", ti + 1, len(texts), status)
+
+    _destroy_vllm_engine(llm)
 
     n_deterministic = sum(1 for r in results_per_text if r["all_identical"])
     agreement_rate = n_deterministic / len(results_per_text) if results_per_text else 0
@@ -576,16 +613,11 @@ def test_nvfp4_determinism(
         "per_text": results_per_text,
     }
 
-    out_path = output_dir / f"nvfp4_determinism_{label}.json"
+    out_path = output_dir / f"quantized_determinism_{label}.json"
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
-    log.info("nvfp4 determinism [%s]: %.1f%% agreement → %s",
+    log.info("quantized determinism [%s]: %.1f%% agreement → %s",
              label, agreement_rate * 100, out_path)
-
-    del llm
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     return summary
 
@@ -605,23 +637,25 @@ def generate_report(results: Dict[str, Any], output_dir: Path) -> str:
     ]
 
     # Determinism
-    lines.append("## 1. Routing Determinism")
+    lines.append("## 1. Routing Determinism (bf16, temperature=0)")
     lines.append("")
     for label in ["original", "patched"]:
         det = results.get(f"determinism_{label}", {})
-        if det.get("skipped"):
-            lines.append(f"**{label}**: skipped")
+        if "error" in det:
+            lines.append(f"- **{label}**: ERROR — {det['error']}")
             continue
+        n_det = det.get("n_deterministic", "?")
+        n_total = det.get("n_texts", "?")
+        rate = det.get("agreement_rate", 0) * 100
         status = "PASS" if det.get("pass") else "FAIL"
-        max_diff = det.get("overall_max_logit_diff", "N/A")
-        lines.append(f"- **{label}**: {status} (max logit diff: {max_diff:.2e})")
+        lines.append(f"- **{label}**: {n_det}/{n_total} texts deterministic ({rate:.1f}%) [{status}]")
     lines.append("")
 
     # Quality
-    lines.append("## 2. Quality Preservation")
+    lines.append("## 2. Quality Preservation (lm_eval via vLLM)")
     lines.append("")
     qc = results.get("quality_comparison", {})
-    if qc:
+    if qc and "comparisons" in qc:
         lines.append("| Metric | Original | Patched | Diff |")
         lines.append("|--------|----------|---------|------|")
         for metric, data in sorted(qc.get("comparisons", {}).items()):
@@ -636,12 +670,12 @@ def generate_report(results: Dict[str, Any], output_dir: Path) -> str:
     lines.append("")
 
     # vLLM Prefix Caching
-    lines.append("## 3. vLLM Prefix Caching")
+    lines.append("## 3. vLLM Prefix Caching Throughput")
     lines.append("")
     for label in ["original", "patched"]:
         vllm_data = results.get(f"vllm_{label}", {})
-        if vllm_data.get("skipped"):
-            lines.append(f"**{label}**: skipped ({vllm_data.get('reason', '')})")
+        if "error" in vllm_data:
+            lines.append(f"**{label}**: ERROR — {vllm_data.get('error', '')}")
             continue
         cb = vllm_data.get("cache_benefit", {})
         for workload, data in cb.items():
@@ -653,13 +687,14 @@ def generate_report(results: Dict[str, Any], output_dir: Path) -> str:
             )
     lines.append("")
 
-    # nvfp4
-    lines.append("## 4. Quantization Routing Stability")
+    # Quantized determinism
+    lines.append("## 4. Quantized Routing Stability")
     lines.append("")
     for label in ["original", "patched"]:
-        nv = results.get(f"nvfp4_{label}", {})
-        if nv.get("skipped"):
-            lines.append(f"**{label}**: skipped ({nv.get('reason', '')})")
+        nv = results.get(f"quant_{label}", {})
+        if nv.get("skipped") or "error" in nv:
+            reason = nv.get("reason", nv.get("error", "unknown"))
+            lines.append(f"- **{label}**: skipped ({reason})")
             continue
         rate = nv.get("agreement_rate", 0) * 100
         status = "PASS" if nv.get("pass") else "FAIL"
@@ -669,11 +704,11 @@ def generate_report(results: Dict[str, Any], output_dir: Path) -> str:
     # Overall
     lines.append("## Overall Verdict")
     lines.append("")
-    all_pass = all([
-        results.get("determinism_patched", {}).get("pass", False),
-        results.get("quality_comparison", {}).get("pass", True),
-    ])
-    lines.append(f"**{'PASS' if all_pass else 'FAIL'}**")
+    det_pass = results.get("determinism_patched", {}).get("pass", False)
+    qual_pass = results.get("quality_comparison", {}).get("pass", True)
+    lines.append(f"- Determinism: {'PASS' if det_pass else 'FAIL'}")
+    lines.append(f"- Quality: {'PASS' if qual_pass else 'FAIL/SKIPPED'}")
+    lines.append(f"- **Overall: {'PASS' if (det_pass and qual_pass) else 'NEEDS REVIEW'}**")
     lines.append("")
 
     report = "\n".join(lines)
@@ -694,18 +729,19 @@ def main():
     parser.add_argument("--output", default="~/moe_benchmark_results", help="Output directory")
     parser.add_argument("--tp", type=int, default=4, help="Tensor parallel size for vLLM")
     parser.add_argument("--skip-quality", action="store_true", help="Skip lm_eval (slow)")
-    parser.add_argument("--skip-vllm", action="store_true", help="Skip vLLM tests")
-    parser.add_argument("--skip-nvfp4", action="store_true", help="Skip nvfp4 tests")
+    parser.add_argument("--skip-vllm", action="store_true", help="Skip vLLM prefix cache tests")
+    parser.add_argument("--skip-quant", action="store_true", help="Skip quantization tests")
     args = parser.parse_args()
 
     output_dir = Path(args.output).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     log.info("=" * 60)
-    log.info("MoE Routing Patch Benchmark Suite")
+    log.info("MoE Routing Patch Benchmark Suite (vLLM-native)")
     log.info("Original: %s", args.original)
     log.info("Patched:  %s", args.patched)
     log.info("Output:   %s", output_dir)
+    log.info("TP size:  %d", args.tp)
     log.info("=" * 60)
 
     all_results: Dict[str, Any] = {
@@ -719,7 +755,7 @@ def main():
     # ── Test 1: Determinism ──
     for label, model_path in [("original", args.original), ("patched", args.patched)]:
         try:
-            r = test_determinism(model_path, output_dir, label)
+            r = test_determinism(model_path, output_dir, label, tensor_parallel_size=args.tp)
             all_results[f"determinism_{label}"] = r
         except Exception as e:
             log.error("determinism test [%s] failed: %s", label, e, exc_info=True)
@@ -729,7 +765,7 @@ def main():
     if not args.skip_quality:
         for label, model_path in [("original", args.original), ("patched", args.patched)]:
             try:
-                r = test_quality_lm_eval(model_path, output_dir, label)
+                r = test_quality_lm_eval(model_path, output_dir, label, tensor_parallel_size=args.tp)
                 all_results[f"quality_{label}"] = r
             except Exception as e:
                 log.error("quality test [%s] failed: %s", label, e, exc_info=True)
@@ -750,21 +786,21 @@ def main():
                 all_results[f"vllm_{label}"] = r
             except Exception as e:
                 log.error("vLLM test [%s] failed: %s", label, e, exc_info=True)
-                all_results[f"vllm_{label}"] = {"error": str(e), "skipped": True}
+                all_results[f"vllm_{label}"] = {"error": str(e)}
     else:
-        log.info("skipping vLLM tests (--skip-vllm)")
+        log.info("skipping vLLM prefix cache tests (--skip-vllm)")
 
-    # ── Test 4: nvfp4 ──
-    if not args.skip_nvfp4:
+    # ── Test 4: Quantized determinism ──
+    if not args.skip_quant:
         for label, model_path in [("original", args.original), ("patched", args.patched)]:
             try:
-                r = test_nvfp4_determinism(model_path, output_dir, label, tensor_parallel_size=args.tp)
-                all_results[f"nvfp4_{label}"] = r
+                r = test_quantized_determinism(model_path, output_dir, label, tensor_parallel_size=args.tp)
+                all_results[f"quant_{label}"] = r
             except Exception as e:
-                log.error("nvfp4 test [%s] failed: %s", label, e, exc_info=True)
-                all_results[f"nvfp4_{label}"] = {"error": str(e), "skipped": True}
+                log.error("quant test [%s] failed: %s", label, e, exc_info=True)
+                all_results[f"quant_{label}"] = {"error": str(e), "skipped": True}
     else:
-        log.info("skipping nvfp4 tests (--skip-nvfp4)")
+        log.info("skipping quantization tests (--skip-quant)")
 
     # ── Report ──
     total_time = time.time() - t_total
