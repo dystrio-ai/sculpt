@@ -41,14 +41,9 @@ def _get_moe_module(model, layer_idx: int):
 
 
 def _get_experts_and_gate(moe_module):
-    """Extract expert list and gating network."""
-    experts = getattr(moe_module, "experts", None)
-    gate = getattr(moe_module, "gate", None) or getattr(moe_module, "router", None)
-    if experts is None:
-        raise ValueError("Cannot find experts in MoE module")
-    if gate is None:
-        raise ValueError("Cannot find gate/router in MoE module")
-    return experts, gate
+    """Extract expert list and gating network. Delegates to _calibrate_moe."""
+    from .._calibrate_moe import _get_experts_and_gate as _get_eg
+    return _get_eg(moe_module)
 
 
 def _merge_expert_weights(

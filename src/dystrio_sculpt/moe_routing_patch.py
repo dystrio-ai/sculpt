@@ -193,13 +193,13 @@ def calibrate_routing_patch(
     from ._calibrate_moe import (
         collect_all_layers_covariance_and_utilization,
         _get_moe_module,
-        _get_experts_and_gate,
+        _get_num_experts,
+        _get_top_k,
     )
 
     first_moe = _get_moe_module(model, 0)
-    experts, _ = _get_experts_and_gate(first_moe)
-    n_experts = len(experts)
-    top_k = getattr(first_moe, "num_experts_per_tok", None) or getattr(first_moe, "top_k", 2)
+    n_experts = _get_num_experts(first_moe, model)
+    top_k = _get_top_k(first_moe)
 
     _log.info(
         "calibrating routing patch: %d experts, top-%d, max_tokens=%d",
@@ -334,7 +334,7 @@ def apply_routing_patch(model, patch: RoutingPatch) -> int:
 
     Returns the number of layers patched.
     """
-    from ._calibrate_moe import _get_moe_module, _get_experts_and_gate
+    from ._calibrate_moe import _get_moe_module, _get_gate
 
     patched = 0
     for li, classes in patch.layers.items():
@@ -344,7 +344,7 @@ def apply_routing_patch(model, patch: RoutingPatch) -> int:
 
         try:
             moe = _get_moe_module(model, li)
-            _, gate = _get_experts_and_gate(moe)
+            gate = _get_gate(moe)
         except (ValueError, AttributeError):
             _log.warning("layer %d: cannot locate MoE module, skipping", li)
             continue
@@ -377,14 +377,14 @@ def apply_routing_patch(model, patch: RoutingPatch) -> int:
 
 def remove_routing_patch(model) -> int:
     """Remove routing canonicalization, restoring original routers."""
-    from ._calibrate_moe import _get_moe_module, _get_experts_and_gate, _get_layers_module
+    from ._calibrate_moe import _get_moe_module, _get_gate, _get_layers_module
 
     removed = 0
     n_layers = len(_get_layers_module(model))
     for li in range(n_layers):
         try:
             moe = _get_moe_module(model, li)
-            _, gate = _get_experts_and_gate(moe)
+            gate = _get_gate(moe)
         except (ValueError, AttributeError):
             continue
 
@@ -416,7 +416,7 @@ def bake_routing_patch(model, patch: RoutingPatch) -> int:
 
     Returns the number of layers modified.
     """
-    from ._calibrate_moe import _get_moe_module, _get_experts_and_gate
+    from ._calibrate_moe import _get_moe_module, _get_gate
 
     modified = 0
     total_swaps = 0
@@ -428,7 +428,7 @@ def bake_routing_patch(model, patch: RoutingPatch) -> int:
 
         try:
             moe = _get_moe_module(model, li)
-            _, gate = _get_experts_and_gate(moe)
+            gate = _get_gate(moe)
         except (ValueError, AttributeError):
             _log.warning("layer %d: cannot locate router, skipping", li)
             continue

@@ -1,22 +1,34 @@
 """Expert-level calibration for MoE models.
 
-Mirrors _calibrate.py but operates at expert granularity:
-  - Expert operator sensitivity: how much does zeroing expert E change the MoE output?
-  - Expert covariance: how correlated are experts' outputs on calibration data?
-  - Expert utilization: how frequently does the router select each expert?
+Two calibration modes:
 
-These feed into the same Physarum conductance → structural selection pipeline
-used for dense neuron-block pruning, but with experts as the selection unit.
+1. **Router-based** (works with ANY expert implementation, including fused):
+   Uses gate logit correlation to identify which experts compete for the same
+   tokens. This is the primary mode for routing canonicalization.
+
+2. **Expert-output-based** (requires iterable experts, e.g. ModuleList):
+   Runs individual expert forwards to build output covariance. Used for
+   expert-level structural compression (drop/merge).
+
+The router-based mode is preferred for the routing patch pipeline because:
+  - It works with fused experts (Qwen3.5 Qwen3_5MoeExperts, etc.)
+  - It's faster (no extra expert forward passes)
+  - It directly measures routing interchangeability
 """
 
 from __future__ import annotations
 
+import logging
 import math
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 
+_log = logging.getLogger(__name__)
+
+
+# ── Model structure helpers ───────────────────────────────────────────
 
 def _get_layers_module(model):
     """Locate the decoder layer list, handling multimodal wrappers.
@@ -74,21 +86,135 @@ def _get_moe_module(model, layer_idx: int):
     raise ValueError(f"Cannot locate MoE module in layer {layer_idx}")
 
 
-def _get_experts_and_gate(moe_module):
-    """Extract the expert list and gating network from an MoE module."""
-    experts = None
-    gate = None
-    if hasattr(moe_module, "experts"):
-        experts = moe_module.experts
+def _get_gate(moe_module) -> torch.nn.Module:
+    """Extract the gating/router network from an MoE module."""
     if hasattr(moe_module, "gate"):
-        gate = moe_module.gate
-    elif hasattr(moe_module, "router"):
-        gate = moe_module.router
+        return moe_module.gate
+    if hasattr(moe_module, "router"):
+        return moe_module.router
+    raise ValueError("Cannot find gate/router in MoE module")
+
+
+def _get_num_experts(moe_module, model=None) -> int:
+    """Get the number of experts, handling both ModuleList and fused implementations."""
+    experts = getattr(moe_module, "experts", None)
+    if experts is not None:
+        try:
+            return len(experts)
+        except TypeError:
+            pass
+
+    gate = _get_gate(moe_module)
+    if hasattr(gate, "weight"):
+        return gate.weight.shape[0]
+
+    if model is not None:
+        cfg = model.config
+        if hasattr(cfg, "text_config") and cfg.text_config is not None:
+            cfg = cfg.text_config
+        for attr in ("num_experts", "num_local_experts"):
+            if hasattr(cfg, attr):
+                return getattr(cfg, attr)
+
+    raise ValueError("Cannot determine number of experts")
+
+
+def _get_top_k(moe_module) -> int:
+    """Get the number of experts selected per token."""
+    return getattr(moe_module, "num_experts_per_tok", None) or getattr(moe_module, "top_k", 2)
+
+
+def _experts_are_iterable(moe_module) -> bool:
+    """Check if experts can be individually indexed (ModuleList vs fused)."""
+    experts = getattr(moe_module, "experts", None)
+    if experts is None:
+        return False
+    try:
+        len(experts)
+        _ = experts[0]
+        return True
+    except (TypeError, IndexError, KeyError):
+        return False
+
+
+def _get_experts_and_gate(moe_module):
+    """Extract expert list and gating network. For backward compat with iterable experts."""
+    experts = getattr(moe_module, "experts", None)
+    gate = _get_gate(moe_module)
     if experts is None:
         raise ValueError("Cannot find experts in MoE module")
-    if gate is None:
-        raise ValueError("Cannot find gate/router in MoE module")
     return experts, gate
+
+
+# ── Router-based calibration (works with fused experts) ───────────────
+
+@torch.no_grad()
+def collect_router_logit_covariance(
+    model, tokenizer, layer_idx: int, texts: Sequence[str],
+    max_len: int, device: str, max_tokens: int = 30_000,
+) -> Dict[str, Any]:
+    """Build expert covariance from router logit correlation.
+
+    For each token, captures the full gate logit vector [n_experts].
+    Builds a covariance matrix over these logits across tokens.
+    Experts with correlated logits compete for the same tokens and
+    are candidates for routing canonicalization.
+
+    Works with ANY expert implementation (fused or ModuleList).
+    """
+    moe = _get_moe_module(model, layer_idx)
+    gate = _get_gate(moe)
+    n_experts = _get_num_experts(moe, model)
+    top_k = _get_top_k(moe)
+
+    sum_z = torch.zeros(n_experts, dtype=torch.float64, device=device)
+    sum_zz = torch.zeros(n_experts, n_experts, dtype=torch.float64, device=device)
+    sum_mag = torch.zeros(n_experts, dtype=torch.float64, device=device)
+    total_tokens = 0
+
+    def hook(module, inputs, output):
+        nonlocal sum_z, sum_zz, sum_mag, total_tokens
+        if total_tokens >= max_tokens:
+            return
+        hidden = inputs[0]
+        if hidden.dim() == 3:
+            hidden = hidden.reshape(-1, hidden.shape[-1])
+        T = hidden.shape[0]
+        budget = max_tokens - total_tokens
+        if T > budget:
+            hidden = hidden[:budget]
+            T = budget
+
+        gate_dev = next(gate.parameters()).device
+        logits = gate(hidden.to(gate_dev).float())
+        probs = F.softmax(logits, dim=-1).to(torch.float64)
+
+        sum_z += probs.sum(dim=0).to(device)
+        sum_zz += (probs.T @ probs).to(device)
+        sum_mag += probs.abs().mean(dim=0).to(device)
+        total_tokens += T
+
+    h = moe.register_forward_hook(hook)
+    model.eval()
+    for t in texts:
+        if total_tokens >= max_tokens:
+            break
+        inp = tokenizer(t, return_tensors="pt", truncation=True, max_length=max_len)
+        first_device = next(model.parameters()).device
+        inp = {k: v.to(first_device) for k, v in inp.items()}
+        model(**inp, use_cache=False)
+    h.remove()
+
+    N = max(total_tokens, 1)
+    mean_z = sum_z / N
+    D = (sum_zz / N) - mean_z.unsqueeze(1) * mean_z.unsqueeze(0)
+
+    return {
+        "D": D.cpu(),
+        "block_energy": (sum_mag / N).cpu(),
+        "n_blocks": n_experts,
+        "feature_multiplier": 1,
+    }
 
 
 @torch.no_grad()
@@ -98,15 +224,12 @@ def collect_expert_utilization(
 ) -> Dict[str, Any]:
     """Measure per-expert utilization: selection frequency and average routing weight.
 
-    Returns:
-        expert_frequency: [num_experts] — fraction of tokens that select each expert
-        expert_avg_weight: [num_experts] — average gating weight when selected
-        total_tokens: int — number of tokens observed
+    Works with ANY expert implementation (only uses the gate).
     """
     moe = _get_moe_module(model, layer_idx)
-    experts, gate = _get_experts_and_gate(moe)
-    n_experts = len(experts)
-    top_k = getattr(moe, "num_experts_per_tok", None) or getattr(moe, "top_k", 2)
+    gate = _get_gate(moe)
+    n_experts = _get_num_experts(moe, model)
+    top_k = _get_top_k(moe)
 
     expert_count = torch.zeros(n_experts, device=device, dtype=torch.float64)
     expert_weight_sum = torch.zeros(n_experts, device=device, dtype=torch.float64)
@@ -125,13 +248,14 @@ def collect_expert_utilization(
             hidden = hidden[:budget]
             T = budget
 
-        logits = gate(hidden.float())
+        gate_dev = next(gate.parameters()).device
+        logits = gate(hidden.to(gate_dev).float())
         weights = F.softmax(logits, dim=-1)
         topk_weights, topk_indices = torch.topk(weights, top_k, dim=-1)
 
         for k in range(top_k):
-            idx = topk_indices[:, k]
-            w = topk_weights[:, k].to(torch.float64)
+            idx = topk_indices[:, k].to(device)
+            w = topk_weights[:, k].to(torch.float64).to(device)
             expert_count.scatter_add_(0, idx.long(), torch.ones_like(w))
             expert_weight_sum.scatter_add_(0, idx.long(), w)
 
@@ -143,7 +267,8 @@ def collect_expert_utilization(
         if total_tokens >= max_tokens:
             break
         inp = tokenizer(t, return_tensors="pt", truncation=True, max_length=max_len)
-        inp = {k: v.to(device) for k, v in inp.items()}
+        first_device = next(model.parameters()).device
+        inp = {k: v.to(first_device) for k, v in inp.items()}
         model(**inp, use_cache=False)
     h.remove()
 
@@ -157,6 +282,8 @@ def collect_expert_utilization(
     }
 
 
+# ── Expert-output-based calibration (requires iterable experts) ───────
+
 @torch.no_grad()
 def collect_expert_sensitivity(
     model, tokenizer, layer_idx: int, texts: Sequence[str],
@@ -164,14 +291,17 @@ def collect_expert_sensitivity(
 ) -> Dict[str, Any]:
     """Expert operator sensitivity: how much does zeroing each expert change the MoE output?
 
-    For each token, we compute the full MoE output, then simulate dropping each
-    selected expert and measure the L2 delta. This is the expert-level analog
-    of collect_block_operator_sensitivity_swiglu.
+    REQUIRES iterable experts (ModuleList). Will raise TypeError on fused experts.
     """
     moe = _get_moe_module(model, layer_idx)
+    if not _experts_are_iterable(moe):
+        raise TypeError(
+            "collect_expert_sensitivity requires iterable experts (ModuleList). "
+            "This model uses fused experts. Use router-based calibration instead."
+        )
     experts, gate = _get_experts_and_gate(moe)
     n_experts = len(experts)
-    top_k = getattr(moe, "num_experts_per_tok", None) or getattr(moe, "top_k", 2)
+    top_k = _get_top_k(moe)
 
     sensitivity = torch.zeros(n_experts, device=device, dtype=torch.float64)
     energy = torch.zeros(n_experts, device=device, dtype=torch.float64)
@@ -207,8 +337,6 @@ def collect_expert_sensitivity(
                 exp_out = experts[eidx](tok_hidden).float()
                 expert_outputs.append((eidx, tok_weights[k].float(), exp_out))
 
-            full_out = sum(w * o for _, w, o in expert_outputs)
-
             for eidx, w, exp_out in expert_outputs:
                 delta = w * exp_out
                 sensitivity[eidx] += delta.pow(2).sum().to(torch.float64)
@@ -242,20 +370,24 @@ def collect_expert_covariance(
     max_len: int, device: str, max_tokens: int = 30_000,
     n_features: int = 3,
 ) -> Dict[str, Any]:
-    """Expert-level covariance matrix for Physarum structural selection.
+    """Expert-level covariance from expert outputs for Physarum structural selection.
 
-    For each token, we extract per-expert features (mean, std, abs_mean of the
-    expert's output) and build a covariance matrix D across experts. This is
-    the expert-level analog of collect_block_geometry_swiglu.
-
-    The resulting D matrix feeds into the same Physarum conductance →
-    structural selection pipeline, with experts taking the place of
-    neuron blocks.
+    REQUIRES iterable experts (ModuleList). For fused experts, use
+    collect_router_logit_covariance instead.
     """
     moe = _get_moe_module(model, layer_idx)
+    if not _experts_are_iterable(moe):
+        _log.info(
+            "layer %d: fused experts detected, falling back to router logit covariance",
+            layer_idx,
+        )
+        return collect_router_logit_covariance(
+            model, tokenizer, layer_idx, texts, max_len, device, max_tokens,
+        )
+
     experts, gate = _get_experts_and_gate(moe)
     n_experts = len(experts)
-    top_k = getattr(moe, "num_experts_per_tok", None) or getattr(moe, "top_k", 2)
+    top_k = _get_top_k(moe)
     F_dim = n_features
     dim = F_dim * n_experts
 
@@ -337,24 +469,18 @@ def collect_expert_covariance(
     }
 
 
-# ── Batch calibration (all layers in one pass) ────────────────────────
-
-import logging as _logging
-
-_log = _logging.getLogger(__name__)
-
+# ── Batch calibration (all layers in one pass, router-based) ─────────
 
 @torch.no_grad()
 def collect_all_layers_covariance_and_utilization(
     model, tokenizer, texts: Sequence[str],
     max_len: int = 256, device: str = "cuda",
-    max_tokens: int = 20_000, n_features: int = 3,
+    max_tokens: int = 20_000,
 ) -> Dict[int, Dict[str, Any]]:
     """Collect expert covariance + utilization for ALL MoE layers in a single forward sweep.
 
-    Instead of running separate forward passes per layer, this registers hooks
-    on every MoE layer simultaneously. One pass through the calibration texts
-    yields data for all layers.
+    Uses router logit correlation (not expert outputs), so it works with
+    any expert implementation including fused experts.
 
     Returns: {layer_idx: {"covariance": {...}, "utilization": {...}}}
     """
@@ -374,11 +500,8 @@ def collect_all_layers_covariance_and_utilization(
 
     first_li = next(iter(moe_layers))
     first_moe = moe_layers[first_li]
-    experts_0, gate_0 = _get_experts_and_gate(first_moe)
-    n_experts = len(experts_0)
-    top_k = getattr(first_moe, "num_experts_per_tok", None) or getattr(first_moe, "top_k", 2)
-    F_dim = n_features
-    dim = F_dim * n_experts
+    n_experts = _get_num_experts(first_moe, model)
+    top_k = _get_top_k(first_moe)
 
     _log.info(
         "batch calibration: %d MoE layers, %d experts, top-%d, max_tokens=%d",
@@ -389,19 +512,18 @@ def collect_all_layers_covariance_and_utilization(
         __slots__ = ("sum_z", "sum_zz", "sum_mag", "expert_count",
                      "expert_weight_sum", "tokens")
         def __init__(self, dev):
-            self.sum_z = torch.zeros(dim, dtype=torch.float64, device=dev)
-            self.sum_zz = torch.zeros(dim, dim, dtype=torch.float64, device=dev)
+            self.sum_z = torch.zeros(n_experts, dtype=torch.float64, device=dev)
+            self.sum_zz = torch.zeros(n_experts, n_experts, dtype=torch.float64, device=dev)
             self.sum_mag = torch.zeros(n_experts, dtype=torch.float64, device=dev)
             self.expert_count = torch.zeros(n_experts, dtype=torch.float64, device=dev)
             self.expert_weight_sum = torch.zeros(n_experts, dtype=torch.float64, device=dev)
             self.tokens = 0
 
-    # Each layer's state lives on the device where that layer's gate resides
     states: Dict[int, LayerState] = {}
     total_tokens = [0]
 
     for li, moe in moe_layers.items():
-        _, gate = _get_experts_and_gate(moe)
+        gate = _get_gate(moe)
         gate_device = next(gate.parameters()).device
         states[li] = LayerState(gate_device)
 
@@ -420,52 +542,24 @@ def collect_all_layers_covariance_and_utilization(
                 hidden = hidden[:budget]
                 T = budget
 
-            experts, gate = _get_experts_and_gate(moe_mod)
+            gate = _get_gate(moe_mod)
             gate_dev = next(gate.parameters()).device
             hidden_f = hidden.to(gate_dev).float()
             logits = gate(hidden_f)
-            weights = F.softmax(logits, dim=-1)
-            topk_weights, topk_indices = torch.topk(weights, top_k, dim=-1)
-            topk_weights_norm = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            probs = F.softmax(logits, dim=-1)
 
-            # --- Utilization ---
+            probs_d = probs.to(torch.float64)
+            state.sum_z += probs_d.sum(dim=0)
+            state.sum_zz += probs_d.T @ probs_d
+            state.sum_mag += probs_d.abs().mean(dim=0)
+            state.tokens += T
+
+            topk_weights, topk_indices = torch.topk(probs, top_k, dim=-1)
             for k in range(top_k):
                 idx = topk_indices[:, k]
                 w = topk_weights[:, k].to(torch.float64)
-                state.expert_count.scatter_add_(0, idx.long().to(state.expert_count.device),
-                                                torch.ones_like(w).to(state.expert_count.device))
-                state.expert_weight_sum.scatter_add_(0, idx.long().to(state.expert_weight_sum.device),
-                                                     w.to(state.expert_weight_sum.device))
-
-            # --- Covariance features (subsample for speed) ---
-            batch_size = min(T, 128)
-            z = torch.zeros(batch_size, dim, dtype=torch.float64, device=gate_dev)
-
-            for k in range(top_k):
-                batch_indices = topk_indices[:batch_size, k]
-                batch_weights = topk_weights_norm[:batch_size, k].to(torch.float64)
-                unique_experts = batch_indices.unique()
-                for eidx in unique_experts:
-                    mask = batch_indices == eidx
-                    if not mask.any():
-                        continue
-                    eidx_int = eidx.item()
-                    exp_in = hidden_f[:batch_size][mask]
-                    exp_dev = next(experts[eidx_int].parameters()).device
-                    exp_out = experts[eidx_int](exp_in.to(exp_dev)).float().to(torch.float64).to(gate_dev)
-                    w = batch_weights[mask].unsqueeze(1)
-                    weighted_out = w * exp_out
-
-                    base = F_dim * eidx_int
-                    z[mask, base] += weighted_out.mean(dim=-1)
-                    z[mask, base + 1] += weighted_out.std(dim=-1, correction=0)
-                    z[mask, base + 2] += weighted_out.abs().mean(dim=-1)
-                    state.sum_mag[eidx_int] += weighted_out.abs().mean(dim=-1).sum().to(state.sum_mag.device)
-
-            z_on_dev = z.to(state.sum_z.device)
-            state.sum_z += z_on_dev.sum(dim=0)
-            state.sum_zz += z_on_dev.T @ z_on_dev
-            state.tokens += batch_size
+                state.expert_count.scatter_add_(0, idx.long(), torch.ones_like(w))
+                state.expert_weight_sum.scatter_add_(0, idx.long(), w)
 
         return hook
 
@@ -479,7 +573,6 @@ def collect_all_layers_covariance_and_utilization(
         if total_tokens[0] >= max_tokens:
             break
         inp = tokenizer(t, return_tensors="pt", truncation=True, max_length=max_len)
-        # device_map="auto" handles input placement via model.forward
         first_device = next(model.parameters()).device
         inp = {k: v.to(first_device) for k, v in inp.items()}
         model(**inp, use_cache=False)
@@ -494,17 +587,17 @@ def collect_all_layers_covariance_and_utilization(
 
     results: Dict[int, Dict[str, Any]] = {}
     for li, state in states.items():
-        N_cov = max(state.tokens, 1)
+        N = max(state.tokens, 1)
         N_util = max(total_tokens[0], 1)
-        mean_z = state.sum_z / N_cov
-        D = (state.sum_zz / N_cov) - mean_z.unsqueeze(1) * mean_z.unsqueeze(0)
+        mean_z = state.sum_z / N
+        D = (state.sum_zz / N) - mean_z.unsqueeze(1) * mean_z.unsqueeze(0)
 
         results[li] = {
             "covariance": {
                 "D": D.cpu(),
-                "block_energy": (state.sum_mag / N_cov).cpu(),
+                "block_energy": (state.sum_mag / N).cpu(),
                 "n_blocks": n_experts,
-                "feature_multiplier": F_dim,
+                "feature_multiplier": 1,
             },
             "utilization": {
                 "expert_frequency": (state.expert_count / N_util).cpu(),
