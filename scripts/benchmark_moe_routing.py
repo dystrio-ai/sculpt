@@ -156,15 +156,6 @@ def _ensure_local_model(model_id: str) -> str:
 
 
 def _free_gpu():
-    """Aggressively free GPU memory, including vLLM zombie worker processes."""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    # vLLM's multiprocess executor can leave zombie workers holding GPU memory
-    import subprocess as _sp
-    for proc_name in ("vllm", "ray", "multiproc_executor"):
-        _sp.run(["pkill", "-f", proc_name], capture_output=True)
-    import time; time.sleep(3)
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -194,9 +185,27 @@ def _create_vllm_engine(
 
 
 def _destroy_vllm_engine(llm):
+    # Shut down vLLM's internal processes before deleting
+    try:
+        if hasattr(llm, "llm_engine"):
+            if hasattr(llm.llm_engine, "shutdown"):
+                llm.llm_engine.shutdown()
+            elif hasattr(llm.llm_engine, "model_executor"):
+                ex = llm.llm_engine.model_executor
+                if hasattr(ex, "shutdown"):
+                    ex.shutdown()
+    except Exception:
+        pass
     del llm
     _free_gpu()
+    # Kill any orphaned vLLM worker processes (but NOT our parent process)
+    import subprocess as _sp
+    _sp.run(
+        "ps aux | grep '[m]ultiproc_executor' | awk '{print $2}' | xargs -r kill -9",
+        shell=True, capture_output=True,
+    )
     time.sleep(5)
+    _free_gpu()
 
 
 # ─── Test 1: Routing Determinism ─────────────────────────────────────
