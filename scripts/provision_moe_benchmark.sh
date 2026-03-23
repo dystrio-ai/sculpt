@@ -22,12 +22,25 @@ set -euo pipefail
 BRANCH="experimental/distill-repair"
 REPO="https://github.com/clusteroptimizerengine/BumbleB.git"
 WORKDIR="$HOME/BumbleB"
-OUTPUT_DIR="$HOME/moe_benchmark_results"
-LOG_FILE="$HOME/moe_benchmark.log"
 
 ORIGINAL_MODEL="${ORIGINAL_MODEL:-Qwen/Qwen3.5-122B-A10B}"
 PATCHED_MODEL="${PATCHED_MODEL:-dystrio/Qwen3.5-122B-A10B-CacheReady}"
 TP_SIZE="${TP_SIZE:-4}"
+
+# Use /ephemeral if available (large disk), otherwise fall back to $HOME
+if [ -d "/ephemeral" ] && [ -w "/ephemeral" ]; then
+    STORAGE="/ephemeral"
+elif [ -d "/mnt" ] && [ -w "/mnt" ]; then
+    STORAGE="/mnt"
+else
+    STORAGE="$HOME"
+fi
+
+OUTPUT_DIR="${STORAGE}/moe_benchmark_results"
+LOG_FILE="${STORAGE}/moe_benchmark.log"
+export HF_HOME="${STORAGE}/hf_cache"
+export XET_CACHE_HOME="${STORAGE}/hf_cache/xet"
+mkdir -p "$HF_HOME" "$OUTPUT_DIR"
 
 echo "============================================================"
 echo "  MoE Routing Patch — Benchmark Suite"

@@ -117,12 +117,20 @@ def build_model_card(
     tier_scores: dict,
     all_tiers_scores: dict,
     benchmark_table: str,
+    perf: dict = None,
 ) -> str:
-    """Build a complete model card for one tier."""
+    """Build a complete model card for one tier.
+
+    perf: optional dict with keys like prefill_speedup, decode_speedup,
+          weights_gb, baseline_weights_gb, weights_memory_reduction_pct,
+          prefill_tps, decode_tps, baseline_prefill_tps, baseline_decode_tps,
+          num_params, steady_state_alloc_gb, etc.
+    """
     meta = TIER_META[tier_name]
     model_short = base_model.split("/")[-1]
     hf_model_id = f"{org}/{model_short}-{meta['suffix']}"
     size_cut = round((1 - meta["keep_frac"]) * 100)
+    perf = perf or {}
 
     tier_links = []
     for tn, tm in TIER_META.items():
@@ -141,6 +149,37 @@ def build_model_card(
             scores_section += f"| {task} | {score} | {base} | {diff:+.1f} |\n"
         else:
             scores_section += f"| {task} | {score} | — | — |\n"
+
+    perf_section = ""
+    if perf:
+        perf_rows = []
+        w = perf.get("weights_gb")
+        bw = perf.get("baseline_weights_gb")
+        wr = perf.get("weights_memory_reduction_pct")
+        if w and bw:
+            perf_rows.append(f"| Model size | {w:.1f} GB | {bw:.1f} GB | {wr:+.1f}% |" if wr else f"| Model size | {w:.1f} GB | {bw:.1f} GB | — |")
+        np_c = perf.get("num_params")
+        if np_c:
+            perf_rows.append(f"| Parameters | {np_c:,} | — | — |")
+        pt = perf.get("prefill_tps")
+        bpt = perf.get("baseline_prefill_tps")
+        ps = perf.get("prefill_speedup")
+        if pt and bpt:
+            pct = f"{(ps - 1) * 100:+.0f}%" if ps else "—"
+            perf_rows.append(f"| Prefill throughput | {pt:,.0f} tok/s | {bpt:,.0f} tok/s | {pct} |")
+        dt = perf.get("decode_tps")
+        bdt = perf.get("baseline_decode_tps")
+        ds = perf.get("decode_speedup")
+        if dt and bdt:
+            dpct = f"{(ds - 1) * 100:+.0f}%" if ds else "—"
+            perf_rows.append(f"| Decode throughput | {dt:,.0f} tok/s | {bdt:,.0f} tok/s | {dpct} |")
+        ss = perf.get("steady_state_alloc_gb")
+        bss = perf.get("baseline_steady_state_alloc_gb")
+        ssr = perf.get("steady_state_memory_reduction_pct")
+        if ss and bss:
+            perf_rows.append(f"| VRAM (steady state) | {ss:.1f} GB | {bss:.1f} GB | {ssr:+.1f}% |" if ssr else f"| VRAM (steady state) | {ss:.1f} GB | {bss:.1f} GB | — |")
+        if perf_rows:
+            perf_section = "## Performance\n\n| Metric | Sculpt | Baseline | Change |\n|--------|-------:|----------|--------|\n" + "\n".join(perf_rows) + "\n\n> KV-cache footprint is unchanged — Sculpt only compresses FFN layers, not attention.\n\n"
 
     card = f"""---
 license: apache-2.0
@@ -184,7 +223,7 @@ This is the **{meta['tier_display']}** tier of [{model_short}](https://huggingfa
 |---|---:|---:|---:|
 {scores_section}
 
-## Quick Start
+{perf_section}## Quick Start
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -209,7 +248,7 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 
 ## Technical Details
 
-- **Method:** Structural FFN pruning with Physarum-inspired block selection + live teacher distillation (alpha=0.5)
+- **Method:** Structural FFN pruning with importance-aware block selection + live teacher distillation (alpha=0.5)
 - **Keep fraction:** {meta['keep_frac']} ({size_cut}% of FFN neurons removed)
 - **Repair:** 8-stage cosine-LR fine-tuning with best-checkpoint restore
 - **Training data:** general_v2 mixture (WikiText, OpenHermes 2.5, MMLU, HellaSwag, GSM8K, OpenOrca)
