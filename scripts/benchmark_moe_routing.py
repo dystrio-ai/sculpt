@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """MoE Routing Patch Benchmark Suite.
 
-Validates the Physarum routing canonicalization patch across four dimensions:
+Validates the routing canonicalization patch across four dimensions:
 
   1. Routing Determinism — identical inputs → identical outputs (via vLLM)
   2. Quality Preservation — full lm_eval benchmarks with vLLM backend
@@ -107,23 +107,39 @@ UNIQUE_PROMPTS = [
 
 # ─── Helpers ─────────────────────────────────────────────────────────
 
+def _fix_model_configs(model_dir: Path) -> None:
+    """Fix known config issues in our patched model."""
+    config_path = model_dir / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            cfg = json.load(f)
+        if cfg.get("model_type") == "qwen3_5_moe_text":
+            log.info("fixing model_type qwen3_5_moe_text → qwen3_5_moe")
+            cfg["model_type"] = "qwen3_5_moe"
+            with open(config_path, "w") as f:
+                json.dump(cfg, f, indent=2)
+
+    tok_path = model_dir / "tokenizer_config.json"
+    if tok_path.exists():
+        with open(tok_path) as f:
+            tok_cfg = json.load(f)
+        if tok_cfg.get("tokenizer_class") == "TokenizersBackend":
+            log.info("fixing tokenizer_class TokenizersBackend → PreTrainedTokenizerFast")
+            tok_cfg["tokenizer_class"] = "PreTrainedTokenizerFast"
+            with open(tok_path, "w") as f:
+                json.dump(tok_cfg, f, indent=2)
+
+
 def _ensure_local_model(model_id: str) -> str:
     """Download a HF model to local cache and fix config if needed.
 
-    Fixes the known issue where our patched model has model_type
-    'qwen3_5_moe_text' which older transformers versions don't recognize.
+    Fixes known issues with our patched model:
+    - model_type 'qwen3_5_moe_text' not recognized by older transformers
+    - tokenizer_class 'TokenizersBackend' is invalid
     Returns the local path to use.
     """
     if Path(model_id).exists():
-        config_path = Path(model_id) / "config.json"
-        if config_path.exists():
-            with open(config_path) as f:
-                cfg = json.load(f)
-            if cfg.get("model_type") == "qwen3_5_moe_text":
-                log.info("fixing model_type qwen3_5_moe_text → qwen3_5_moe in %s", config_path)
-                cfg["model_type"] = "qwen3_5_moe"
-                with open(config_path, "w") as f:
-                    json.dump(cfg, f, indent=2)
+        _fix_model_configs(Path(model_id))
         return model_id
 
     from huggingface_hub import snapshot_download
@@ -135,16 +151,7 @@ def _ensure_local_model(model_id: str) -> str:
         log.info("downloading %s → %s", model_id, local_dir)
         snapshot_download(repo_id=model_id, local_dir=str(local_dir))
 
-    config_path = local_dir / "config.json"
-    if config_path.exists():
-        with open(config_path) as f:
-            cfg = json.load(f)
-        if cfg.get("model_type") == "qwen3_5_moe_text":
-            log.info("fixing model_type qwen3_5_moe_text → qwen3_5_moe in %s", config_path)
-            cfg["model_type"] = "qwen3_5_moe"
-            with open(config_path, "w") as f:
-                json.dump(cfg, f, indent=2)
-
+    _fix_model_configs(local_dir)
     return str(local_dir)
 
 
