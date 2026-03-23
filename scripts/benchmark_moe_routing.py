@@ -156,6 +156,15 @@ def _ensure_local_model(model_id: str) -> str:
 
 
 def _free_gpu():
+    """Aggressively free GPU memory, including vLLM zombie worker processes."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    # vLLM's multiprocess executor can leave zombie workers holding GPU memory
+    import subprocess as _sp
+    for proc_name in ("vllm", "ray", "multiproc_executor"):
+        _sp.run(["pkill", "-f", proc_name], capture_output=True)
+    import time; time.sleep(3)
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
