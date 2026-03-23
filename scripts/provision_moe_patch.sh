@@ -132,18 +132,32 @@ OUTPUT_DIR = '${OUTPUT_DIR}'
 
 # ── Load model ──
 log.info('loading tokenizer for %s', MODEL_ID)
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 
-log.info('loading model (device_map=auto across %d GPUs)...', torch.cuda.device_count())
+# Use the FULL multimodal model class to preserve vision encoder + MTP weights.
+# AutoModelForCausalLM loads only the text backbone, losing vision/MTP on save.
+log.info('loading full model (device_map=auto across %d GPUs)...', torch.cuda.device_count())
 t0 = time.time()
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID,
-    torch_dtype=torch.bfloat16,
-    device_map='auto',
-    trust_remote_code=True,
-)
+try:
+    from transformers import AutoModelForVision2Seq
+    model = AutoModelForVision2Seq.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        device_map='auto',
+        trust_remote_code=True,
+    )
+    log.info('loaded as multimodal (ForVision2Seq/ForConditionalGeneration)')
+except Exception as e:
+    log.warning('multimodal load failed (%s), falling back to AutoModelForCausalLM', e)
+    log.warning('vision encoder and MTP weights will NOT be preserved')
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        device_map='auto',
+        trust_remote_code=True,
+    )
 load_time = time.time() - t0
 n_params = sum(p.numel() for p in model.parameters())
 log.info('model loaded in %.0fs: %.1fB parameters', load_time, n_params / 1e9)
@@ -166,7 +180,7 @@ texts = [t for t in ds['text'][:5000] if len(t.strip()) > 100][:500]
 log.info('calibration corpus: %d texts', len(texts))
 
 # ── Calibrate (batch mode — all 48 layers in one pass) ──
-log.info('starting Physarum batch calibration...')
+log.info('starting batch calibration...')
 from dystrio_sculpt.moe_routing_patch import calibrate_routing_patch, bake_routing_patch
 
 t0 = time.time()
@@ -236,7 +250,7 @@ api.create_repo(repo_id, exist_ok=True, private=False)
 api.upload_folder(
     folder_path=OUTPUT_DIR,
     repo_id=repo_id,
-    commit_message='Baked Physarum routing canonicalization for prefix cache determinism',
+    commit_message='Baked routing canonicalization for prefix cache determinism',
 )
 log.info('pushed to https://huggingface.co/%s', repo_id)
 
