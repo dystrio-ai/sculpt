@@ -87,7 +87,7 @@ source .venv/bin/activate
 
 pip install --upgrade pip setuptools wheel -q
 pip install vllm -q
-pip install lm_eval -q
+pip install lm_eval ray -q
 pip install -e ".[dev]" -q
 pip install accelerate huggingface_hub -q
 # Ensure transformers is vLLM-compatible (all tests use vLLM natively)

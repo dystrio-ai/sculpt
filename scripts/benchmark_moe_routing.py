@@ -107,6 +107,46 @@ UNIQUE_PROMPTS = [
 
 # ─── Helpers ─────────────────────────────────────────────────────────
 
+def _ensure_local_model(model_id: str) -> str:
+    """Download a HF model to local cache and fix config if needed.
+
+    Fixes the known issue where our patched model has model_type
+    'qwen3_5_moe_text' which older transformers versions don't recognize.
+    Returns the local path to use.
+    """
+    if Path(model_id).exists():
+        config_path = Path(model_id) / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                cfg = json.load(f)
+            if cfg.get("model_type") == "qwen3_5_moe_text":
+                log.info("fixing model_type qwen3_5_moe_text → qwen3_5_moe in %s", config_path)
+                cfg["model_type"] = "qwen3_5_moe"
+                with open(config_path, "w") as f:
+                    json.dump(cfg, f, indent=2)
+        return model_id
+
+    from huggingface_hub import snapshot_download
+    local_dir = Path.home() / "models" / model_id.replace("/", "--")
+    if local_dir.exists() and (local_dir / "config.json").exists():
+        log.info("using cached model at %s", local_dir)
+    else:
+        log.info("downloading %s → %s", model_id, local_dir)
+        snapshot_download(repo_id=model_id, local_dir=str(local_dir))
+
+    config_path = local_dir / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            cfg = json.load(f)
+        if cfg.get("model_type") == "qwen3_5_moe_text":
+            log.info("fixing model_type qwen3_5_moe_text → qwen3_5_moe in %s", config_path)
+            cfg["model_type"] = "qwen3_5_moe"
+            with open(config_path, "w") as f:
+                json.dump(cfg, f, indent=2)
+
+    return str(local_dir)
+
+
 def _free_gpu():
     gc.collect()
     if torch.cuda.is_available():
@@ -129,6 +169,7 @@ def _create_vllm_engine(
         enable_prefix_caching=enable_prefix_caching,
         gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=max_model_len,
+        enforce_eager=True,
     )
     if quantization:
         kwargs["quantization"] = quantization
@@ -290,7 +331,8 @@ def test_quality_lm_eval(
             f"tensor_parallel_size={tensor_parallel_size},"
             "trust_remote_code=True,"
             "gpu_memory_utilization=0.90,"
-            "max_model_len=2048"
+            "max_model_len=2048,"
+            "enforce_eager=True"
         ),
         "--tasks", tasks,
         "--batch_size", "auto",
@@ -743,6 +785,12 @@ def main():
     log.info("Output:   %s", output_dir)
     log.info("TP size:  %d", args.tp)
     log.info("=" * 60)
+
+    # Download and fix patched model config if needed
+    patched_local = _ensure_local_model(args.patched)
+    if patched_local != args.patched:
+        log.info("using local patched model: %s", patched_local)
+        args.patched = patched_local
 
     all_results: Dict[str, Any] = {
         "original_model": args.original,
