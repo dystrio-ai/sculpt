@@ -127,7 +127,8 @@ def _ensure_local_model(model_id: str) -> str:
         return model_id
 
     from huggingface_hub import snapshot_download
-    local_dir = Path.home() / "models" / model_id.replace("/", "--")
+    base = Path(os.environ.get("HF_HOME", Path.home() / "models"))
+    local_dir = base / model_id.replace("/", "--")
     if local_dir.exists() and (local_dir / "config.json").exists():
         log.info("using cached model at %s", local_dir)
     else:
