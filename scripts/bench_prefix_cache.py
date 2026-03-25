@@ -175,12 +175,18 @@ def measure_throughput(
     n_rounds: int = 3,
     n_warmup: int = 20,
     max_new_tokens: int = 64,
+    mode: str = "batch",
 ) -> Dict[str, Any]:
-    """Load model, warm up, measure throughput over multiple rounds."""
+    """Load model, warm up, measure throughput over multiple rounds.
+
+    mode="batch":  submit all prompts at once via llm.generate()
+    mode="online": submit prompts one-at-a-time to simulate sequential
+                   serving where prefix caching actually matters.
+    """
     from vllm import SamplingParams
 
     cache_label = "ON" if prefix_caching else "OFF"
-    log.info("  loading engine (prefix_caching=%s)...", cache_label)
+    log.info("  loading engine (prefix_caching=%s, mode=%s)...", cache_label, mode)
 
     t_load = time.time()
     llm = create_engine(model_path, tp, prefix_caching)
@@ -191,18 +197,26 @@ def measure_throughput(
     prompts = build_shared_prefix_prompts(n_prompts)
     warmup_prompts = build_shared_prefix_prompts(n_warmup)
 
-    # Warmup: run and discard
     log.info("  warmup: %d prompts (discarded)...", n_warmup)
-    _ = llm.generate(warmup_prompts, params)
+    if mode == "online":
+        for wp in warmup_prompts:
+            _ = llm.generate([wp], params)
+    else:
+        _ = llm.generate(warmup_prompts, params)
 
-    # Measurement rounds
     round_throughputs = []
     round_times = []
     for r in range(n_rounds):
         t0 = time.time()
-        outputs = llm.generate(prompts, params)
+        if mode == "online":
+            total_tokens = 0
+            for prompt in prompts:
+                outputs = llm.generate([prompt], params)
+                total_tokens += len(outputs[0].outputs[0].token_ids)
+        else:
+            outputs = llm.generate(prompts, params)
+            total_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
         elapsed = time.time() - t0
-        total_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
         tps = total_tokens / max(elapsed, 1e-9)
         round_throughputs.append(tps)
         round_times.append(elapsed)
@@ -219,6 +233,7 @@ def measure_throughput(
 
     return {
         "prefix_caching": prefix_caching,
+        "mode": mode,
         "n_prompts": n_prompts,
         "n_rounds": n_rounds,
         "n_warmup": n_warmup,
@@ -244,22 +259,18 @@ def generate_report(
         f"**Date**: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
         f"**Hardware**: {results.get('gpu_info', 'N/A')}",
         f"**TP**: {results.get('tp', 'N/A')}",
-        f"**Prompts per round**: {results.get('n_prompts', 200)}",
+        f"**Prompts per round (batch)**: {results.get('n_prompts', 200)}",
         f"**Rounds**: {results.get('n_rounds', 3)}",
         f"**Warmup prompts**: {results.get('n_warmup', 20)}",
+        f"**Modes**: {', '.join(results.get('modes', ['batch']))}",
         "",
     ]
 
     orig = results.get("original", {})
     patch = results.get("patched", {})
 
-    orig_off = orig.get("cache_off", {})
-    orig_on = orig.get("cache_on", {})
-    patch_off = patch.get("cache_off", {})
-    patch_on = patch.get("cache_on", {})
-
     def _fmt(d):
-        if not d:
+        if not d or "error" in d:
             return "—", "—"
         med = d.get("median_tok_s", 0)
         lo = d.get("min_tok_s", 0)
@@ -267,78 +278,92 @@ def generate_report(
         spread = max(hi - med, med - lo)
         return f"{med:.0f}", f"±{spread:.0f}"
 
-    orig_off_med, orig_off_spread = _fmt(orig_off)
-    orig_on_med, orig_on_spread = _fmt(orig_on)
-    patch_off_med, patch_off_spread = _fmt(patch_off)
-    patch_on_med, patch_on_spread = _fmt(patch_on)
-
     def _effect(d_off, d_on):
-        if not d_off or not d_on:
+        if not d_off or not d_on or "error" in d_off or "error" in d_on:
             return "—"
         off = d_off.get("median_tok_s", 0)
         on = d_on.get("median_tok_s", 0)
         if off <= 0:
             return "—"
-        ratio = on / off
-        return f"{ratio:.2f}x"
+        return f"{on / off:.2f}x"
 
-    orig_effect = _effect(orig_off, orig_on)
-    patch_effect = _effect(patch_off, patch_on)
+    for bench_mode in results.get("modes", ["batch"]):
+        off_key = f"{bench_mode}_cache_off"
+        on_key = f"{bench_mode}_cache_on"
 
-    lines.extend([
-        "## Shared-Prefix Throughput (tok/s)",
-        "",
-        "| Model | Cache OFF | Cache ON | Cache Effect |",
-        "|-------|-----------|----------|--------------|",
-        f"| Original | {orig_off_med} {orig_off_spread} | {orig_on_med} {orig_on_spread} | {orig_effect} |",
-        f"| **CacheReady** | **{patch_off_med} {patch_off_spread}** | **{patch_on_med} {patch_on_spread}** | **{patch_effect}** |",
-        "",
-    ])
+        # Fall back to old-style keys for single-mode runs
+        orig_off = orig.get(off_key, orig.get("cache_off", {}))
+        orig_on = orig.get(on_key, orig.get("cache_on", {}))
+        patch_off = patch.get(off_key, patch.get("cache_off", {}))
+        patch_on = patch.get(on_key, patch.get("cache_on", {}))
 
-    # Absolute comparison
-    orig_off_v = orig_off.get("median_tok_s", 0) if orig_off else 0
-    orig_on_v = orig_on.get("median_tok_s", 0) if orig_on else 0
-    patch_off_v = patch_off.get("median_tok_s", 0) if patch_off else 0
-    patch_on_v = patch_on.get("median_tok_s", 0) if patch_on else 0
+        label = "Batch" if bench_mode == "batch" else "Online (sequential)"
 
-    lines.append("## Key Comparisons")
-    lines.append("")
+        lines.extend([
+            f"## {label} — Shared-Prefix Throughput (tok/s)",
+            "",
+            "| Model | Cache OFF | Cache ON | Cache Effect |",
+            "|-------|-----------|----------|--------------|",
+        ])
 
-    if orig_off_v > 0 and patch_off_v > 0:
-        overhead = (patch_off_v - orig_off_v) / orig_off_v * 100
-        lines.append(f"- **Patch overhead** (cache OFF): {overhead:+.1f}% "
-                     f"({orig_off_v:.0f} → {patch_off_v:.0f} tok/s)")
+        orig_off_med, orig_off_spread = _fmt(orig_off)
+        orig_on_med, orig_on_spread = _fmt(orig_on)
+        patch_off_med, patch_off_spread = _fmt(patch_off)
+        patch_on_med, patch_on_spread = _fmt(patch_on)
 
-    if orig_off_v > 0 and orig_on_v > 0:
-        orig_cache_pct = (orig_on_v - orig_off_v) / orig_off_v * 100
-        lines.append(f"- **Original + cache**: {orig_cache_pct:+.1f}% "
-                     f"({orig_off_v:.0f} → {orig_on_v:.0f} tok/s)")
+        lines.append(
+            f"| Original | {orig_off_med} {orig_off_spread} | "
+            f"{orig_on_med} {orig_on_spread} | {_effect(orig_off, orig_on)} |"
+        )
+        lines.append(
+            f"| **CacheReady** | **{patch_off_med} {patch_off_spread}** | "
+            f"**{patch_on_med} {patch_on_spread}** | **{_effect(patch_off, patch_on)}** |"
+        )
+        lines.append("")
 
-    if patch_off_v > 0 and patch_on_v > 0:
-        patch_cache_pct = (patch_on_v - patch_off_v) / patch_off_v * 100
-        lines.append(f"- **CacheReady + cache**: {patch_cache_pct:+.1f}% "
-                     f"({patch_off_v:.0f} → {patch_on_v:.0f} tok/s)")
+        orig_off_v = orig_off.get("median_tok_s", 0) if orig_off and "error" not in orig_off else 0
+        orig_on_v = orig_on.get("median_tok_s", 0) if orig_on and "error" not in orig_on else 0
+        patch_off_v = patch_off.get("median_tok_s", 0) if patch_off and "error" not in patch_off else 0
+        patch_on_v = patch_on.get("median_tok_s", 0) if patch_on and "error" not in patch_on else 0
 
-    if orig_off_v > 0 and patch_on_v > 0:
-        absolute = patch_on_v / orig_off_v
-        lines.append(f"- **Absolute improvement** (original no-cache vs CacheReady+cache): "
-                     f"**{absolute:.2f}x** ({orig_off_v:.0f} → {patch_on_v:.0f} tok/s)")
+        lines.append(f"### {label} — Key Comparisons")
+        lines.append("")
 
-    lines.append("")
+        if orig_off_v > 0 and patch_off_v > 0:
+            overhead = (patch_off_v - orig_off_v) / orig_off_v * 100
+            lines.append(f"- **Patch overhead** (cache OFF): {overhead:+.1f}% "
+                         f"({orig_off_v:.0f} → {patch_off_v:.0f} tok/s)")
 
-    # Per-round details
-    lines.append("## Per-Round Details")
-    lines.append("")
-    for model_label, model_data in [("Original", orig), ("CacheReady", patch)]:
-        for cache_label, cache_data in [("cache_off", model_data.get("cache_off", {})),
-                                         ("cache_on", model_data.get("cache_on", {}))]:
-            if not cache_data:
-                continue
-            rounds = cache_data.get("round_throughputs_tok_s", [])
-            if rounds:
-                round_str = ", ".join(f"{r:.0f}" for r in rounds)
-                lines.append(f"- **{model_label}** ({cache_label}): [{round_str}] tok/s")
-    lines.append("")
+        if orig_off_v > 0 and orig_on_v > 0:
+            pct = (orig_on_v - orig_off_v) / orig_off_v * 100
+            lines.append(f"- **Original + cache**: {pct:+.1f}% "
+                         f"({orig_off_v:.0f} → {orig_on_v:.0f} tok/s)")
+
+        if patch_off_v > 0 and patch_on_v > 0:
+            pct = (patch_on_v - patch_off_v) / patch_off_v * 100
+            lines.append(f"- **CacheReady + cache**: {pct:+.1f}% "
+                         f"({patch_off_v:.0f} → {patch_on_v:.0f} tok/s)")
+
+        if orig_off_v > 0 and patch_on_v > 0:
+            absolute = patch_on_v / orig_off_v
+            lines.append(f"- **Absolute** (original no-cache vs CacheReady+cache): "
+                         f"**{absolute:.2f}x** ({orig_off_v:.0f} → {patch_on_v:.0f} tok/s)")
+
+        lines.append("")
+
+        # Per-round details
+        lines.append(f"### {label} — Per-Round Details")
+        lines.append("")
+        for model_label, model_data in [("Original", orig), ("CacheReady", patch)]:
+            for cache_label_key, nice_label in [(off_key, "cache_off"), (on_key, "cache_on")]:
+                cache_data = model_data.get(cache_label_key, {})
+                if not cache_data or "error" in cache_data:
+                    continue
+                rounds = cache_data.get("round_throughputs_tok_s", [])
+                if rounds:
+                    round_str = ", ".join(f"{r:.0f}" for r in rounds)
+                    lines.append(f"- **{model_label}** ({nice_label}): [{round_str}] tok/s")
+        lines.append("")
 
     report = "\n".join(lines)
     report_path = output_dir / "prefix_cache_report.md"
@@ -360,12 +385,17 @@ def main():
     parser.add_argument("--n-rounds", type=int, default=3, help="Measurement rounds")
     parser.add_argument("--n-warmup", type=int, default=20, help="Warmup prompts (discarded)")
     parser.add_argument("--max-new-tokens", type=int, default=64, help="Max tokens per prompt")
+    parser.add_argument(
+        "--mode", choices=["batch", "online", "both"], default="both",
+        help="batch = submit all prompts at once (throughput test), "
+             "online = submit one-at-a-time (latency/cache-hit test), "
+             "both = run both modes sequentially (default)",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # GPU info
     gpu_info = "unknown"
     try:
         r = subprocess.run(
@@ -377,16 +407,18 @@ def main():
     except Exception:
         pass
 
+    modes = ["batch", "online"] if args.mode == "both" else [args.mode]
+
     log.info("=" * 60)
     log.info("Prefix Caching Benchmark (clean methodology)")
     log.info("Original: %s", args.original)
     log.info("Patched:  %s", args.patched)
     log.info("TP: %d | Prompts: %d | Rounds: %d | Warmup: %d",
              args.tp, args.n_prompts, args.n_rounds, args.n_warmup)
+    log.info("Modes: %s", ", ".join(modes))
     log.info("GPU: %s", gpu_info)
     log.info("=" * 60)
 
-    # Step 1: Ensure both models are local
     log.info("--- Step 1: Download models to local disk ---")
     original_local = ensure_local(args.original)
     patched_local = ensure_local(args.patched)
@@ -404,50 +436,55 @@ def main():
         "n_warmup": args.n_warmup,
         "max_new_tokens": args.max_new_tokens,
         "gpu_info": gpu_info,
+        "modes": modes,
         "start_time": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
     }
 
     t_total = time.time()
 
-    # Step 2: Measure each model
-    for model_label, model_path in [("original", original_local), ("patched", patched_local)]:
-        log.info("--- %s: %s ---", model_label.upper(), model_path)
-        model_results = {}
+    for bench_mode in modes:
+        log.info("=" * 40)
+        log.info("MODE: %s", bench_mode.upper())
+        log.info("=" * 40)
 
-        for cache_enabled in [False, True]:
-            cache_label = "cache_on" if cache_enabled else "cache_off"
-            log.info("[%s] prefix_caching=%s", model_label, cache_enabled)
-            try:
-                r = measure_throughput(
-                    model_path=model_path,
-                    tp=args.tp,
-                    prefix_caching=cache_enabled,
-                    n_prompts=args.n_prompts,
-                    n_rounds=args.n_rounds,
-                    n_warmup=args.n_warmup,
-                    max_new_tokens=args.max_new_tokens,
-                )
-                model_results[cache_label] = r
-                log.info("[%s] %s: median %.0f tok/s (range: %.0f–%.0f)",
-                         model_label, cache_label,
-                         r["median_tok_s"], r["min_tok_s"], r["max_tok_s"])
-            except Exception as e:
-                log.error("[%s] %s FAILED: %s", model_label, cache_label, e, exc_info=True)
-                model_results[cache_label] = {"error": str(e)}
+        n_prompts = args.n_prompts if bench_mode == "batch" else min(args.n_prompts, 60)
+        n_warmup = args.n_warmup if bench_mode == "batch" else min(args.n_warmup, 10)
 
-        all_results[model_label] = model_results
+        for model_label, model_path in [("original", original_local), ("patched", patched_local)]:
+            log.info("--- %s [%s]: %s ---", model_label.upper(), bench_mode, model_path)
+            model_results = all_results.setdefault(model_label, {})
+
+            for cache_enabled in [False, True]:
+                cache_label = f"{bench_mode}_cache_{'on' if cache_enabled else 'off'}"
+                log.info("[%s] prefix_caching=%s mode=%s", model_label, cache_enabled, bench_mode)
+                try:
+                    r = measure_throughput(
+                        model_path=model_path,
+                        tp=args.tp,
+                        prefix_caching=cache_enabled,
+                        n_prompts=n_prompts,
+                        n_rounds=args.n_rounds,
+                        n_warmup=n_warmup,
+                        max_new_tokens=args.max_new_tokens,
+                        mode=bench_mode,
+                    )
+                    model_results[cache_label] = r
+                    log.info("[%s] %s: median %.0f tok/s (range: %.0f–%.0f)",
+                             model_label, cache_label,
+                             r["median_tok_s"], r["min_tok_s"], r["max_tok_s"])
+                except Exception as e:
+                    log.error("[%s] %s FAILED: %s", model_label, cache_label, e, exc_info=True)
+                    model_results[cache_label] = {"error": str(e)}
 
     total_time = time.time() - t_total
     all_results["total_time_s"] = round(total_time, 1)
     all_results["end_time"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 
-    # Save raw results
     raw_path = output_dir / "prefix_cache_results.json"
     with open(raw_path, "w") as f:
         json.dump(all_results, f, indent=2)
     log.info("raw results: %s", raw_path)
 
-    # Generate report
     report = generate_report(all_results, output_dir)
     print("\n" + report)
 

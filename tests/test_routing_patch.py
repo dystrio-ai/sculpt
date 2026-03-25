@@ -285,13 +285,17 @@ class TestBakeRoutingPatch:
         n_modified = bake_routing_patch(self.model, patch)
         assert n_modified == 1
 
-        # Members 1,2,3 should now have the same weight row as canonical 0
-        assert torch.equal(moe.gate.weight.data[0], moe.gate.weight.data[1])
-        assert torch.equal(moe.gate.weight.data[0], moe.gate.weight.data[2])
-        assert torch.equal(moe.gate.weight.data[0], moe.gate.weight.data[3])
-        # Members 5,6,7 should match canonical 4
-        assert torch.equal(moe.gate.weight.data[4], moe.gate.weight.data[5])
-        assert torch.equal(moe.gate.weight.data[4], moe.gate.weight.data[6])
+        W = moe.gate.weight.data
+        scale = 1.0 - 1e-4
+        # Members 1,2,3 should be canonical 0's row scaled down by tiebreak_eps
+        assert torch.allclose(W[1], W[0] * scale, atol=1e-6)
+        assert torch.allclose(W[2], W[0] * scale, atol=1e-6)
+        assert torch.allclose(W[3], W[0] * scale, atol=1e-6)
+        # Members 5,6,7 should be canonical 4's row scaled down
+        assert torch.allclose(W[5], W[4] * scale, atol=1e-6)
+        assert torch.allclose(W[6], W[4] * scale, atol=1e-6)
+        # Canonical should NOT equal member (tiebreaker gap)
+        assert not torch.equal(W[0], W[1])
 
     def test_baked_model_forward_works(self):
         from dystrio_sculpt.moe_routing_patch import (
@@ -332,11 +336,17 @@ class TestBakeRoutingPatch:
             x = self.model.embed(ids).reshape(-1, 64)
             logits = moe.gate(x)
 
-        # All 8 experts now have identical router weights, so top-k
-        # selection is fully deterministic (no tie-breaking ambiguity
-        # from different weight rows).
-        assert logits[:, 0].allclose(logits[:, 1])
-        assert logits[:, 0].allclose(logits[:, 7])
+        # Non-canonical experts have slightly lower gate weights (scaled
+        # by 1-eps). Logits should be very close but NOT identical.
+        assert logits[:, 0].allclose(logits[:, 1], atol=0.01)
+        assert not torch.equal(logits[:, 0], logits[:, 1])
+
+        # For positive logits (the ones that matter for top-k selection),
+        # the canonical expert should always win.
+        pos_mask = logits[:, 0] > 0
+        if pos_mask.any():
+            assert (logits[pos_mask, 0] >= logits[pos_mask, 1]).all()
+            assert (logits[pos_mask, 0] >= logits[pos_mask, 7]).all()
 
     def test_no_runtime_wrapper_needed(self):
         """After baking, the router should be a plain nn.Linear, not CanonicalRouter."""

@@ -227,6 +227,7 @@ for shard_name, keys in sorted(shard_to_gates.items()):
         W = tensors[gate_key]
         n_experts = W.shape[0]
         layer_swaps = 0
+        TIEBREAK_SCALE = 1.0 - 1e-4
 
         for ec in patch.layers[layer_idx]:
             if len(ec.members) <= 1:
@@ -236,7 +237,7 @@ for shard_name, keys in sorted(shard_to_gates.items()):
             canonical_row = W[ec.canonical].clone()
             for member in ec.members:
                 if member != ec.canonical and member < n_experts:
-                    W[member].copy_(canonical_row)
+                    W[member].copy_(canonical_row * TIEBREAK_SCALE)
                     layer_swaps += 1
 
         tensors[gate_key] = W

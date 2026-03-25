@@ -401,15 +401,21 @@ def remove_routing_patch(model) -> int:
 
 
 @torch.no_grad()
-def bake_routing_patch(model, patch: RoutingPatch) -> int:
+def bake_routing_patch(
+    model,
+    patch: RoutingPatch,
+    tiebreak_eps: float = 1e-4,
+) -> int:
     """Bake canonicalization directly into router weights (vLLM-compatible).
 
-    Instead of wrapping the router at runtime, this modifies the gate weight
-    matrix in-place: for each equivalence class, all member experts' rows
-    in gate.weight are replaced with the canonical expert's row.
+    For each equivalence class, non-canonical members get the canonical
+    expert's gate weights scaled down by (1 - tiebreak_eps).  This gives
+    the canonical expert a deterministic logit advantage for any input
+    where the logit is positive (the regime that matters for top-k).
 
-    The router physically cannot distinguish between equivalent experts,
-    so it deterministically picks the canonical one.
+    Previous version copied weights exactly, creating floating-point ties
+    whose resolution depended on CUDA topk internals and varied with batch
+    shape / chunked-prefill size — the opposite of deterministic.
 
     After baking, save the model with model.save_pretrained() and load
     it in vLLM like any normal model — no runtime patches needed.
@@ -420,6 +426,7 @@ def bake_routing_patch(model, patch: RoutingPatch) -> int:
 
     modified = 0
     total_swaps = 0
+    scale = 1.0 - tiebreak_eps
 
     for li, classes in patch.layers.items():
         non_singleton = [c for c in classes if len(c.members) > 1]
@@ -447,7 +454,7 @@ def bake_routing_patch(model, patch: RoutingPatch) -> int:
             canonical_row = W[ec.canonical].clone()
             for member in ec.members:
                 if member != ec.canonical and member < n_experts:
-                    W[member].copy_(canonical_row)
+                    W[member].copy_(canonical_row * scale)
                     layer_swaps += 1
 
         gate_bias = getattr(gate, "bias", None)
@@ -459,17 +466,18 @@ def bake_routing_patch(model, patch: RoutingPatch) -> int:
                 canonical_bias = B[ec.canonical].clone()
                 for member in ec.members:
                     if member != ec.canonical and member < n_experts:
-                        B[member].copy_(canonical_bias)
+                        B[member].copy_(canonical_bias * scale)
 
         modified += 1
         total_swaps += layer_swaps
         _log.info(
-            "layer %d: baked %d expert rows to canonical representatives",
-            li, layer_swaps,
+            "layer %d: baked %d expert rows (scale=%.6f for non-canonical)",
+            li, layer_swaps, scale,
         )
 
     _log.info(
-        "routing patch baked: %d layers modified, %d total weight rows overwritten",
-        modified, total_swaps,
+        "routing patch baked: %d layers modified, %d total weight rows overwritten "
+        "(tiebreak_eps=%.1e)",
+        modified, total_swaps, tiebreak_eps,
     )
     return modified
