@@ -259,6 +259,17 @@ def sculpt(
 
     log.info("  calib:         %s / %s / %s", calib_cfg.dataset, calib_cfg.config, calib_cfg.split)
 
+    # Fingerprint and create adapter for the model architecture
+    from .architectures import fingerprint as _fingerprint, get_adapter
+    from .architectures.descriptor import SupportState
+    desc = _fingerprint(model_id)
+    adapter = None
+    if desc.support_state in (SupportState.SUPPORTED, SupportState.PARTIALLY_SUPPORTED):
+        adapter = get_adapter(desc)
+        log.info("  adapter:       %s (family=%s)", type(adapter).__name__, desc.family)
+    else:
+        log.info("  adapter:       none (family=%s, %s)", desc.family, desc.support_state)
+
     search = FrontierSearch(
         model_id=model_id,
         n_frontier=frontier,
@@ -279,6 +290,7 @@ def sculpt(
         protection_threshold=protection_threshold,
         downstream_threshold=downstream_threshold,
         mixture_workload=mixture_wl,
+        adapter=adapter,
     )
 
     selected = search.run()
