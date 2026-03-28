@@ -307,12 +307,11 @@ def compile_model(
             block_size=BLOCK_SIZE, adapter=adapter,
         )
 
-    # Distillation: create a frozen teacher from the original model before compression.
-    # A/B testing showed distillation only helps at aggressive compression
-    # (keep_frac <= 0.65) where the model is damaged enough that teacher
-    # guidance aids recovery. At lighter compression, CE-only repair is
-    # sufficient and the KL term adds noise.
-    DISTILL_THRESHOLD = 0.65
+    # Distillation: create a frozen teacher from the original model before
+    # compression.  Live teacher distillation preserves quality at ALL
+    # compression levels — the 9B runs proved that even light pruning
+    # (keep_frac=0.95) benefits from teacher guidance, especially for
+    # code models where small probability shifts break syntax.
     teacher_model = None
     teacher_logit_cache = None
     distill_alpha = 0.0
@@ -321,13 +320,8 @@ def compile_model(
             distill_alpha = distill_alpha_override
         elif policy is not None and policy.distill_alpha > 0.0:
             distill_alpha = policy.distill_alpha
-        elif keep_frac <= DISTILL_THRESHOLD:
-            distill_alpha = 0.5
         else:
-            _log.info(
-                "distillation skipped: keep_frac=%.3f > %.2f threshold",
-                keep_frac, DISTILL_THRESHOLD,
-            )
+            distill_alpha = 0.5
         if distill_alpha > 0.0:
             teacher_model = _create_teacher(model, model_id, device, dtype, distill_alpha)
             if distill_cache and teacher_model is not None:

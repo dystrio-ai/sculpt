@@ -30,6 +30,9 @@ _KNOWN_ARCHITECTURES = {
     "deepseek": ("deepseek", MlpType.SWIGLU, True,  "silu"),
     "qwen2_moe": ("qwen_moe", MlpType.SWIGLU, True, "silu"),
     "qwen3_5_moe": ("qwen_moe", MlpType.SWIGLU, True, "silu"),
+    # Multimodal wrappers with dense SwiGLU LLM backbone
+    "minicpmo": ("minicpm", MlpType.SWIGLU, True, "silu"),
+    "minicpmv": ("minicpm", MlpType.SWIGLU, True, "silu"),
     # Plain MLP (ungated)
     "gpt2":     ("gpt2",     MlpType.PLAIN,  False, "gelu_new"),
     "gptj":     ("gptj",     MlpType.PLAIN,  False, "gelu_new"),
@@ -39,7 +42,9 @@ _KNOWN_ARCHITECTURES = {
 }
 
 # Families where the SwiGLU dense adapter works today
-_DENSE_SWIGLU_FAMILIES = {"llama", "mistral", "qwen", "phi", "gemma", "starcoder"}
+_DENSE_SWIGLU_FAMILIES = {"llama", "mistral", "qwen", "phi", "gemma", "starcoder", "minicpm"}
+
+_MULTIMODAL_FAMILIES = {"minicpm"}
 
 
 def _extract_num_params(config) -> Optional[int]:
@@ -200,6 +205,7 @@ def fingerprint(model_id: str) -> ArchitectureDescriptor:
         moe=is_moe,
         num_experts=num_experts,
         num_experts_per_tok=num_experts_per_tok,
+        is_multimodal=family in _MULTIMODAL_FAMILIES,
         tie_word_embeddings=tie_embeddings,
         confidence=confidence,
         support_state=support_state,

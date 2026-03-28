@@ -38,6 +38,7 @@ def _find_layers(model: nn.Module) -> nn.ModuleList:
     """
     candidates = [
         ("model.model.layers", lambda m: m.model.layers),
+        ("model.llm.model.layers", lambda m: m.llm.model.layers),
         ("model.language_model.layers", lambda m: m.language_model.layers),
         ("model.transformer.h", lambda m: m.transformer.h),
     ]

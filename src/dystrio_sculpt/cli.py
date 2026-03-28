@@ -122,11 +122,13 @@ def sculpt(
     ),
     distill: bool = typer.Option(
         False, "--distill",
-        help="Enable knowledge distillation during repair (teacher = uncompressed model).",
+        help="Enable knowledge distillation during repair (teacher = uncompressed model). "
+             "Active at ALL compression levels — no threshold gating.",
     ),
     distill_alpha: Optional[float] = typer.Option(
         None, "--distill-alpha",
-        help="Force distillation alpha at all compression levels (bypasses adaptive threshold).",
+        help="Override distillation mixing weight (default: 0.5). "
+             "Implicitly enables --distill.",
     ),
     distill_cache: bool = typer.Option(
         True, "--distill-cache/--no-distill-cache",

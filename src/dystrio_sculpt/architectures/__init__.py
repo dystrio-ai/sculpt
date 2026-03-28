@@ -61,6 +61,7 @@ def _auto_register() -> None:
     from .swiglu_dense import SwiGLUDenseAdapter
     from .plain_mlp import PlainMLPAdapter
     from .swiglu_moe import SwiGLUMoEAdapter
+    from .minicpm import MiniCPMAdapter
 
     for family in ("llama", "mistral", "qwen", "phi", "gemma", "starcoder"):
         register(family, SwiGLUDenseAdapter)
@@ -70,6 +71,8 @@ def _auto_register() -> None:
 
     for family in ("mixtral", "deepseek", "qwen_moe"):
         register(family, SwiGLUMoEAdapter)
+
+    register("minicpm", MiniCPMAdapter)
 
 
 _auto_register()

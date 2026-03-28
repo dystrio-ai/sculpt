@@ -55,10 +55,26 @@ def _format_gsm8k_qa(row: Dict) -> str:
     return f"Question: {q}\nAnswer: {a}"
 
 
+def _format_apps_solution(row: Dict) -> str:
+    """Format APPS training row: problem statement + first solution."""
+    q = row.get("question", "")
+    sols = row.get("solutions", "")
+    if isinstance(sols, str):
+        import json as _json
+        try:
+            sols = _json.loads(sols)
+        except (ValueError, TypeError):
+            sols = []
+    if isinstance(sols, list) and sols:
+        return f"{q}\n\n{sols[0]}"
+    return q
+
+
 _FORMATTERS: Dict[str, Callable[[Dict], str]] = {
     "openhermes": _format_openhermes,
     "mmlu_qa": _format_mmlu_qa,
     "gsm8k_qa": _format_gsm8k_qa,
+    "apps_solution": _format_apps_solution,
 }
 
 
@@ -157,6 +173,39 @@ MIXTURE_PRESETS: Dict[str, List[Dict[str, Any]]] = {
             "purpose": "factual knowledge retention",
         },
     ],
+    "code_starcoder": [
+        {
+            "dataset": "bigcode/starcoderdata", "data_dir": "python",
+            "split": "train", "text_field": "content", "weight": 0.45,
+            "purpose": "actual StarCoder training distribution (Python), primary repair signal",
+            "note": "gated: requires agreeing to The Stack Terms of Use on HF",
+        },
+        {
+            "dataset": "bigcode/starcoderdata", "data_dir": "javascript",
+            "split": "train", "text_field": "content", "weight": 0.15,
+            "purpose": "StarCoder training distribution (JavaScript), second-highest language",
+        },
+        {
+            "dataset": "bigcode/starcoderdata", "data_dir": "java",
+            "split": "train", "text_field": "content", "weight": 0.10,
+            "purpose": "StarCoder training distribution (Java), multi-language coverage",
+        },
+        {
+            "dataset": "gsm8k", "config": "main",
+            "split": "train", "formatter": "gsm8k_qa", "weight": 0.10,
+            "purpose": "math/reasoning preservation — SC2-15B beats DSCoder-33B on GSM8K",
+        },
+        {
+            "dataset": "teknium/OpenHermes-2.5", "config": "default",
+            "split": "train", "formatter": "openhermes", "weight": 0.10,
+            "purpose": "instruction following, prevents general capability collapse",
+        },
+        {
+            "dataset": "wikitext", "config": "wikitext-103-raw-v1",
+            "split": "train", "text_field": "text", "weight": 0.10,
+            "purpose": "language anchor",
+        },
+    ],
 }
 
 
@@ -177,8 +226,10 @@ def calib_config_for_workload(workload: str) -> "CalibConfig":
     if workload in MIXTURE_PRESETS:
         first = MIXTURE_PRESETS[workload][0]
         return CalibConfig(
-            dataset=first["dataset"], config=first["config"],
-            split=first["split"], text_field=first["text_field"],
+            dataset=first["dataset"],
+            config=first.get("config", first.get("data_dir", "default")),
+            split=first["split"],
+            text_field=first.get("text_field", "text"),
         )
     all_keys = list(WORKLOAD_PRESETS.keys()) + list(MIXTURE_PRESETS.keys())
     raise ValueError(f"Unknown workload {workload!r}. Available: {all_keys}")
@@ -280,13 +331,19 @@ def load_mixture_corpus(
     all_texts: List[str] = []
     for src in sources:
         n_from_src = max(20, int(n_total * src["weight"] / total_weight))
+        ds_name = src["dataset"]
+        ds_label = src.get("data_dir") or src.get("config", "default")
         try:
             _log.info(
                 "mixture: loading %d texts from %s/%s [%s]",
-                n_from_src, src["dataset"], src.get("config", "default"),
-                src.get("purpose", ""),
+                n_from_src, ds_name, ds_label, src.get("purpose", ""),
             )
-            ds = load_dataset(src["dataset"], src.get("config", "default"), split=src["split"])
+            load_kwargs: Dict[str, Any] = {"split": src["split"]}
+            if "data_dir" in src:
+                load_kwargs["data_dir"] = src["data_dir"]
+                ds = load_dataset(ds_name, **load_kwargs)
+            else:
+                ds = load_dataset(ds_name, src.get("config", "default"), **load_kwargs)
             fmt_name = src.get("formatter")
             fmt_fn = _FORMATTERS.get(fmt_name) if fmt_name else None
             texts = _collect_texts(
@@ -298,7 +355,7 @@ def load_mixture_corpus(
             all_texts.extend(sampled)
             _log.info("  -> got %d texts", len(sampled))
         except Exception as exc:
-            _log.warning("mixture: failed to load %s: %s — skipping", src["dataset"], exc)
+            _log.warning("mixture: failed to load %s/%s: %s — skipping", ds_name, ds_label, exc)
 
     if not all_texts:
         raise RuntimeError(f"All sources failed for mixture workload {workload!r}")
