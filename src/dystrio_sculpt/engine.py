@@ -274,6 +274,9 @@ def compile_model(
 
     _log.info("loading model %s (keep_frac=%.3f)", model_id, keep_frac)
     model, tok = load_model_and_tokenizer(model_id, device, dtype)
+    # For multimodal models (e.g. MiniCPM-o), route inference through
+    # the LLM backbone so text-only forward passes work correctly.
+    eval_model = adapter.get_eval_model(model) if adapter is not None else model
     num_layers = get_text_config(model).num_hidden_layers
     layers = list(range(num_layers))
 
@@ -284,14 +287,14 @@ def compile_model(
     # Resolve policy
     if policy is None:
         from .policy import _estimate_param_billions
-        param_b = _estimate_param_billions(model)
+        param_b = _estimate_param_billions(eval_model)
         ladder = build_policy_ladder(param_b)
         policy = ladder[0]
         _log.info("using default policy: %s", policy.name)
 
     if baseline_metrics is None:
         _log.info("computing baseline metrics (final eval)")
-        baseline_metrics = _collect_metrics(model, tok, texts, device, max_eval_tokens)
+        baseline_metrics = _collect_metrics(eval_model, tok, texts, device, max_eval_tokens)
         if torch.cuda.is_available():
             baseline_metrics["cuda_allocated_baseline_bytes"] = torch.cuda.memory_allocated()
 
@@ -323,7 +326,7 @@ def compile_model(
         else:
             distill_alpha = 0.5
         if distill_alpha > 0.0:
-            teacher_model = _create_teacher(model, model_id, device, dtype, distill_alpha)
+            teacher_model = _create_teacher(eval_model, model_id, device, dtype, distill_alpha)
             if distill_cache and teacher_model is not None:
                 teacher_logit_cache = build_teacher_cache(
                     teacher_model, tok, texts["train"],
@@ -362,7 +365,7 @@ def compile_model(
     else:
         compressible = [li for li in layers if keep_frac < 1.0]
     if not compressible:
-        metrics = _collect_metrics(model, tok, texts, device, max_eval_tokens)
+        metrics = _collect_metrics(eval_model, tok, texts, device, max_eval_tokens)
         return CompileResult(
             model=model, tokenizer=tok, keep_frac=keep_frac,
             baseline_metrics=baseline_metrics, metrics_pre=metrics,
@@ -397,20 +400,20 @@ def compile_model(
 
     def _curve_fn(opt_step: int) -> Dict[str, float]:
         metrics: Dict[str, float] = {
-            "ppl_w2_test": cheap_eval(model, tok, cheap_w2, device, current_policy.cheap_eval_max_tokens),
+            "ppl_w2_test": cheap_eval(eval_model, tok, cheap_w2, device, current_policy.cheap_eval_max_tokens),
         }
         if cheap_workload is not None:
             # Use workload-matched eval for repair early stopping.
             # Report under ppl_w103_valid so existing early-stop logic triggers on it.
             metrics["ppl_w103_valid"] = cheap_eval(
-                model, tok, cheap_workload, device, current_policy.cheap_eval_max_tokens,
+                eval_model, tok, cheap_workload, device, current_policy.cheap_eval_max_tokens,
             )
             metrics["ppl_w103_reference"] = cheap_eval(
-                model, tok, cheap_w103, device, current_policy.cheap_eval_max_tokens,
+                eval_model, tok, cheap_w103, device, current_policy.cheap_eval_max_tokens,
             )
         else:
             metrics["ppl_w103_valid"] = cheap_eval(
-                model, tok, cheap_w103, device, current_policy.cheap_eval_max_tokens,
+                eval_model, tok, cheap_w103, device, current_policy.cheap_eval_max_tokens,
             )
         return metrics
 
@@ -470,7 +473,7 @@ def compile_model(
         compressed_so_far.extend(chunk)
 
         _eval_texts = cheap_workload if cheap_workload is not None else cheap_w103
-        stage_ppl = cheap_eval(model, tok, _eval_texts, device, current_policy.cheap_eval_max_tokens)
+        stage_ppl = cheap_eval(eval_model, tok, _eval_texts, device, current_policy.cheap_eval_max_tokens)
         _log.info("stage %d post-compile ppl_w103=%.2f", si + 1, stage_ppl)
 
         if STAGE_GUARDRAIL > 0 and stage_ppl > STAGE_GUARDRAIL:
@@ -491,7 +494,7 @@ def compile_model(
         if current_policy.steps > 0:
             warmup_stage = min(100, current_policy.steps // 5)
             sr = repair_layers(
-                model=model, tokenizer=tok, texts_train=texts["train"],
+                model=eval_model, tokenizer=tok, texts_train=texts["train"],
                 layers=compressed_so_far, steps=current_policy.steps, lr=current_policy.lr,
                 warmup=warmup_stage, weight_decay=0.01,
                 max_len=MAX_LEN, device=device,
@@ -517,7 +520,7 @@ def compile_model(
             stage_nan_inf = sr.get("nan_inf_detected", False)
             stage_early_stop = sr.get("early_stop_triggered", False)
 
-            post_ppl = cheap_eval(model, tok, _eval_texts, device, current_policy.cheap_eval_max_tokens)
+            post_ppl = cheap_eval(eval_model, tok, _eval_texts, device, current_policy.cheap_eval_max_tokens)
 
             if not sr.get("repaired_ok", True) or math.isnan(post_ppl) or math.isinf(post_ppl):
                 _log.warning(
@@ -544,7 +547,7 @@ def compile_model(
                     current_policy = fallback
                     warmup_r = min(100, fallback.steps // 5)
                     sr2 = repair_layers(
-                        model=model, tokenizer=tok, texts_train=texts["train"],
+                        model=eval_model, tokenizer=tok, texts_train=texts["train"],
                         layers=compressed_so_far, steps=fallback.steps, lr=fallback.lr,
                         warmup=warmup_r, weight_decay=0.01,
                         max_len=MAX_LEN, device=device,
@@ -630,10 +633,10 @@ def compile_model(
     if current_policy.steps > 0 and not guardrail_failed and compressed_so_far:
         final_steps = max(current_policy.steps, current_policy.steps * len(chunks) // 2)
         warmup_final = min(100, final_steps // 5)
-        pre_final_ppl = cheap_eval(model, tok, _eval_texts, device, policy.cheap_eval_max_tokens)
+        pre_final_ppl = cheap_eval(eval_model, tok, _eval_texts, device, policy.cheap_eval_max_tokens)
         _log.info("final repair: %d steps on %d layers", final_steps, len(compressed_so_far))
         fr = repair_layers(
-            model=model, tokenizer=tok, texts_train=texts["train"],
+            model=eval_model, tokenizer=tok, texts_train=texts["train"],
             layers=compressed_so_far, steps=final_steps, lr=current_policy.lr,
             warmup=warmup_final, weight_decay=0.01,
             max_len=MAX_LEN, device=device,
@@ -676,7 +679,7 @@ def compile_model(
         model.to(device)
 
     # Final evaluation + benchmark (full token budget)
-    metrics_post = _collect_metrics(model, tok, texts, device, policy.final_eval_max_tokens)
+    metrics_post = _collect_metrics(eval_model, tok, texts, device, policy.final_eval_max_tokens)
 
     # Benchmark-phase VRAM peaks + steady-state
     peak_alloc_bench: Optional[int] = None

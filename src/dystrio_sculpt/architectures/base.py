@@ -99,3 +99,17 @@ class ArchitectureAdapter(ABC):
     ) -> List[torch.nn.Parameter]:
         """Return trainable parameters for repair optimisation."""
         ...
+
+    # ── Model routing ─────────────────────────────────────────────────────
+
+    def get_eval_model(self, model):
+        """Return the sub-model to use for inference (perplexity, repair, benchmarks).
+
+        For standalone models this is the model itself.  For multimodal
+        wrappers (e.g. MiniCPM-o) this returns the inner LLM backbone so
+        that text-only forward passes work correctly.
+
+        The returned model shares layers with *model*, so in-place
+        compression is visible through both references.
+        """
+        return model

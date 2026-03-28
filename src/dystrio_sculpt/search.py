@@ -28,7 +28,7 @@ import torch
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-from ._model import load_model_and_tokenizer, resolve_dtype
+from ._model import load_model_and_tokenizer, resolve_dtype, get_text_config
 from ._data import CalibConfig, load_text_sets, is_mixture_workload
 from .engine import CompileResult, compile_model, _collect_metrics, setup_determinism, MAX_LEN
 from ._downstream_eval import (
@@ -360,9 +360,10 @@ class FrontierSearch:
         setup_determinism(self.seed, self.deterministic)
         dtype = resolve_dtype(self.dtype_str)
         model, tok = load_model_and_tokenizer(self.model_id, self.device, dtype)
+        eval_model = self.adapter.get_eval_model(model) if self.adapter else model
         assert self.texts is not None
         self.baseline_metrics = _collect_metrics(
-            model, tok, self.texts, self.device, self.max_eval_tokens,
+            eval_model, tok, self.texts, self.device, self.max_eval_tokens,
         )
         if torch.cuda.is_available():
             self.baseline_metrics["cuda_allocated_baseline_bytes"] = torch.cuda.memory_allocated()
@@ -371,7 +372,7 @@ class FrontierSearch:
         if self._downstream_probe and self._downstream_probe.questions:
             _log.info("running downstream probe on baseline model (%d questions)",
                        len(self._downstream_probe.questions))
-            bl_result = eval_downstream_accuracy(model, tok, self._downstream_probe, self.device)
+            bl_result = eval_downstream_accuracy(eval_model, tok, self._downstream_probe, self.device)
             self._baseline_downstream = bl_result["accuracy"]
             self._downstream_probe.baseline_accuracy = bl_result["accuracy"]
             _log.info(
@@ -399,7 +400,10 @@ class FrontierSearch:
         setup_determinism(self.seed, self.deterministic)
         dtype = resolve_dtype(self.dtype_str)
         model, tok = load_model_and_tokenizer(self.model_id, self.device, dtype)
-        num_layers = model.config.num_hidden_layers
+        num_layers = (
+            self.adapter.get_num_layers(model) if self.adapter
+            else get_text_config(model).num_hidden_layers
+        )
         assert self.texts is not None
         self.prescan_cache = prescan_structural_artifacts(
             model, tok, list(range(num_layers)), self.texts["cal"],

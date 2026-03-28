@@ -173,6 +173,38 @@ MIXTURE_PRESETS: Dict[str, List[Dict[str, Any]]] = {
             "purpose": "factual knowledge retention",
         },
     ],
+    "multimodal_description": [
+        {
+            "dataset": "teknium/OpenHermes-2.5", "config": "default",
+            "split": "train", "formatter": "openhermes", "weight": 0.35,
+            "purpose": "instruction following — model generates descriptions from prompts",
+        },
+        {
+            "dataset": "wikitext", "config": "wikitext-103-raw-v1",
+            "split": "train", "text_field": "text", "weight": 0.15,
+            "purpose": "descriptive encyclopedic text, language anchor",
+        },
+        {
+            "dataset": "cais/mmlu", "config": "all",
+            "split": "auxiliary_train", "formatter": "mmlu_qa", "weight": 0.15,
+            "purpose": "factual knowledge for accurate file descriptions",
+        },
+        {
+            "dataset": "Rowan/hellaswag", "config": "default",
+            "split": "train", "text_field": "ctx", "weight": 0.15,
+            "purpose": "commonsense completion, coherent description generation",
+        },
+        {
+            "dataset": "Open-Orca/OpenOrca", "config": "default",
+            "split": "train", "text_field": "response", "weight": 0.10,
+            "purpose": "diverse instruction responses, broad capability",
+        },
+        {
+            "dataset": "gsm8k", "config": "main",
+            "split": "train", "formatter": "gsm8k_qa", "weight": 0.10,
+            "purpose": "structured reasoning, chain-of-thought",
+        },
+    ],
     "code_starcoder": [
         {
             "dataset": "bigcode/starcoderdata", "data_dir": "python",

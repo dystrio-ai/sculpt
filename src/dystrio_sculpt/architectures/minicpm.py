@@ -170,3 +170,14 @@ class MiniCPMAdapter(ArchitectureAdapter):
             for p in ll[li].mlp.parameters():
                 params.append(p)
         return params
+
+    # ── Model routing ─────────────────────────────────────────────────────
+
+    def get_eval_model(self, model):
+        """Return the LLM backbone for text-only inference.
+
+        The multimodal forward path requires image/audio inputs we don't
+        have during sculpt.  The LLM backbone (Qwen3ForCausalLM) accepts
+        standard tokenizer output and returns CausalLMOutput with logits.
+        """
+        return _resolve_llm(model)
