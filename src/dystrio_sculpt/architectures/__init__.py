@@ -62,8 +62,9 @@ def _auto_register() -> None:
     from .plain_mlp import PlainMLPAdapter
     from .swiglu_moe import SwiGLUMoEAdapter
     from .minicpm import MiniCPMAdapter
+    from .starcoder2 import Starcoder2Adapter
 
-    for family in ("llama", "mistral", "qwen", "phi", "gemma", "starcoder"):
+    for family in ("llama", "mistral", "qwen", "phi", "gemma"):
         register(family, SwiGLUDenseAdapter)
 
     for family in ("gpt2", "gptj", "gpt_neox", "opt", "bloom"):
@@ -73,6 +74,7 @@ def _auto_register() -> None:
         register(family, SwiGLUMoEAdapter)
 
     register("minicpm", MiniCPMAdapter)
+    register("starcoder", Starcoder2Adapter)
 
 
 _auto_register()

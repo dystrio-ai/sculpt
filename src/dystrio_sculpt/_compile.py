@@ -68,3 +68,36 @@ def compress_mlp_layer_swiglu_inplace(
     mlp.up_proj = new_up
     mlp.down_proj = new_down
     return {"hidden": hidden, "ffn_kept": ffn_kept}
+
+
+@torch.no_grad()
+def compress_mlp_layer_plain_inplace(
+    model, layer_idx: int, kept_idx: torch.Tensor,
+    dtype: torch.dtype, device: str,
+    up_name: str = "c_fc", down_name: str = "c_proj",
+) -> Dict[str, int]:
+    """Replace up/down projections in a plain (2-projection) MLP with smaller ones."""
+    mlp = get_mlp(model, layer_idx)
+    old_up = getattr(mlp, up_name)
+    old_down = getattr(mlp, down_name)
+    hidden = old_up.in_features
+    ffn_kept = int(kept_idx.numel())
+    kept = kept_idx.to(device=device)
+
+    new_up = torch.nn.Linear(
+        hidden, ffn_kept, bias=(old_up.bias is not None), device=device, dtype=dtype,
+    )
+    new_down = torch.nn.Linear(
+        ffn_kept, hidden, bias=(old_down.bias is not None), device=device, dtype=dtype,
+    )
+
+    new_up.weight.copy_(old_up.weight[kept].to(dtype))
+    if old_up.bias is not None:
+        new_up.bias.copy_(old_up.bias[kept].to(dtype))
+    new_down.weight.copy_(old_down.weight[:, kept].to(dtype))
+    if old_down.bias is not None:
+        new_down.bias.copy_(old_down.bias.to(dtype))
+
+    setattr(mlp, up_name, new_up)
+    setattr(mlp, down_name, new_down)
+    return {"hidden": hidden, "ffn_kept": ffn_kept}

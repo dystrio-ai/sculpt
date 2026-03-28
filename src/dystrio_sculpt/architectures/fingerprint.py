@@ -24,7 +24,7 @@ _KNOWN_ARCHITECTURES = {
     "phi":      ("phi",      MlpType.SWIGLU, True,  "silu"),
     "gemma":    ("gemma",    MlpType.SWIGLU, True,  "gelu_pytorch_tanh"),
     "gemma2":   ("gemma",    MlpType.SWIGLU, True,  "gelu_pytorch_tanh"),
-    "starcoder2": ("starcoder", MlpType.SWIGLU, True, "gelu_pytorch_tanh"),
+    "starcoder2": ("starcoder", MlpType.PLAIN, False, "gelu_pytorch_tanh"),
     # MoE variants
     "mixtral":  ("mixtral",  MlpType.SWIGLU, True,  "silu"),
     "deepseek": ("deepseek", MlpType.SWIGLU, True,  "silu"),
@@ -42,7 +42,9 @@ _KNOWN_ARCHITECTURES = {
 }
 
 # Families where the SwiGLU dense adapter works today
-_DENSE_SWIGLU_FAMILIES = {"llama", "mistral", "qwen", "phi", "gemma", "starcoder", "minicpm"}
+_DENSE_SWIGLU_FAMILIES = {"llama", "mistral", "qwen", "phi", "gemma", "minicpm"}
+
+_DENSE_PLAIN_FAMILIES = {"starcoder"}
 
 _MULTIMODAL_FAMILIES = {"minicpm"}
 
@@ -179,6 +181,8 @@ def fingerprint(model_id: str) -> ArchitectureDescriptor:
         else:
             support_state = SupportState.PARTIALLY_SUPPORTED
     elif family in _DENSE_SWIGLU_FAMILIES and confidence >= 0.8:
+        support_state = SupportState.SUPPORTED
+    elif family in _DENSE_PLAIN_FAMILIES and confidence >= 0.8:
         support_state = SupportState.SUPPORTED
     elif mlp_type == MlpType.PLAIN:
         support_state = SupportState.NEEDS_ADAPTER
