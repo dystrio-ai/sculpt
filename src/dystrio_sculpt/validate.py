@@ -8,12 +8,15 @@ from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from ._model import get_text_config
+
 _log = logging.getLogger(__name__)
 
 
 def validate_saved_model(
     model_dir: Path | str,
     device: str = "cuda",
+    adapter=None,
 ) -> bool:
     """Reload a saved model and verify it produces valid outputs.
 
@@ -31,21 +34,24 @@ def validate_saved_model(
     ).to(device)
     tok = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
 
+    eval_model = adapter.get_eval_model(model) if adapter is not None else model
+
     inp = tok("The quick brown fox jumps over the lazy dog", return_tensors="pt")
     inp = {k: v.to(device) for k, v in inp.items()}
 
     with torch.no_grad():
-        out = model(**inp, use_cache=False)
+        out = eval_model(**inp, use_cache=False)
 
     logits = out.logits
     seq_len = inp["input_ids"].shape[1]
+    vocab_size = get_text_config(model).vocab_size
 
     has_nan = torch.isnan(logits).any().item()
     has_inf = torch.isinf(logits).any().item()
     shape_ok = (
         logits.shape[0] == 1
         and logits.shape[1] == seq_len
-        and logits.shape[2] == model.config.vocab_size
+        and logits.shape[2] == vocab_size
     )
 
     passed = not has_nan and not has_inf and shape_ok
@@ -62,7 +68,7 @@ def validate_saved_model(
     else:
         _log.info("validation passed: shape=%s, no NaN/Inf", list(logits.shape))
 
-    del model
+    del model, eval_model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 

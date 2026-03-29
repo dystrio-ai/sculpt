@@ -146,7 +146,7 @@ def run_compile_stage(
         )
 
         model_dir = point_dir / "model"
-        ok = validate_saved_model(model_dir, device=device)
+        ok = validate_saved_model(model_dir, device=device, adapter=adapter)
         if not ok:
             _log.error("validation FAILED for %s — skipping tier", pt.label)
             continue

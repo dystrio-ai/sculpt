@@ -330,7 +330,7 @@ def sculpt(
         )
 
         model_dir = point_dir / "model"
-        ok = validate_saved_model(model_dir, device=device)
+        ok = validate_saved_model(model_dir, device=device, adapter=adapter)
         if not ok:
             log.error("validation FAILED for %s — model may be corrupt", pt.label)
             raise typer.Exit(code=2)
