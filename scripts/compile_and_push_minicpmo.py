@@ -67,7 +67,10 @@ def compile_tier(keep_frac: float, adapter):
     log.info("compiling kf=%.3f (%s)", keep_frac, label_name)
 
     calib_cfg = calib_config_for_workload("multimodal_description")
-    texts = load_text_sets(MODEL_ID, calib_cfg, mixture_workload="multimodal_description")
+    texts = load_text_sets(
+        n_cal=400, n_train=2500, n_eval=300,
+        calib=calib_cfg, mixture_workload="multimodal_description",
+    )
 
     param_b = 8.0
     ladder = build_policy_ladder(param_b)
