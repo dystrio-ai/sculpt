@@ -455,6 +455,7 @@ class FrontierSearch:
             max_compile_hours=self.max_compile_hours,
             pilot_keep_frac=pilot_kf,
             layer_order=self.layer_order,
+            adapter=self.adapter,
         )
         self._tuning_report = self.pilot_report
         _log.info("policy auto-selected: %s", self.policy.name)

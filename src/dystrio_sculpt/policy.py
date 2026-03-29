@@ -489,6 +489,7 @@ def _run_pilot_stages(
     selector: str = "structural",
     pilot_steps: Optional[int] = None,
     pilot_chunks: Optional[List[List[int]]] = None,
+    adapter=None,
 ) -> tuple:
     """Run pilot stage chunks of compress+repair and return (stage_stats, elapsed_s).
 
@@ -499,11 +500,18 @@ def _run_pilot_stages(
     Lightweight pilot: no rollback retry, no final repair, no benchmarking.
     Respects never-worse invariant via repair_layers' pre_repair_metric.
     """
+    from ._model import get_text_config
+
     dtype = resolve_dtype(dtype_str)
     rng = np.random.RandomState(seed) if deterministic else None
 
     model, tok = load_model_and_tokenizer(model_id, device, dtype)
-    num_layers = model.config.num_hidden_layers
+    eval_model = adapter.get_eval_model(model) if adapter is not None else model
+
+    if adapter is not None:
+        num_layers = adapter.get_num_layers(model)
+    else:
+        num_layers = get_text_config(model).num_hidden_layers
     layers = list(range(num_layers))
 
     if pilot_chunks is not None:
@@ -527,14 +535,18 @@ def _run_pilot_stages(
     for si, chunk in enumerate(chunks):
         for li in chunk:
             kept_blocks, kept_idx, _ = select_for_layer(
-                model, tok, li, texts_cal, keep_frac,
+                eval_model, tok, li, texts_cal, keep_frac,
                 MAX_LEN, device, selector=selector,
                 prescan_cache=prescan_cache, rng=rng,
+                adapter=adapter,
             )
-            compress_mlp_layer_swiglu_inplace(model, li, kept_idx, dtype, device)
+            if adapter is not None:
+                adapter.compress_layer(model, li, kept_idx, dtype, device)
+            else:
+                compress_mlp_layer_swiglu_inplace(model, li, kept_idx, dtype, device)
         compressed_so_far.extend(chunk)
 
-        P0 = eval_perplexity(model, tok, eval_subset, MAX_LEN, device, eval_tokens)
+        P0 = eval_perplexity(eval_model, tok, eval_subset, MAX_LEN, device, eval_tokens)
 
         if math.isnan(P0) or math.isinf(P0):
             stage_stats.append({
@@ -552,13 +564,13 @@ def _run_pilot_stages(
         early_stop = False
 
         if steps > 0:
-            def _curve(step, _model=model, _tok=tok, _es=eval_subset):
+            def _curve(step, _model=eval_model, _tok=tok, _es=eval_subset):
                 v = eval_perplexity(_model, _tok, _es, MAX_LEN, device, eval_tokens)
                 return {"ppl_w103_valid": v}
 
             warmup = min(15, steps // 5)
             sr = repair_layers(
-                model=model, tokenizer=tok, texts_train=texts_train,
+                model=eval_model, tokenizer=tok, texts_train=texts_train,
                 layers=compressed_so_far, steps=steps, lr=policy.lr,
                 warmup=warmup, weight_decay=0.01,
                 max_len=MAX_LEN, device=device,
@@ -689,6 +701,7 @@ def _select_stage_size(
             dtype_str=dtype_str, seed=seed, deterministic=deterministic,
             prescan_cache=prescan_cache, layer_order=layer_order,
             selector=selector, pilot_chunks=probe_chunks,
+            adapter=adapter,
         )
         budget_remaining_s -= elapsed
 
@@ -761,6 +774,7 @@ def tune_policy_with_pilot(
     pilot_keep_frac: float,
     prescan_cache: Optional[Dict[int, Dict[str, Any]]] = None,
     layer_order: Optional[List[int]] = None,
+    adapter=None,
 ) -> tuple:
     """Adaptive pilot tuner with Thompson Sampling LR search.
 
@@ -835,6 +849,7 @@ def tune_policy_with_pilot(
             seed=seed, deterministic=deterministic,
             prescan_cache=prescan_cache, layer_order=layer_order,
             selector=selector, pilot_chunks=[probe_chunk],
+            adapter=adapter,
         )
 
         improve = max((s.get("improve_frac", 0.0) for s in stats), default=0.0)
@@ -1048,6 +1063,7 @@ def auto_select_policy(
     max_compile_hours: Optional[float] = None,
     pilot_keep_frac: Optional[float] = None,
     layer_order: Optional[List[int]] = None,
+    adapter=None,
 ) -> tuple:
     """Select a repair policy, optionally via bounded stratified pilot tuner.
 
@@ -1068,6 +1084,7 @@ def auto_select_policy(
             pilot_keep_frac=keep_frac,
             prescan_cache=prescan_cache,
             layer_order=layer_order,
+            adapter=adapter,
         )
         chosen = risk_scale_policy(chosen, risk_score)
         report_dict = report.to_dict()
