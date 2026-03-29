@@ -583,8 +583,12 @@ class FrontierSearch:
             and not (result.guardrail_failed or result.failure is not None)
         ):
             try:
+                ds_model = (
+                    self.adapter.get_eval_model(result.model)
+                    if self.adapter is not None else result.model
+                )
                 ds_result = eval_downstream_accuracy(
-                    result.model, result.tokenizer,
+                    ds_model, result.tokenizer,
                     self._downstream_probe, self.device,
                 )
                 ds_score = ds_result["accuracy"]
