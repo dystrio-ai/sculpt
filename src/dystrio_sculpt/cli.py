@@ -159,6 +159,11 @@ def sculpt(
         help="Downstream accuracy retention required for 'safe' classification. "
              "E.g. 0.95 means keep >= 95%% of baseline accuracy. [default: 0.95]",
     ),
+    keep_fracs: Optional[str] = typer.Option(
+        None, "--keep-fracs",
+        help="Comma-separated keep_frac values to evaluate (skip search, "
+             "evaluate only these). E.g. '0.90,0.75' for two specific points.",
+    ),
 ) -> None:
     """Compile a model across a Pareto frontier of quality vs speed."""
     log = logging.getLogger("dystrio.sculpt")
@@ -270,6 +275,11 @@ def sculpt(
     else:
         log.info("  adapter:       none (family=%s, %s)", desc.family, desc.support_state)
 
+    explicit_keep_fracs = None
+    if keep_fracs is not None:
+        explicit_keep_fracs = [float(x.strip()) for x in keep_fracs.split(",")]
+        log.info("  keep_fracs:    %s (explicit, skipping search)", explicit_keep_fracs)
+
     search = FrontierSearch(
         model_id=model_id,
         n_frontier=frontier,
@@ -291,6 +301,7 @@ def sculpt(
         downstream_threshold=downstream_threshold,
         mixture_workload=mixture_wl,
         adapter=adapter,
+        explicit_keep_fracs=explicit_keep_fracs,
     )
 
     selected = search.run()

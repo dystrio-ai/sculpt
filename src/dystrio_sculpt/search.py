@@ -276,10 +276,12 @@ class FrontierSearch:
         adapter=None,
         downstream_threshold: Optional[float] = None,
         mixture_workload: Optional[str] = None,
+        explicit_keep_fracs: Optional[List[float]] = None,
     ):
         self.model_id = model_id
         self.n_frontier = n_frontier
         self.adapter = adapter
+        self.explicit_keep_fracs = explicit_keep_fracs
         # Default quality ceiling (PPL fallback)
         if max_ppl_multiplier is None or max_ppl_multiplier <= 0:
             self.max_ppl_multiplier = DEFAULT_PPL_CEILING
@@ -684,153 +686,163 @@ class FrontierSearch:
         ceiling = self.max_ppl_multiplier
         reject_margin = ceiling * 1.05
 
-        # Risk-aware initial candidates (descending keep_frac = conservative first)
-        candidates = risk_aware_keep_candidates(self.risk_score)
-        candidates.sort(reverse=True)
-        _log.info("initial candidates (risk=%.3f): %s", self.risk_score, candidates)
+        # Explicit keep_fracs: skip Thompson sampling, evaluate only these
+        if self.explicit_keep_fracs is not None:
+            _log.info(
+                "explicit keep_fracs mode: evaluating %s (no search)",
+                self.explicit_keep_fracs,
+            )
+            for kf in sorted(self.explicit_keep_fracs, reverse=True):
+                self._evaluate(kf)
+                gc.collect()
+        else:
+            # Risk-aware initial candidates (descending keep_frac = conservative first)
+            candidates = risk_aware_keep_candidates(self.risk_score)
+            candidates.sort(reverse=True)
+            _log.info("initial candidates (risk=%.3f): %s", self.risk_score, candidates)
 
-        rng = np.random.RandomState(self.seed) if self.deterministic else None
+            rng = np.random.RandomState(self.seed) if self.deterministic else None
 
-        # Thompson Sampling state: two arms for explore vs exploit
-        explore_arm = BetaArm()
-        exploit_arm = BetaArm()
-        remaining = list(candidates)
-        k_safe_best: Optional[float] = None
-        k_unsafe: Optional[float] = None
+            # Thompson Sampling state: two arms for explore vs exploit
+            explore_arm = BetaArm()
+            exploit_arm = BetaArm()
+            remaining = list(candidates)
+            k_safe_best: Optional[float] = None
+            k_unsafe: Optional[float] = None
 
-        _over_ceiling_extras = 0
-        _MAX_OVER_CEILING_EXTRAS = 1
-        _MIN_PREFILL_DELTA_FOR_EXTRA = 0.005
-        _prev_prefill_speedup: float = 0.0
-        min_resolution = 0.03
-        max_iterations = len(candidates) + 6
+            _over_ceiling_extras = 0
+            _MAX_OVER_CEILING_EXTRAS = 1
+            _MIN_PREFILL_DELTA_FOR_EXTRA = 0.005
+            _prev_prefill_speedup: float = 0.0
+            min_resolution = 0.03
+            max_iterations = len(candidates) + 6
 
-        for iteration in range(max_iterations):
-            if self._time_exceeded():
-                _log.info("time budget reached at iteration %d", iteration)
-                break
+            for iteration in range(max_iterations):
+                if self._time_exceeded():
+                    _log.info("time budget reached at iteration %d", iteration)
+                    break
 
-            # Determine available actions
-            can_explore = len(remaining) > 0
-            has_bracket = k_safe_best is not None and k_unsafe is not None
-            can_exploit = has_bracket and (k_safe_best - k_unsafe) >= min_resolution
+                # Determine available actions
+                can_explore = len(remaining) > 0
+                has_bracket = k_safe_best is not None and k_unsafe is not None
+                can_exploit = has_bracket and (k_safe_best - k_unsafe) >= min_resolution
 
-            if not can_explore and not can_exploit:
-                break
+                if not can_explore and not can_exploit:
+                    break
 
-            # Thompson Sampling: sample both arms, pick the winner
-            if not can_exploit:
-                action = "explore"
-            elif not can_explore:
-                action = "exploit"
-            else:
-                e_sample = explore_arm.sample(rng)
-                x_sample = exploit_arm.sample(rng)
-                action = "explore" if e_sample >= x_sample else "exploit"
-
-            if action == "explore":
-                kf = remaining.pop(0)
-            else:
-                mid = round((k_safe_best + k_unsafe) / 2, 3)
-                if any(abs(p.keep_frac - mid) < 0.005 for p in self.evaluated):
-                    if remaining:
-                        action = "explore"
-                        kf = remaining.pop(0)
-                    else:
-                        break
+                # Thompson Sampling: sample both arms, pick the winner
+                if not can_exploit:
+                    action = "explore"
+                elif not can_explore:
+                    action = "exploit"
                 else:
-                    kf = mid
+                    e_sample = explore_arm.sample(rng)
+                    x_sample = exploit_arm.sample(rng)
+                    action = "explore" if e_sample >= x_sample else "exploit"
 
-            pt = self._evaluate(kf)
-            reward = _safety_reward(pt, ceiling)
+                if action == "explore":
+                    kf = remaining.pop(0)
+                else:
+                    mid = round((k_safe_best + k_unsafe) / 2, 3)
+                    if any(abs(p.keep_frac - mid) < 0.005 for p in self.evaluated):
+                        if remaining:
+                            action = "explore"
+                            kf = remaining.pop(0)
+                        else:
+                            break
+                    else:
+                        kf = mid
 
-            # Update bracket
-            if self._is_safe_point(pt):
-                if k_safe_best is None or kf < k_safe_best:
-                    k_safe_best = kf
-            elif not pt.failed:
-                if pt.ppl_ratio <= reject_margin * 1.5:
+                pt = self._evaluate(kf)
+                reward = _safety_reward(pt, ceiling)
+
+                # Update bracket
+                if self._is_safe_point(pt):
+                    if k_safe_best is None or kf < k_safe_best:
+                        k_safe_best = kf
+                elif not pt.failed:
+                    if pt.ppl_ratio <= reject_margin * 1.5:
+                        if k_unsafe is None or kf > k_unsafe:
+                            k_unsafe = kf
+
+                # Update the arm that was used
+                if action == "explore":
+                    explore_arm.update(reward)
+                else:
+                    exploit_arm.update(reward)
+
+                # Early rejection (explore path only): prune remaining candidates
+                # that would be even more aggressive than a point already far over
+                # the ceiling.  Preserves the over-ceiling-extras heuristic.
+                if (
+                    action == "explore"
+                    and not pt.failed
+                    and pt.ppl_ratio > reject_margin
+                    and kf < 0.80
+                ):
                     if k_unsafe is None or kf > k_unsafe:
                         k_unsafe = kf
 
-            # Update the arm that was used
-            if action == "explore":
-                explore_arm.update(reward)
-            else:
-                exploit_arm.update(reward)
-
-            # Early rejection (explore path only): prune remaining candidates
-            # that would be even more aggressive than a point already far over
-            # the ceiling.  Preserves the over-ceiling-extras heuristic.
-            if (
-                action == "explore"
-                and not pt.failed
-                and pt.ppl_ratio > reject_margin
-                and kf < 0.80
-            ):
-                if k_unsafe is None or kf > k_unsafe:
-                    k_unsafe = kf
-
-                close_to_ceiling = pt.ppl_ratio <= ceiling * 1.10
-                helpful_count = 0
-                total_improve = 0.0
-                if pt.compile_result is not None:
-                    for s in pt.compile_result.stage_stats:
-                        if s.get("repair_helpful", False):
-                            helpful_count += 1
-                        total_improve += s.get("improve_frac", 0.0)
-                repair_shows_promise = helpful_count >= 1 or total_improve >= 0.005
-                speed_improving = (
-                    pt.prefill_speedup >= _prev_prefill_speedup + _MIN_PREFILL_DELTA_FOR_EXTRA
-                )
-
-                if (
-                    close_to_ceiling
-                    and repair_shows_promise
-                    and speed_improving
-                    and _over_ceiling_extras < _MAX_OVER_CEILING_EXTRAS
-                ):
-                    _over_ceiling_extras += 1
-                    _log.info(
-                        "[search] window: continue over-ceiling "
-                        "(ratio=%.3f, helpful=%d, improve=%.3f, "
-                        "prefill_delta=%.3f) at kf=%.3f (%d/%d extra)",
-                        pt.ppl_ratio, helpful_count, total_improve,
-                        pt.prefill_speedup - _prev_prefill_speedup, kf,
-                        _over_ceiling_extras, _MAX_OVER_CEILING_EXTRAS,
+                    close_to_ceiling = pt.ppl_ratio <= ceiling * 1.10
+                    helpful_count = 0
+                    total_improve = 0.0
+                    if pt.compile_result is not None:
+                        for s in pt.compile_result.stage_stats:
+                            if s.get("repair_helpful", False):
+                                helpful_count += 1
+                            total_improve += s.get("improve_frac", 0.0)
+                    repair_shows_promise = helpful_count >= 1 or total_improve >= 0.005
+                    speed_improving = (
+                        pt.prefill_speedup >= _prev_prefill_speedup + _MIN_PREFILL_DELTA_FOR_EXTRA
                     )
-                else:
-                    reason = "far_from_ceiling" if not close_to_ceiling else (
-                        "no_helpful_repair" if not repair_shows_promise else (
-                            "no_speed_gain" if not speed_improving else "cap_reached"
+
+                    if (
+                        close_to_ceiling
+                        and repair_shows_promise
+                        and speed_improving
+                        and _over_ceiling_extras < _MAX_OVER_CEILING_EXTRAS
+                    ):
+                        _over_ceiling_extras += 1
+                        _log.info(
+                            "[search] window: continue over-ceiling "
+                            "(ratio=%.3f, helpful=%d, improve=%.3f, "
+                            "prefill_delta=%.3f) at kf=%.3f (%d/%d extra)",
+                            pt.ppl_ratio, helpful_count, total_improve,
+                            pt.prefill_speedup - _prev_prefill_speedup, kf,
+                            _over_ceiling_extras, _MAX_OVER_CEILING_EXTRAS,
                         )
-                    )
-                    _log.info(
-                        "[search] window: pruning remaining below kf=%.3f "
-                        "(reason=%s, ratio=%.3f)",
-                        kf, reason, pt.ppl_ratio,
-                    )
-                    remaining = [r for r in remaining if r > kf]
+                    else:
+                        reason = "far_from_ceiling" if not close_to_ceiling else (
+                            "no_helpful_repair" if not repair_shows_promise else (
+                                "no_speed_gain" if not speed_improving else "cap_reached"
+                            )
+                        )
+                        _log.info(
+                            "[search] window: pruning remaining below kf=%.3f "
+                            "(reason=%s, ratio=%.3f)",
+                            kf, reason, pt.ppl_ratio,
+                        )
+                        remaining = [r for r in remaining if r > kf]
 
-            _prev_prefill_speedup = pt.prefill_speedup
+                _prev_prefill_speedup = pt.prefill_speedup
 
-            # Free models from failed points to reclaim CPU RAM and prevent
-            # CUDA context pollution on subsequent iterations.
-            for old_pt in self.evaluated:
-                if old_pt.failed and old_pt.compile_result is not None:
-                    if old_pt.compile_result.model is not None:
-                        del old_pt.compile_result.model
-                        old_pt.compile_result.model = None
-            gc.collect()
+                # Free models from failed points to reclaim CPU RAM and prevent
+                # CUDA context pollution on subsequent iterations.
+                for old_pt in self.evaluated:
+                    if old_pt.failed and old_pt.compile_result is not None:
+                        if old_pt.compile_result.model is not None:
+                            del old_pt.compile_result.model
+                            old_pt.compile_result.model = None
+                gc.collect()
 
-            _log.info(
-                "[search] iter=%d action=%s kf=%.3f reward=%.3f "
-                "arms=(explore=%.3f, exploit=%.3f) bracket=[%s, %s]",
-                iteration, action, kf, reward,
-                explore_arm.mean, exploit_arm.mean,
-                f"{k_unsafe:.3f}" if k_unsafe is not None else "?",
-                f"{k_safe_best:.3f}" if k_safe_best is not None else "?",
-            )
+                _log.info(
+                    "[search] iter=%d action=%s kf=%.3f reward=%.3f "
+                    "arms=(explore=%.3f, exploit=%.3f) bracket=[%s, %s]",
+                    iteration, action, kf, reward,
+                    explore_arm.mean, exploit_arm.mean,
+                    f"{k_unsafe:.3f}" if k_unsafe is not None else "?",
+                    f"{k_safe_best:.3f}" if k_safe_best is not None else "?",
+                )
 
         # ── Selection phase ──────────────────────────────────────────────
         safe = self._safe_points()
