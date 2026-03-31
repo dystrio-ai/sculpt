@@ -218,23 +218,24 @@ class SwiGLUMoEAdapter(ArchitectureAdapter):
         # --- Resize router gate ---
         if hasattr(gate, "weight"):
             old_w = gate.weight.data
+            has_bias = getattr(gate, "bias", None) is not None
             if old_w.shape[0] == n_orig:
                 new_gate_w = old_w[kept].to(dtype)
                 new_gate = torch.nn.Linear(
-                    old_w.shape[1], len(kept), bias=gate.bias is not None,
+                    old_w.shape[1], len(kept), bias=has_bias,
                     device=device, dtype=dtype,
                 )
                 new_gate.weight.data.copy_(new_gate_w)
-                if gate.bias is not None:
+                if has_bias:
                     new_gate.bias.data.copy_(gate.bias.data[kept].to(dtype))
             else:
                 new_gate_w = old_w[:, kept].to(dtype)
                 new_gate = torch.nn.Linear(
-                    len(kept), old_w.shape[0], bias=gate.bias is not None,
+                    len(kept), old_w.shape[0], bias=has_bias,
                     device=device, dtype=dtype,
                 )
                 new_gate.weight.data.copy_(new_gate_w)
-                if gate.bias is not None:
+                if has_bias:
                     new_gate.bias.data.copy_(gate.bias.data.to(dtype))
 
             if hasattr(moe, "gate"):
