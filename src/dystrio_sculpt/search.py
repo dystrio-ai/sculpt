@@ -921,10 +921,12 @@ class FrontierSearch:
                     p.compile_result.model = None
         gc.collect()
 
+        _explore_mean = explore_arm.mean if "explore_arm" in dir() else 0.0
+        _exploit_mean = exploit_arm.mean if "exploit_arm" in dir() else 0.0
         _log.info(
             "TSS complete: %d evaluated, %d safe, %d selected  "
             "(risk=%.3f, ceiling=%.2fx, explore_arm=%.3f, exploit_arm=%.3f)",
             len(self.evaluated), len(safe), len(selected),
-            self.risk_score, ceiling, explore_arm.mean, exploit_arm.mean,
+            self.risk_score, ceiling, _explore_mean, _exploit_mean,
         )
         return selected
