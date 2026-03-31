@@ -266,14 +266,24 @@ class SwiGLUMoEAdapter(ArchitectureAdapter):
                     if hasattr(gate, attr) and getattr(gate, attr) == n_orig:
                         setattr(gate, attr, len(kept))
 
+        # --- Update num_experts on all relevant modules ---
+        # OlmoeExperts.forward() uses self.num_experts for one_hot encoding.
+        # OlmoeTopKRouter stores num_experts too (handled above for custom routers).
+        # OlmoeForCausalLM.num_experts is used in aux loss computation.
+        n_new = len(kept)
+        for obj in (experts, moe, model):
+            for attr in ("num_experts", "num_local_experts"):
+                if hasattr(obj, attr) and getattr(obj, attr) == n_orig:
+                    setattr(obj, attr, n_new)
+
         # --- Update config ---
         from .._model import get_text_config
         text_cfg = get_text_config(model)
         for attr in ("num_local_experts", "num_experts"):
             if hasattr(text_cfg, attr):
-                setattr(text_cfg, attr, len(kept))
+                setattr(text_cfg, attr, n_new)
             if hasattr(model.config, attr):
-                setattr(model.config, attr, len(kept))
+                setattr(model.config, attr, n_new)
 
         _log.info(
             "layer %d: %d → %d experts  (fused=%s, merged=%d)",
