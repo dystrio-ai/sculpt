@@ -105,10 +105,13 @@ class TestSwiGLUMoEAdapterAccess:
         adapter = SwiGLUMoEAdapter()
         assert adapter.get_num_layers(self.model) == 2
 
-    def test_get_ffn_size(self):
+    def test_get_ffn_size_returns_num_experts(self):
+        """For MoE, get_ffn_size returns num_experts so the engine
+        treats each expert as one selectable block."""
         from dystrio_sculpt.architectures.swiglu_moe import SwiGLUMoEAdapter
         adapter = SwiGLUMoEAdapter()
-        assert adapter.get_ffn_size(self.model, 0) == 128
+        assert adapter.get_ffn_size(self.model, 0) == 8
+        assert adapter.get_ffn_size(self.model, 0) == adapter.get_num_experts(self.model, 0)
 
     def test_get_num_experts(self):
         from dystrio_sculpt.architectures.swiglu_moe import SwiGLUMoEAdapter

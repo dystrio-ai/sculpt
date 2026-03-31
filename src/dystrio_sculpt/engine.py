@@ -443,7 +443,11 @@ def compile_model(
                 _log.info("layer %d: keep_frac=%.3f (protected, skipping)", li, layer_kf)
                 continue
 
-            n_blocks_li = original_ffn_dims[li] // BLOCK_SIZE
+            moe_mode = adapter is not None and hasattr(adapter, 'get_num_experts')
+            if moe_mode:
+                n_blocks_li = original_ffn_dims[li]
+            else:
+                n_blocks_li = original_ffn_dims[li] // BLOCK_SIZE
             novelty = (
                 novelty_tracker.novelty_multiplier(n_blocks_li)
                 if novelty_tracker is not None else None
@@ -461,7 +465,11 @@ def compile_model(
                 novelty_tracker.record(kept_blocks, n_blocks_li, block_adj=block_adj)
 
             if adapter is not None:
-                rep = adapter.compress_layer(model, li, kept_idx, dtype, device)
+                coupling = sel_arts.get("block_adj_norm") if sel_arts else None
+                rep = adapter.compress_layer(
+                    model, li, kept_idx, dtype, device,
+                    coupling_matrix=coupling,
+                )
             else:
                 rep = compress_mlp_layer_swiglu_inplace(model, li, kept_idx, dtype, device)
             compile_report[str(li)] = {

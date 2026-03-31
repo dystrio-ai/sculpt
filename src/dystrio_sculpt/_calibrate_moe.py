@@ -80,6 +80,8 @@ def _get_moe_module(model, layer_idx: int):
         return layer.block_sparse_moe
     if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
         return layer.mlp
+    if hasattr(layer, "mlp") and hasattr(layer.mlp, "gate"):
+        return layer.mlp
     raise ValueError(f"Cannot locate MoE module in layer {layer_idx}")
 
 
@@ -303,21 +305,61 @@ def collect_expert_utilization(
 # ── Expert-output-based calibration (requires iterable experts) ───────
 
 @torch.no_grad()
+def _fused_expert_forward(
+    hidden: torch.Tensor,
+    gate_up_proj: torch.Tensor,
+    down_proj: torch.Tensor,
+    expert_idx: int,
+) -> torch.Tensor:
+    """Manually compute a single fused expert's SwiGLU forward pass.
+
+    gate_up_proj: [num_experts, 2*intermediate, hidden]
+    down_proj:    [num_experts, hidden, intermediate]
+
+    Returns expert output of shape [T, hidden].
+    """
+    gu_w = gate_up_proj[expert_idx].float()   # [2*intermediate, hidden]
+    d_w = down_proj[expert_idx].float()        # [hidden, intermediate]
+    h = hidden.float()
+
+    gate_up = h @ gu_w.T                       # [T, 2*intermediate]
+    mid = gate_up.shape[-1] // 2
+    gate = gate_up[..., :mid]
+    up = gate_up[..., mid:]
+    activated = F.silu(gate) * up               # [T, intermediate]
+    return activated @ d_w.T                    # [T, hidden]
+
+
 def collect_expert_sensitivity(
     model, tokenizer, layer_idx: int, texts: Sequence[str],
     max_len: int, device: str, max_tokens: int = 30_000,
 ) -> Dict[str, Any]:
-    """Expert operator sensitivity. REQUIRES iterable experts (ModuleList)."""
+    """Expert operator sensitivity: ||w_k * expert_k(x)||^2 per expert.
+
+    Measures how much each expert's weighted output contributes to the
+    MoE block output — the same operator-fidelity signal used for neuron
+    blocks in the dense SwiGLU pipeline. Experts with high sensitivity
+    contribute more to the residual stream and are costlier to remove.
+
+    Works with BOTH iterable (ModuleList) and fused (3D tensor) experts.
+    For fused experts, manually slices the weight tensors and computes the
+    SwiGLU forward pass per expert.
+    """
     moe = _get_moe_module(model, layer_idx)
-    if not _experts_are_iterable(moe):
-        raise TypeError(
-            "collect_expert_sensitivity requires iterable experts (ModuleList). "
-            "This model uses fused experts. Use router-based calibration instead."
-        )
     experts, gate = _get_experts_and_gate(moe)
     gate_weight = _get_gate_weight(moe)
-    n_experts = len(experts)
+    fused = not _experts_are_iterable(moe)
+    n_experts = _get_num_experts(moe)
     top_k = _get_top_k(moe)
+
+    if fused:
+        fused_gate_up = getattr(experts, "gate_up_proj", None)
+        fused_down = getattr(experts, "down_proj", None)
+        if fused_gate_up is None or fused_down is None:
+            raise ValueError(
+                "Fused experts detected but missing gate_up_proj/down_proj. "
+                f"Expert module attrs: {[a for a in dir(experts) if not a.startswith('_')]}"
+            )
 
     sensitivity = torch.zeros(n_experts, device=device, dtype=torch.float64)
     energy = torch.zeros(n_experts, device=device, dtype=torch.float64)
@@ -342,15 +384,24 @@ def collect_expert_sensitivity(
         topk_weights, topk_indices = torch.topk(weights, top_k, dim=-1)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-        for t_idx in range(min(T, 512)):
+        # Sample tokens for per-expert forward (cap at 512 for memory)
+        n_sample = min(T, 512)
+        for t_idx in range(n_sample):
             tok_hidden = hidden[t_idx : t_idx + 1]
             tok_experts = topk_indices[t_idx]
             tok_weights = topk_weights[t_idx]
 
             for k in range(top_k):
                 eidx = tok_experts[k].item()
-                exp_out = experts[eidx](tok_hidden).float()
                 w = tok_weights[k].float()
+
+                if fused:
+                    exp_out = _fused_expert_forward(
+                        tok_hidden, fused_gate_up, fused_down, eidx,
+                    )
+                else:
+                    exp_out = experts[eidx](tok_hidden).float()
+
                 delta = w * exp_out
                 sensitivity[eidx] += delta.pow(2).sum().to(torch.float64)
                 energy[eidx] += exp_out.abs().mean().to(torch.float64)
@@ -364,7 +415,8 @@ def collect_expert_sensitivity(
         if total_tokens >= max_tokens:
             break
         inp = tokenizer(t, return_tensors="pt", truncation=True, max_length=max_len)
-        inp = {k: v.to(device) for k, v in inp.items()}
+        first_device = next(model.parameters()).device
+        inp = {k: v.to(first_device) for k, v in inp.items()}
         model(**inp, use_cache=False)
     h.remove()
 
@@ -383,27 +435,38 @@ def collect_expert_covariance(
     max_len: int, device: str, max_tokens: int = 30_000,
     n_features: int = 3,
 ) -> Dict[str, Any]:
-    """Expert-level covariance from expert outputs.
+    """Expert-level output covariance for Physarum structural selection.
 
-    REQUIRES iterable experts. Falls back to router logit covariance
-    for fused experts.
+    For each calibration token, computes expert outputs (weighted by routing
+    probability) and extracts 3 features per expert: mean, std, and abs_mean
+    of the weighted output. The covariance of this feature vector captures
+    which experts produce correlated outputs → Physarum finds the coupling
+    structure and penalises selecting redundant expert pairs.
+
+    Works with BOTH iterable (ModuleList) and fused (3D tensor) experts.
+    For fused experts, manually slices weight tensors and runs per-expert
+    SwiGLU forward passes.
     """
     moe = _get_moe_module(model, layer_idx)
-    if not _experts_are_iterable(moe):
-        _log.info(
-            "layer %d: fused experts detected, falling back to router logit covariance",
-            layer_idx,
-        )
-        return collect_router_logit_covariance(
-            model, tokenizer, layer_idx, texts, max_len, device, max_tokens,
-        )
-
     experts, gate = _get_experts_and_gate(moe)
     gate_weight = _get_gate_weight(moe)
-    n_experts = len(experts)
+    fused = not _experts_are_iterable(moe)
+    n_experts = _get_num_experts(moe)
     top_k = _get_top_k(moe)
     F_dim = n_features
     dim = F_dim * n_experts
+
+    if fused:
+        fused_gate_up = getattr(experts, "gate_up_proj", None)
+        fused_down = getattr(experts, "down_proj", None)
+        if fused_gate_up is None or fused_down is None:
+            _log.warning(
+                "layer %d: fused experts but missing gate_up_proj/down_proj, "
+                "falling back to router logit covariance", layer_idx,
+            )
+            return collect_router_logit_covariance(
+                model, tokenizer, layer_idx, texts, max_len, device, max_tokens,
+            )
 
     sum_z = torch.zeros(dim, dtype=torch.float64, device=device)
     sum_zz = torch.zeros(dim, dim, dtype=torch.float64, device=device)
@@ -446,7 +509,14 @@ def collect_expert_covariance(
                         continue
                     eidx_int = eidx.item()
                     exp_in = batch_hidden[mask]
-                    exp_out = experts[eidx_int](exp_in).float().to(torch.float64)
+
+                    if fused:
+                        exp_out = _fused_expert_forward(
+                            exp_in, fused_gate_up, fused_down, eidx_int,
+                        ).to(torch.float64)
+                    else:
+                        exp_out = experts[eidx_int](exp_in).float().to(torch.float64)
+
                     w = batch_weights[mask].unsqueeze(1)
                     weighted_out = w * exp_out
 
@@ -466,7 +536,8 @@ def collect_expert_covariance(
         if total_tokens >= max_tokens:
             break
         inp = tokenizer(t, return_tensors="pt", truncation=True, max_length=max_len)
-        inp = {k: v.to(device) for k, v in inp.items()}
+        first_device = next(model.parameters()).device
+        inp = {k: v.to(first_device) for k, v in inp.items()}
         model(**inp, use_cache=False)
     h.remove()
 
@@ -479,6 +550,84 @@ def collect_expert_covariance(
         "block_energy": (sum_mag / N).cpu(),
         "n_blocks": n_experts,
         "feature_multiplier": F_dim,
+    }
+
+
+# ── REAP-style expert importance scoring (works with fused experts) ────
+
+
+@torch.no_grad()
+def score_expert_importance(
+    model, tokenizer, layer_idx: int, texts: Sequence[str],
+    max_len: int, device: str, max_tokens: int = 30_000,
+) -> Dict[str, Any]:
+    """Score expert importance using routing frequency * avg gate weight.
+
+    REAP-style saliency: experts that are selected often AND receive high
+    routing weights are more important. Works with ANY expert implementation
+    (fused or ModuleList) since it only reads router logits.
+
+    Returns dict with 'importance' (Tensor[n_experts]) plus breakdown.
+    """
+    moe = _get_moe_module(model, layer_idx)
+    gate_weight = _get_gate_weight(moe)
+    n_experts = gate_weight.shape[0]
+    top_k = _get_top_k(moe)
+
+    expert_count = torch.zeros(n_experts, device=device, dtype=torch.float64)
+    expert_weight_sum = torch.zeros(n_experts, device=device, dtype=torch.float64)
+    expert_weight_sq_sum = torch.zeros(n_experts, device=device, dtype=torch.float64)
+    total_tokens = 0
+
+    def hook(module, inputs, output):
+        nonlocal expert_count, expert_weight_sum, expert_weight_sq_sum, total_tokens
+        if total_tokens >= max_tokens:
+            return
+        hidden = inputs[0]
+        if hidden.dim() == 3:
+            hidden = hidden.reshape(-1, hidden.shape[-1])
+        T = hidden.shape[0]
+        budget = max_tokens - total_tokens
+        if T > budget:
+            hidden = hidden[:budget]
+            T = budget
+
+        logits = _compute_raw_logits(hidden, gate_weight)
+        weights = F.softmax(logits.float(), dim=-1)
+        topk_weights, topk_indices = torch.topk(weights, top_k, dim=-1)
+
+        for k in range(top_k):
+            idx = topk_indices[:, k].to(device)
+            w = topk_weights[:, k].to(torch.float64).to(device)
+            expert_count.scatter_add_(0, idx.long(), torch.ones_like(w))
+            expert_weight_sum.scatter_add_(0, idx.long(), w)
+            expert_weight_sq_sum.scatter_add_(0, idx.long(), w * w)
+
+        total_tokens += T
+
+    h = moe.register_forward_hook(hook)
+    model.eval()
+    for t in texts:
+        if total_tokens >= max_tokens:
+            break
+        inp = tokenizer(t, return_tensors="pt", truncation=True, max_length=max_len)
+        first_device = next(model.parameters()).device
+        inp = {k: v.to(first_device) for k, v in inp.items()}
+        model(**inp, use_cache=False)
+    h.remove()
+
+    N = max(total_tokens, 1)
+    frequency = expert_count / (N * top_k)
+    avg_weight = expert_weight_sum / expert_count.clamp(min=1)
+    importance = frequency * avg_weight
+
+    return {
+        "importance": importance.cpu(),
+        "frequency": frequency.cpu(),
+        "avg_weight": avg_weight.cpu(),
+        "total_tokens": total_tokens,
+        "n_experts": n_experts,
+        "top_k": top_k,
     }
 
 

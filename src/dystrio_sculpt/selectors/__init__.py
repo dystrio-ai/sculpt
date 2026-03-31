@@ -1,8 +1,12 @@
-"""Block selector dispatch.
+"""Block / expert selector dispatch.
 
-Selectors determine which FFN neuron blocks to keep during compression.
-The structural selector (default) uses operator-fidelity scoring with
-coupling-geometry diversity.  The magnitude selector is a simpler fallback.
+Selectors determine which FFN neuron blocks (or which MoE experts) to keep
+during compression.  The structural selector (default) uses operator-fidelity
+scoring with coupling-geometry diversity.  The magnitude selector is a simpler
+fallback.
+
+For MoE models, each "block" is one expert.  The selector returns expert
+indices directly instead of expanding to neuron ranges.
 """
 
 from __future__ import annotations
@@ -26,6 +30,15 @@ from .._calibrate import (
 BLOCK_SIZE = 128
 
 
+def _is_moe_adapter(adapter) -> bool:
+    """Check if the adapter operates at expert-block level."""
+    if adapter is None:
+        return False
+    from ..architectures.descriptor import OptimizationTarget
+    targets = adapter.supported_targets()
+    return OptimizationTarget.EXPERT_BLOCK in targets
+
+
 def select_for_layer(
     model,
     tokenizer,
@@ -40,18 +53,17 @@ def select_for_layer(
     cross_layer_novelty: Optional[np.ndarray] = None,
     adapter=None,
 ) -> Tuple[List[int], torch.Tensor, Dict[str, object]]:
-    """Select blocks for a single layer using the chosen selector.
+    """Select blocks (or experts) for a single layer.
 
-    When *prescan_cache* contains an entry for *layer_idx* and the selector
-    is structural, cached tensors are used instead of live calibration.
+    For dense models: returns neuron block indices expanded to individual
+    neuron positions (used by compress_mlp_layer_swiglu_inplace).
 
-    *cross_layer_novelty*, when provided, is a per-block multiplier from a
-    CrossLayerNoveltyTracker that boosts blocks not frequently selected in
-    previously compressed layers.
-
-    When *adapter* is provided, calibration is dispatched through it instead
-    of calling the SwiGLU-specific functions directly.
+    For MoE models: returns expert indices directly (used by
+    SwiGLUMoEAdapter.compress_layer).  Each "block" is one expert;
+    kept_idx contains expert IDs, not neuron ranges.
     """
+    moe_mode = _is_moe_adapter(adapter)
+
     if selector == "structural":
         if prescan_cache is not None and layer_idx in prescan_cache:
             pre = prescan_cache[layer_idx]
@@ -86,14 +98,18 @@ def select_for_layer(
             block_sensitivity = sens["block_sensitivity"]
             feature_multiplier = geom.get("feature_multiplier", 3)
 
+        block_size = 1 if moe_mode else BLOCK_SIZE
         kept_blocks, kept_idx, arts = select_blocks_structural(
-            geom_D, keep_frac, BLOCK_SIZE, topk_edges=20,
+            geom_D, keep_frac, block_size, topk_edges=20,
             block_energy=block_energy,
             feature_multiplier=feature_multiplier,
             block_sensitivity=block_sensitivity,
             rng=rng,
             cross_layer_novelty=cross_layer_novelty,
         )
+
+        if moe_mode:
+            return kept_blocks, torch.tensor(kept_blocks, dtype=torch.long, device=device), arts
         return kept_blocks, kept_idx.to(device), arts
 
     return select_for_layer_magnitude(

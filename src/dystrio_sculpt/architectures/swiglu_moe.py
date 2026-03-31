@@ -56,6 +56,8 @@ def _merge_expert_weights(
     After merging, expert_keep ≈ alpha * keep + (1-alpha) * drop.
     This preserves the surviving expert's identity while absorbing
     knowledge from the redundant one.
+
+    For iterable (ModuleList) experts only.
     """
     with torch.no_grad():
         for (name_k, p_k), (name_d, p_d) in zip(
@@ -63,6 +65,33 @@ def _merge_expert_weights(
             expert_drop.named_parameters(),
         ):
             p_k.data.lerp_(p_d.data.to(p_k.device, p_k.dtype), 1.0 - alpha)
+
+
+def _merge_fused_expert_weights(
+    experts_module: torch.nn.Module,
+    keep_idx: int,
+    drop_idx: int,
+    alpha: float = 0.5,
+) -> None:
+    """Merge a dropped fused expert's weights into a surviving one.
+
+    For 3D fused weight tensors (e.g. gate_up_proj[n_experts, ...]),
+    merges expert slice at drop_idx into keep_idx via lerp:
+        W[keep_idx] = alpha * W[keep_idx] + (1-alpha) * W[drop_idx]
+
+    This preserves the survivor's identity while absorbing the dropped
+    expert's knowledge, using Physarum coupling to pick the best recipient.
+    """
+    with torch.no_grad():
+        for attr in ("gate_up_proj", "down_proj"):
+            param = getattr(experts_module, attr, None)
+            if param is None:
+                continue
+            data = param.data if isinstance(param, torch.nn.Parameter) else param
+            data[keep_idx].lerp_(
+                data[drop_idx].to(data[keep_idx].dtype),
+                1.0 - alpha,
+            )
 
 
 def _build_expert_merge_plan(
@@ -94,6 +123,9 @@ class SwiGLUMoEAdapter(ArchitectureAdapter):
 
     Supports expert-level compression (drop/merge) and the standard
     calibration/selection interface for integration with the search engine.
+
+    Handles both iterable experts (ModuleList, e.g. Mixtral) and fused
+    experts (3D Parameter tensors, e.g. Qwen3.5-MoE).
     """
 
     def supported_targets(self) -> List[OptimizationTarget]:
@@ -109,25 +141,13 @@ class SwiGLUMoEAdapter(ArchitectureAdapter):
         return _get_moe_module(model, layer_idx)
 
     def get_ffn_size(self, model, layer_idx: int) -> int:
-        """Return total expert FFN width (single expert's intermediate_size).
-
-        For expert-level selection, n_blocks = n_experts, and each "block"
-        is one expert. The Physarum pipeline doesn't use ffn_size directly
-        for expert selection — it uses the covariance matrix shape.
-        """
-        moe = _get_moe_module(model, layer_idx)
-        experts, _ = _get_experts_and_gate(moe)
-        if len(experts) > 0:
-            expert = experts[0]
-            for attr in ("w1", "gate_proj"):
-                if hasattr(expert, attr):
-                    return getattr(expert, attr).out_features
-        raise ValueError("Cannot determine FFN size for MoE expert")
+        """For MoE, return num_experts so the engine treats each expert as a 'block'."""
+        return self.get_num_experts(model, layer_idx)
 
     def get_num_experts(self, model, layer_idx: int) -> int:
+        from .._calibrate_moe import _get_num_experts
         moe = _get_moe_module(model, layer_idx)
-        experts, _ = _get_experts_and_gate(moe)
-        return len(experts)
+        return _get_num_experts(moe, model)
 
     # ── Compression ───────────────────────────────────────────────────────
 
@@ -139,83 +159,113 @@ class SwiGLUMoEAdapter(ArchitectureAdapter):
     ) -> Dict[str, int]:
         """Drop experts not in kept_idx, optionally merging their weights.
 
-        1. Identify dropped experts
-        2. If merge=True and coupling_matrix provided, merge each dropped
-           expert into its most-coupled survivor
-        3. Rebuild the expert ModuleList with only survivors
-        4. Slice the router weight matrix to exclude dropped columns
+        Handles both iterable (ModuleList) and fused (3D tensor) experts.
         """
+        from .._calibrate_moe import _experts_are_iterable, _get_num_experts
+
         moe = _get_moe_module(model, layer_idx)
         experts, gate = _get_experts_and_gate(moe)
-        n_orig = len(experts)
+        n_orig = _get_num_experts(moe, model)
         kept = sorted(kept_idx.tolist()) if isinstance(kept_idx, torch.Tensor) else sorted(kept_idx)
         dropped = [i for i in range(n_orig) if i not in set(kept)]
 
         _log.info(
-            "layer %d: dropping %d/%d experts (keeping %s)",
-            layer_idx, len(dropped), n_orig, kept,
+            "layer %d: dropping %d/%d experts (keeping %d)",
+            layer_idx, len(dropped), n_orig, len(kept),
         )
 
-        if merge and coupling_matrix is not None and len(dropped) > 0:
-            merge_plan = _build_expert_merge_plan(kept, dropped, coupling_matrix)
-            for d_idx, k_idx in merge_plan.items():
-                _log.debug(
-                    "  merging expert %d → %d (coupling=%.3f)",
-                    d_idx, k_idx, coupling_matrix[d_idx, k_idx],
-                )
-                _merge_expert_weights(experts[k_idx], experts[d_idx], alpha=0.7)
+        fused = not _experts_are_iterable(moe)
 
-        new_experts = torch.nn.ModuleList([experts[i] for i in kept])
+        n_merged = 0
+        if not fused:
+            # --- Iterable experts (ModuleList): merge then rebuild ---
+            if merge and coupling_matrix is not None and len(dropped) > 0:
+                merge_plan = _build_expert_merge_plan(kept, dropped, coupling_matrix)
+                for d_idx, k_idx in merge_plan.items():
+                    _log.debug("  merge expert %d → %d (coupling=%.3f)",
+                               d_idx, k_idx, coupling_matrix[d_idx, k_idx])
+                    _merge_expert_weights(experts[k_idx], experts[d_idx], alpha=0.7)
+                    n_merged += 1
 
-        if hasattr(moe, "experts"):
-            moe.experts = new_experts
-        elif hasattr(moe, "block_sparse_moe"):
-            model.model.layers[layer_idx].block_sparse_moe.experts = new_experts
+            new_experts = torch.nn.ModuleList([experts[i] for i in kept])
+            if hasattr(moe, "experts"):
+                moe.experts = new_experts
+            elif hasattr(moe, "block_sparse_moe"):
+                from .._calibrate_moe import _get_layers_module
+                _get_layers_module(model)[layer_idx].block_sparse_moe.experts = new_experts
+        else:
+            # --- Fused experts (3D tensors): merge then slice ---
+            if merge and coupling_matrix is not None and len(dropped) > 0:
+                merge_plan = _build_expert_merge_plan(kept, dropped, coupling_matrix)
+                for d_idx, k_idx in merge_plan.items():
+                    _log.debug("  merge fused expert %d → %d (coupling=%.3f)",
+                               d_idx, k_idx, coupling_matrix[d_idx, k_idx])
+                    _merge_fused_expert_weights(experts, k_idx, d_idx, alpha=0.7)
+                    n_merged += 1
 
-        # Rescale router: slice out columns for dropped experts
+            kept_t = torch.tensor(kept, dtype=torch.long, device=device)
+            for attr in ("gate_up_proj", "down_proj"):
+                param = getattr(experts, attr, None)
+                if param is None:
+                    continue
+                if isinstance(param, torch.nn.Parameter):
+                    new_data = param.data[kept_t].clone().to(dtype)
+                    new_param = torch.nn.Parameter(new_data)
+                    setattr(experts, attr, new_param)
+                elif hasattr(param, "data"):
+                    param.data = param.data[kept_t].to(dtype)
+
+        # --- Resize router gate ---
         if hasattr(gate, "weight"):
             old_w = gate.weight.data
-            new_w = old_w[kept, :] if old_w.shape[0] == n_orig else old_w[:, kept]
-            # Determine correct dimension — router maps hidden→n_experts
             if old_w.shape[0] == n_orig:
+                new_gate_w = old_w[kept].to(dtype)
                 new_gate = torch.nn.Linear(
                     old_w.shape[1], len(kept), bias=gate.bias is not None,
                     device=device, dtype=dtype,
                 )
-                new_gate.weight.data.copy_(old_w[kept].to(dtype))
+                new_gate.weight.data.copy_(new_gate_w)
                 if gate.bias is not None:
                     new_gate.bias.data.copy_(gate.bias.data[kept].to(dtype))
             else:
+                new_gate_w = old_w[:, kept].to(dtype)
                 new_gate = torch.nn.Linear(
-                    old_w.shape[0], len(kept), bias=gate.bias is not None,
+                    len(kept), old_w.shape[0], bias=gate.bias is not None,
                     device=device, dtype=dtype,
                 )
-                new_gate.weight.data.copy_(old_w[:, kept].T.to(dtype))
+                new_gate.weight.data.copy_(new_gate_w)
                 if gate.bias is not None:
-                    new_gate.bias.data.copy_(gate.bias.data[kept].to(dtype))
+                    new_gate.bias.data.copy_(gate.bias.data.to(dtype))
 
             if hasattr(moe, "gate"):
                 moe.gate = new_gate
             elif hasattr(moe, "router"):
                 moe.router = new_gate
+        elif hasattr(gate, "weight") is False and isinstance(gate, torch.nn.Module):
+            for name, p in gate.named_parameters():
+                if "weight" in name and p.shape[0] == n_orig:
+                    p.data = p.data[kept].to(dtype)
 
-        # Update config
-        if hasattr(model.config, "num_local_experts"):
-            model.config.num_local_experts = len(kept)
-        if hasattr(model.config, "num_experts"):
-            model.config.num_experts = len(kept)
+        # --- Update config ---
+        from .._model import get_text_config
+        text_cfg = get_text_config(model)
+        for attr in ("num_local_experts", "num_experts"):
+            if hasattr(text_cfg, attr):
+                setattr(text_cfg, attr, len(kept))
+            if hasattr(model.config, attr):
+                setattr(model.config, attr, len(kept))
 
         _log.info(
-            "layer %d: %d → %d experts  (merged=%d)",
-            layer_idx, n_orig, len(kept), len(dropped) if merge else 0,
+            "layer %d: %d → %d experts  (fused=%s, merged=%d)",
+            layer_idx, n_orig, len(kept), fused, n_merged,
         )
 
         return {
             "n_experts_orig": n_orig,
             "n_experts_kept": len(kept),
-            "n_merged": len(dropped) if merge else 0,
-            "ffn_kept": self.get_ffn_size(model, layer_idx),
-            "hidden": model.config.hidden_size,
+            "n_merged": n_merged,
+            "ffn_kept": len(kept),
+            "hidden": getattr(text_cfg, "hidden_size", 0),
         }
 
     # ── Calibration ───────────────────────────────────────────────────────
@@ -235,7 +285,12 @@ class SwiGLUMoEAdapter(ArchitectureAdapter):
         self, model, tokenizer, layer_idx: int, texts: Sequence[str],
         max_len: int, device: str, block_size: int = 128, max_tokens: int = 30_000,
     ) -> Dict[str, Any]:
-        """Expert-level operator sensitivity."""
+        """Expert operator sensitivity: ||w_k * expert_k(x)||^2.
+
+        Uses the same operator-fidelity signal as the dense SwiGLU pipeline.
+        For fused experts, manually slices 3D weight tensors and runs
+        per-expert SwiGLU forward passes inside the calibration hook.
+        """
         from .._calibrate_moe import collect_expert_sensitivity
         result = collect_expert_sensitivity(
             model, tokenizer, layer_idx, texts, max_len, device,
@@ -251,16 +306,16 @@ class SwiGLUMoEAdapter(ArchitectureAdapter):
         self, model, tokenizer, layer_idx: int, texts: Sequence[str],
         max_len: int, device: str,
     ) -> torch.Tensor:
-        """Expert-level importance based on utilization-weighted sensitivity."""
-        from .._calibrate_moe import collect_expert_sensitivity, collect_expert_utilization
-        sens = collect_expert_sensitivity(
+        """Expert-level importance: routing frequency * avg gate weight (REAP-style).
+
+        Works with both fused and iterable experts since it only uses
+        router logits, not expert forward passes.
+        """
+        from .._calibrate_moe import score_expert_importance
+        scores = score_expert_importance(
             model, tokenizer, layer_idx, texts, max_len, device,
         )
-        util = collect_expert_utilization(
-            model, tokenizer, layer_idx, texts, max_len, device,
-        )
-        importance = sens["expert_sensitivity"] * util["expert_frequency"]
-        return importance
+        return scores["importance"]
 
     # ── Repair support ────────────────────────────────────────────────────
 
@@ -271,10 +326,9 @@ class SwiGLUMoEAdapter(ArchitectureAdapter):
         for li in layers:
             moe = _get_moe_module(model, li)
             experts, gate = _get_experts_and_gate(moe)
-            for ei, expert in enumerate(experts):
-                for name, p in expert.named_parameters():
-                    key = f"layers.{li}.expert.{ei}.{name}"
-                    snap[key] = p.data.detach().cpu().clone()
+            for name, p in experts.named_parameters():
+                key = f"layers.{li}.experts.{name}"
+                snap[key] = p.data.detach().cpu().clone()
             for name, p in gate.named_parameters():
                 key = f"layers.{li}.gate.{name}"
                 snap[key] = p.data.detach().cpu().clone()
@@ -287,11 +341,10 @@ class SwiGLUMoEAdapter(ArchitectureAdapter):
         for li in layers:
             moe = _get_moe_module(model, li)
             experts, gate = _get_experts_and_gate(moe)
-            for ei, expert in enumerate(experts):
-                for name, p in expert.named_parameters():
-                    key = f"layers.{li}.expert.{ei}.{name}"
-                    if key in snap:
-                        p.data.copy_(snap[key].to(p.device))
+            for name, p in experts.named_parameters():
+                key = f"layers.{li}.experts.{name}"
+                if key in snap:
+                    p.data.copy_(snap[key].to(p.device))
             for name, p in gate.named_parameters():
                 key = f"layers.{li}.gate.{name}"
                 if key in snap:
@@ -304,7 +357,23 @@ class SwiGLUMoEAdapter(ArchitectureAdapter):
         for li in layers:
             moe = _get_moe_module(model, li)
             experts, gate = _get_experts_and_gate(moe)
-            for expert in experts:
-                params.extend(expert.parameters())
+            params.extend(experts.parameters())
             params.extend(gate.parameters())
         return params
+
+    # ── Model routing ─────────────────────────────────────────────────────
+
+    def get_eval_model(self, model):
+        """Return the text model for text-only inference.
+
+        Qwen3.5 MoE multimodal wrappers (ForConditionalGeneration) have a
+        nested .model or .language_model that accepts standard text inputs.
+        Standalone text-only MoE models just return themselves.
+        """
+        if hasattr(model, "language_model"):
+            return model.language_model
+        if hasattr(model, "model") and hasattr(model.model, "layers"):
+            test_cfg = getattr(model.config, "text_config", None)
+            if test_cfg is not None and hasattr(model.config, "vision_config"):
+                return model
+        return model

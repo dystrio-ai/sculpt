@@ -28,8 +28,10 @@ _KNOWN_ARCHITECTURES = {
     # MoE variants
     "mixtral":  ("mixtral",  MlpType.SWIGLU, True,  "silu"),
     "deepseek": ("deepseek", MlpType.SWIGLU, True,  "silu"),
+    "olmoe":    ("mixtral",  MlpType.SWIGLU, True,  "silu"),
     "qwen2_moe": ("qwen_moe", MlpType.SWIGLU, True, "silu"),
     "qwen3_5_moe": ("qwen_moe", MlpType.SWIGLU, True, "silu"),
+    "qwen3_5_moe_text": ("qwen_moe", MlpType.SWIGLU, True, "silu"),
     # Multimodal wrappers with dense SwiGLU LLM backbone
     "minicpmo": ("minicpm", MlpType.SWIGLU, True, "silu"),
     "minicpmv": ("minicpm", MlpType.SWIGLU, True, "silu"),
