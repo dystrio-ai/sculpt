@@ -216,36 +216,55 @@ class SwiGLUMoEAdapter(ArchitectureAdapter):
                     param.data = param.data[kept_t].to(dtype)
 
         # --- Resize router gate ---
+        # For custom routers (OlmoeTopKRouter, TopKRouter, etc.), modify
+        # the weight parameter in-place to preserve the router's forward()
+        # signature (which returns logits, weights, indices — not just a
+        # raw tensor like nn.Linear).
         if hasattr(gate, "weight"):
-            old_w = gate.weight.data
-            has_bias = getattr(gate, "bias", None) is not None
-            if old_w.shape[0] == n_orig:
-                new_gate_w = old_w[kept].to(dtype)
-                new_gate = torch.nn.Linear(
-                    old_w.shape[1], len(kept), bias=has_bias,
-                    device=device, dtype=dtype,
-                )
-                new_gate.weight.data.copy_(new_gate_w)
-                if has_bias:
-                    new_gate.bias.data.copy_(gate.bias.data[kept].to(dtype))
-            else:
-                new_gate_w = old_w[:, kept].to(dtype)
-                new_gate = torch.nn.Linear(
-                    len(kept), old_w.shape[0], bias=has_bias,
-                    device=device, dtype=dtype,
-                )
-                new_gate.weight.data.copy_(new_gate_w)
-                if has_bias:
-                    new_gate.bias.data.copy_(gate.bias.data.to(dtype))
+            old_w = gate.weight
+            is_plain_linear = isinstance(gate, torch.nn.Linear)
 
-            if hasattr(moe, "gate"):
-                moe.gate = new_gate
-            elif hasattr(moe, "router"):
-                moe.router = new_gate
-        elif hasattr(gate, "weight") is False and isinstance(gate, torch.nn.Module):
-            for name, p in gate.named_parameters():
-                if "weight" in name and p.shape[0] == n_orig:
-                    p.data = p.data[kept].to(dtype)
+            if is_plain_linear:
+                has_bias = getattr(gate, "bias", None) is not None
+                if old_w.shape[0] == n_orig:
+                    new_gate = torch.nn.Linear(
+                        old_w.shape[1], len(kept), bias=has_bias,
+                        device=device, dtype=dtype,
+                    )
+                    new_gate.weight.data.copy_(old_w.data[kept].to(dtype))
+                    if has_bias:
+                        new_gate.bias.data.copy_(gate.bias.data[kept].to(dtype))
+                else:
+                    new_gate = torch.nn.Linear(
+                        len(kept), old_w.shape[0], bias=has_bias,
+                        device=device, dtype=dtype,
+                    )
+                    new_gate.weight.data.copy_(old_w.data[:, kept].to(dtype))
+                    if has_bias:
+                        new_gate.bias.data.copy_(gate.bias.data.to(dtype))
+                if hasattr(moe, "gate"):
+                    moe.gate = new_gate
+                elif hasattr(moe, "router"):
+                    moe.router = new_gate
+            else:
+                # Custom router: slice weight in-place, keep the module
+                if old_w.shape[0] == n_orig:
+                    gate.weight = torch.nn.Parameter(
+                        old_w.data[kept].to(dtype)
+                    )
+                else:
+                    gate.weight = torch.nn.Parameter(
+                        old_w.data[:, kept].to(dtype)
+                    )
+                has_bias = getattr(gate, "bias", None) is not None
+                if has_bias and gate.bias.shape[0] == n_orig:
+                    gate.bias = torch.nn.Parameter(
+                        gate.bias.data[kept].to(dtype)
+                    )
+                # Update num_experts on the router if it tracks it
+                for attr in ("num_experts", "top_k_experts", "n_experts"):
+                    if hasattr(gate, attr) and getattr(gate, attr) == n_orig:
+                        setattr(gate, attr, len(kept))
 
         # --- Update config ---
         from .._model import get_text_config

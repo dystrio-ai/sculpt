@@ -150,16 +150,29 @@ def _get_top_k(moe_module) -> int:
 
 
 def _experts_are_iterable(moe_module) -> bool:
-    """Check if experts can be individually indexed (ModuleList vs fused)."""
+    """Check if experts can be individually indexed (ModuleList vs fused).
+
+    Newer transformers wraps ModuleList experts in an MoE integration class
+    that may not support direct indexing. We check for actual nn.Module
+    children (named '0', '1', ...) to distinguish from fused 3D tensors.
+    """
     experts = getattr(moe_module, "experts", None)
     if experts is None:
         return False
+    # Check for ModuleList-style children (named '0', '1', etc.)
+    if isinstance(experts, torch.nn.ModuleList):
+        return True
+    children = list(experts.named_children())
+    if len(children) > 0 and children[0][0].isdigit():
+        return True
     try:
         n = len(experts)
         if n > 0:
             _ = experts[0]
-        return True
-    except (TypeError, IndexError, KeyError):
+            if isinstance(_, torch.nn.Module):
+                return True
+        return False
+    except (TypeError, IndexError, KeyError, AttributeError):
         return False
 
 
