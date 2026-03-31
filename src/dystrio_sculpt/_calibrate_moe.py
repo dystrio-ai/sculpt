@@ -366,8 +366,13 @@ def collect_expert_sensitivity(
     expert_count = torch.zeros(n_experts, device=device, dtype=torch.float64)
     total_tokens = 0
 
+    # Collect hidden states + routing decisions in the hook, then compute
+    # per-expert sensitivity OUTSIDE the model forward to avoid nested
+    # expert calls that balloon memory inside transformers' grouped_mm.
+    captured_batches: list = []
+
     def hook(module, inputs, output):
-        nonlocal sensitivity, energy, expert_count, total_tokens
+        nonlocal total_tokens
         if total_tokens >= max_tokens:
             return
         hidden = inputs[0]
@@ -384,12 +389,32 @@ def collect_expert_sensitivity(
         topk_weights, topk_indices = torch.topk(weights, top_k, dim=-1)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-        # Sample tokens for per-expert forward (cap at 512 for memory)
-        n_sample = min(T, 512)
+        n_sample = min(T, 256)
+        captured_batches.append((
+            hidden[:n_sample].detach().clone(),
+            topk_indices[:n_sample].detach().clone(),
+            topk_weights[:n_sample].detach().clone(),
+        ))
+        total_tokens += T
+
+    h = moe.register_forward_hook(hook)
+    model.eval()
+    for t in texts:
+        if total_tokens >= max_tokens:
+            break
+        inp = tokenizer(t, return_tensors="pt", truncation=True, max_length=max_len)
+        first_device = next(model.parameters()).device
+        inp = {k: v.to(first_device) for k, v in inp.items()}
+        model(**inp, use_cache=False)
+    h.remove()
+
+    # Now compute per-expert sensitivity from captured data (no nested fwd)
+    for batch_hidden, batch_topk_idx, batch_topk_w in captured_batches:
+        n_sample = batch_hidden.shape[0]
         for t_idx in range(n_sample):
-            tok_hidden = hidden[t_idx : t_idx + 1]
-            tok_experts = topk_indices[t_idx]
-            tok_weights = topk_weights[t_idx]
+            tok_hidden = batch_hidden[t_idx : t_idx + 1]
+            tok_experts = batch_topk_idx[t_idx]
+            tok_weights = batch_topk_w[t_idx]
 
             for k in range(top_k):
                 eidx = tok_experts[k].item()
@@ -406,19 +431,9 @@ def collect_expert_sensitivity(
                 sensitivity[eidx] += delta.pow(2).sum().to(torch.float64)
                 energy[eidx] += exp_out.abs().mean().to(torch.float64)
                 expert_count[eidx] += 1
+                del exp_out, delta
 
-        total_tokens += T
-
-    h = moe.register_forward_hook(hook)
-    model.eval()
-    for t in texts:
-        if total_tokens >= max_tokens:
-            break
-        inp = tokenizer(t, return_tensors="pt", truncation=True, max_length=max_len)
-        first_device = next(model.parameters()).device
-        inp = {k: v.to(first_device) for k, v in inp.items()}
-        model(**inp, use_cache=False)
-    h.remove()
+    del captured_batches
 
     count_safe = expert_count.clamp(min=1)
     return {
@@ -473,8 +488,13 @@ def collect_expert_covariance(
     sum_mag = torch.zeros(n_experts, dtype=torch.float64, device=device)
     total_tokens = 0
 
+    # Capture hidden states + routing in the hook; run per-expert forwards
+    # AFTER the model forward completes to avoid memory explosion from
+    # nested expert calls inside transformers' grouped_mm dispatch.
+    captured_batches: list = []
+
     def hook(module, inputs, output):
-        nonlocal sum_z, sum_zz, sum_mag, total_tokens
+        nonlocal total_tokens
         if total_tokens >= max_tokens:
             return
         hidden = inputs[0]
@@ -491,44 +511,13 @@ def collect_expert_covariance(
         topk_weights, topk_indices = torch.topk(weights, top_k, dim=-1)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-        batch_size = min(T, 256)
-        for start in range(0, T, batch_size):
-            end = min(start + batch_size, T)
-            batch_hidden = hidden[start:end]
-            B = batch_hidden.shape[0]
-            z = torch.zeros(B, dim, dtype=torch.float64, device=device)
-
-            for k in range(top_k):
-                batch_indices = topk_indices[start:end, k]
-                batch_weights = topk_weights[start:end, k].to(torch.float64)
-
-                unique_experts = batch_indices.unique()
-                for eidx in unique_experts:
-                    mask = batch_indices == eidx
-                    if not mask.any():
-                        continue
-                    eidx_int = eidx.item()
-                    exp_in = batch_hidden[mask]
-
-                    if fused:
-                        exp_out = _fused_expert_forward(
-                            exp_in, fused_gate_up, fused_down, eidx_int,
-                        ).to(torch.float64)
-                    else:
-                        exp_out = experts[eidx_int](exp_in).float().to(torch.float64)
-
-                    w = batch_weights[mask].unsqueeze(1)
-                    weighted_out = w * exp_out
-
-                    base = F_dim * eidx_int
-                    z[mask, base] += weighted_out.mean(dim=-1)
-                    z[mask, base + 1] += weighted_out.std(dim=-1, correction=0)
-                    z[mask, base + 2] += weighted_out.abs().mean(dim=-1)
-                    sum_mag[eidx_int] += weighted_out.abs().mean(dim=-1).sum()
-
-            sum_z += z.sum(dim=0)
-            sum_zz += z.T @ z
-            total_tokens += B
+        n_cap = min(T, 256)
+        captured_batches.append((
+            hidden[:n_cap].detach().clone(),
+            topk_indices[:n_cap].detach().clone(),
+            topk_weights[:n_cap].detach().clone(),
+        ))
+        total_tokens += T
 
     h = moe.register_forward_hook(hook)
     model.eval()
@@ -541,7 +530,49 @@ def collect_expert_covariance(
         model(**inp, use_cache=False)
     h.remove()
 
-    N = max(total_tokens, 1)
+    # Process captured batches: per-expert forward passes outside model fwd
+    processed_tokens = 0
+    for batch_hidden, batch_topk_idx, batch_topk_w in captured_batches:
+        B = batch_hidden.shape[0]
+        z = torch.zeros(B, dim, dtype=torch.float64, device=device)
+
+        for k in range(top_k):
+            b_indices = batch_topk_idx[:, k]
+            b_weights = batch_topk_w[:, k].to(torch.float64)
+
+            unique_experts_t = b_indices.unique()
+            for eidx in unique_experts_t:
+                mask = b_indices == eidx
+                if not mask.any():
+                    continue
+                eidx_int = eidx.item()
+                exp_in = batch_hidden[mask]
+
+                if fused:
+                    exp_out = _fused_expert_forward(
+                        exp_in, fused_gate_up, fused_down, eidx_int,
+                    ).to(torch.float64)
+                else:
+                    exp_out = experts[eidx_int](exp_in).float().to(torch.float64)
+
+                w = b_weights[mask].unsqueeze(1)
+                weighted_out = w * exp_out
+
+                base = F_dim * eidx_int
+                z[mask, base] += weighted_out.mean(dim=-1)
+                z[mask, base + 1] += weighted_out.std(dim=-1, correction=0)
+                z[mask, base + 2] += weighted_out.abs().mean(dim=-1)
+                sum_mag[eidx_int] += weighted_out.abs().mean(dim=-1).sum()
+                del exp_out, weighted_out
+
+        sum_z += z.sum(dim=0)
+        sum_zz += z.T @ z
+        processed_tokens += B
+        del z
+
+    del captured_batches
+
+    N = max(processed_tokens, 1)
     mean_z = sum_z / N
     D = (sum_zz / N) - mean_z.unsqueeze(1) * mean_z.unsqueeze(0)
 

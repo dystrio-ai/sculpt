@@ -310,6 +310,11 @@ def prescan_structural_artifacts(
     """
     out: Dict[int, Dict[str, Any]] = {}
     for li in layers:
+        import gc, torch as _torch
+        gc.collect()
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
+
         if adapter is not None:
             geom = adapter.collect_block_geometry(
                 model, tokenizer, li, texts_cal, max_len, device,
