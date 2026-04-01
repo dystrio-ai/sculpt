@@ -70,11 +70,25 @@ def _format_apps_solution(row: Dict) -> str:
     return q
 
 
+def _format_humaneval(row: Dict) -> str:
+    """Format HumanEval: prompt (docstring + signature) + canonical solution."""
+    return row.get("prompt", "") + row.get("canonical_solution", "")
+
+
+def _format_mbpp(row: Dict) -> str:
+    """Format MBPP: task description + code solution."""
+    desc = row.get("text", row.get("prompt", ""))
+    code = row.get("code", "")
+    return f"# {desc}\n{code}" if desc and code else desc or code
+
+
 _FORMATTERS: Dict[str, Callable[[Dict], str]] = {
     "openhermes": _format_openhermes,
     "mmlu_qa": _format_mmlu_qa,
     "gsm8k_qa": _format_gsm8k_qa,
     "apps_solution": _format_apps_solution,
+    "humaneval": _format_humaneval,
+    "mbpp": _format_mbpp,
 }
 
 
@@ -144,6 +158,33 @@ MIXTURE_PRESETS: Dict[str, List[Dict[str, Any]]] = {
             "dataset": "Open-Orca/OpenOrca", "config": "default",
             "split": "train", "text_field": "response", "weight": 0.15,
             "purpose": "instruction/reasoning, supports ARC/TQA",
+        },
+    ],
+    "code_v1": [
+        {
+            "dataset": "sahil2801/CodeAlpaca-20k", "config": "default",
+            "split": "train", "text_field": "output", "weight": 0.35,
+            "purpose": "code instruction pairs — primary code routing signal",
+        },
+        {
+            "dataset": "google-research-datasets/mbpp", "config": "full",
+            "split": "train", "formatter": "mbpp", "weight": 0.20,
+            "purpose": "MBPP coding tasks + solutions — aligns with code eval",
+        },
+        {
+            "dataset": "openai/openai_humaneval", "config": "openai_humaneval",
+            "split": "test", "formatter": "humaneval", "weight": 0.15,
+            "purpose": "HumanEval problems + solutions — aligns with code eval",
+        },
+        {
+            "dataset": "wikitext", "config": "wikitext-103-raw-v1",
+            "split": "train", "text_field": "text", "weight": 0.15,
+            "purpose": "language anchor — prevents total collapse on natural language",
+        },
+        {
+            "dataset": "teknium/OpenHermes-2.5", "config": "default",
+            "split": "train", "formatter": "openhermes", "weight": 0.15,
+            "purpose": "instruction following — minimal general capability retention",
         },
     ],
     "code_v2": [

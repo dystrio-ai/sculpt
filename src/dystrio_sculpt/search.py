@@ -352,7 +352,9 @@ class FrontierSearch:
             calib=self.calib, mixture_workload=self.mixture_workload,
         )
         try:
-            self._downstream_probe = load_downstream_probe(seed=self.seed)
+            self._downstream_probe = load_downstream_probe(
+                seed=self.seed, workload=self.mixture_workload,
+            )
         except Exception as exc:
             _log.warning("downstream probe load failed: %s — using PPL fallback", exc)
             self._downstream_probe = DownstreamProbe(questions=[])

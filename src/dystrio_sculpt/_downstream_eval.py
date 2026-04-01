@@ -25,6 +25,8 @@ _log = logging.getLogger(__name__)
 N_MMLU = 100
 N_HELLASWAG = 80
 N_ARC = 70
+N_HUMANEVAL = 80
+N_MBPP = 70
 
 
 @dataclass
@@ -119,23 +121,134 @@ def _load_arc_questions(n: int, seed: int = 42) -> List[Dict]:
     return questions
 
 
+def _load_humaneval_questions(n: int, seed: int = 42) -> List[Dict]:
+    """Load HumanEval test examples as code completion questions.
+
+    Each question presents a function signature + docstring and asks the model
+    to pick the correct completion from a set of candidates (the canonical
+    solution vs plausible distractors derived from the solution).
+    """
+    ds = load_dataset("openai/openai_humaneval", "openai_humaneval", split="test")
+    indices = list(range(len(ds)))
+    rng = random.Random(seed)
+    rng.shuffle(indices)
+    indices = indices[:n]
+
+    questions = []
+    for idx in indices:
+        row = ds[idx]
+        prompt = row["prompt"]
+        solution = row["canonical_solution"]
+
+        lines = [l for l in solution.split("\n") if l.strip()]
+        if len(lines) < 2:
+            continue
+
+        correct = solution.strip()
+        mid = max(1, len(lines) // 2)
+        distractor_a = "\n".join(lines[:mid]).strip()
+        distractor_b = "\n".join(lines[mid:]).strip()
+        distractor_c = "\n".join(reversed(lines)).strip()
+
+        choices = [correct, distractor_a, distractor_b, distractor_c]
+        label = 0
+        perm = list(range(4))
+        rng.shuffle(perm)
+        choices = [choices[i] for i in perm]
+        label = perm.index(0)
+
+        questions.append({
+            "task": "humaneval",
+            "context": prompt,
+            "choices": ["\n" + c for c in choices],
+            "label": label,
+            "task_id": row.get("task_id", ""),
+        })
+    return questions
+
+
+def _load_mbpp_questions(n: int, seed: int = 42) -> List[Dict]:
+    """Load MBPP examples as code generation questions.
+
+    Presents the task description and asks the model to pick the correct
+    code solution from candidates.
+    """
+    ds = load_dataset("google-research-datasets/mbpp", "full", split="test")
+    indices = list(range(len(ds)))
+    rng = random.Random(seed)
+    rng.shuffle(indices)
+    indices = indices[:n]
+
+    questions = []
+    for idx in indices:
+        row = ds[idx]
+        desc = row.get("text", row.get("prompt", ""))
+        code = row.get("code", "")
+        if not desc or not code:
+            continue
+
+        ctx = f"# Task: {desc}\n"
+        correct = code.strip()
+
+        lines = [l for l in correct.split("\n") if l.strip()]
+        if len(lines) < 2:
+            continue
+
+        mid = max(1, len(lines) // 2)
+        distractor_a = "\n".join(lines[:mid]).strip()
+        distractor_b = "\n".join(reversed(lines)).strip()
+        distractor_c = correct.replace("return", "yield", 1).strip()
+
+        choices = [correct, distractor_a, distractor_b, distractor_c]
+        label = 0
+        perm = list(range(4))
+        rng.shuffle(perm)
+        choices = [choices[i] for i in perm]
+        label = perm.index(0)
+
+        questions.append({
+            "task": "mbpp",
+            "context": ctx,
+            "choices": ["\n" + c for c in choices],
+            "label": label,
+        })
+    return questions
+
+
+# Code-related workload prefixes that trigger code-specific downstream eval.
+_CODE_WORKLOADS = frozenset({"code", "code_v1", "code_v2", "code_starcoder"})
+
+
 def load_downstream_probe(
     n_mmlu: int = N_MMLU,
     n_hellaswag: int = N_HELLASWAG,
     n_arc: int = N_ARC,
+    n_humaneval: int = N_HUMANEVAL,
+    n_mbpp: int = N_MBPP,
     seed: int = 42,
+    workload: Optional[str] = None,
 ) -> DownstreamProbe:
-    """Load the mini eval set.  Call once at search startup."""
-    _log.info(
-        "loading downstream probe: %d MMLU + %d HellaSwag + %d ARC questions",
-        n_mmlu, n_hellaswag, n_arc,
-    )
-    qs: List[Dict] = []
-    for loader, n, name in [
+    """Load the mini eval set.  Call once at search startup.
+
+    When *workload* is a code-specific preset, HumanEval and MBPP questions
+    are added (and weighted) to reflect code-generation quality.
+    """
+    is_code = workload in _CODE_WORKLOADS if workload else False
+
+    loaders: List[Tuple[object, int, str]] = [
         (_load_mmlu_questions, n_mmlu, "mmlu"),
         (_load_hellaswag_questions, n_hellaswag, "hellaswag"),
         (_load_arc_questions, n_arc, "arc"),
-    ]:
+    ]
+    if is_code:
+        loaders.append((_load_humaneval_questions, n_humaneval, "humaneval"))
+        loaders.append((_load_mbpp_questions, n_mbpp, "mbpp"))
+
+    total_str = " + ".join(f"{n} {name.upper()}" for _, n, name in loaders)
+    _log.info("loading downstream probe: %s questions", total_str)
+
+    qs: List[Dict] = []
+    for loader, n, name in loaders:
         try:
             loaded = loader(n, seed)
             qs.extend(loaded)
@@ -174,8 +287,13 @@ def _score_choice(
     return float(gathered.sum().item()) / choice_len
 
 
-# MMLU is weighted 2x because it's the most sensitive metric to compression.
-_TASK_WEIGHTS = {"mmlu": 2.0, "hellaswag": 1.0, "arc": 1.0}
+# MMLU is weighted 2x for general workloads.  HumanEval/MBPP get 2x for code
+# workloads — the weight map is the same for all workloads so that code
+# benchmarks naturally dominate when present.
+_TASK_WEIGHTS = {
+    "mmlu": 2.0, "hellaswag": 1.0, "arc": 1.0,
+    "humaneval": 2.0, "mbpp": 2.0,
+}
 
 
 @torch.no_grad()
