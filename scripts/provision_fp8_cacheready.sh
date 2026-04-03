@@ -19,7 +19,7 @@ set -euo pipefail
 ###############################################################################
 
 BRANCH="experimental/distill-repair"
-REPO="https://github.com/clusteroptimizerengine/BumbleB.git"
+REPO="${SCULPT_REPO:-https://github.com/dystrio/sculpt.git}"
 WORKDIR="$HOME/BumbleB"
 
 FP8_MODEL="Qwen/Qwen3.5-122B-A10B-FP8"

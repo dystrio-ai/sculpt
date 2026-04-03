@@ -18,13 +18,31 @@ pnn/
 # Experiment outputs
 runs/
 runs_*/
+sculpt_out*/
+bench_out*/
+eval_results/
+ablation_results/
 *.tar.gz
 zoo/
 
-# Cloned repos / model weights (not part of this repo)
+# Model weights (don't commit large files)
+*.safetensors
+*.bin
+*.pt
+*.gguf
+
+# Legacy / internal (removed from public repo)
+src/pnn_compiler/
+configs/
+charts/
+drafts/
+experiments/
+data/
+run_engine.py
+setup.py
+update_readmes.sh
 BumbleB/
 Mistral-7B-v0.1-sculpt-*/
-update_readmes.sh
 
 # Mac junk
 .DS_Store
@@ -34,3 +52,7 @@ __MACOSX/
 # IDE
 .vscode/
 .idea/
+
+# Logs
+*.log
+nohup.out

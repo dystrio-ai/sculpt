@@ -2,7 +2,7 @@
 set -euo pipefail
 
 export PYTHONPATH=~/BumbleB/src
-export HF_TOKEN="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"
+export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN environment variable}"
 
 TASKS="arc_challenge,hellaswag,mmlu,truthfulqa_mc2"
 BATCH="auto"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export HF_TOKEN="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"
+export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN environment variable}"
 
 PAIRS=(
   "dystrio/gemma-2-2b-it-sculpt-production gemma_production"

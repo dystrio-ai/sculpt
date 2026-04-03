@@ -35,6 +35,40 @@ def main(
     configure_logging(quiet=quiet, verbose=verbose)
 
 
+def _save_prescan_analysis(outpath: Path, search, workload=None) -> None:
+    """Save prescan structural analysis to JSON for visualization."""
+    import json
+
+    log = logging.getLogger("dystrio.sculpt")
+
+    analysis = {
+        "model_id": search.model_id,
+        "workload": workload,
+        "aggregate_risk": search.risk_score,
+        "layer_order": search.layer_order,
+        "per_layer_risk": {},
+    }
+
+    if isinstance(search.risk_detail, dict):
+        for key, val in search.risk_detail.items():
+            if key == "aggregate":
+                continue
+            analysis["per_layer_risk"][key] = val
+
+    for pt in search.evaluated:
+        if pt.compile_result and pt.compile_result.compile_report:
+            analysis.setdefault("pruning_decisions", {})[f"kf_{pt.keep_frac:.3f}"] = {
+                "keep_frac": pt.keep_frac,
+                "failed": pt.failed,
+                "per_layer": pt.compile_result.compile_report,
+            }
+
+    out_file = outpath / "prescan_analysis.json"
+    with open(out_file, "w") as f:
+        json.dump(analysis, f, indent=2, default=str)
+    log.info("prescan analysis saved to %s", out_file)
+
+
 def _print_summary_table(selected, baseline_metrics) -> None:
     """Print a compact summary table that users screenshot."""
     base_ppl = baseline_metrics.get("ppl_w103_valid", 1.0)
@@ -88,8 +122,9 @@ def sculpt(
     ),
     workload: Optional[str] = typer.Option(
         None, "--workload",
-        help="Workload preset: code, chat, or general. "
-             "Sets calibration/repair corpus to match the target distribution. "
+        help="Workload preset for calibration data. "
+             "Presets: general, general_v2 (recommended), code, code_v1, chat, math. "
+             "Sets calibration/repair corpus to match your deployment. "
              "Individual --calib-* flags override the preset.",
     ),
     calib_dataset: Optional[str] = typer.Option(
@@ -135,9 +170,15 @@ def sculpt(
         help="Cache teacher logits before repair (~2x speedup with same quality). "
              "Default: on when distillation is enabled.",
     ),
+    distill_loss: str = typer.Option(
+        "jsd", "--distill-loss",
+        help="Distillation loss function: jsd (default, recommended — symmetric, "
+             "mode-seeking + mode-covering) or kl (legacy forward-KL).",
+    ),
     push_dataset: bool = typer.Option(
-        True, "--push-dataset/--no-push-dataset",
-        help="Push results to the Dystrio Efficiency Dataset on HuggingFace.",
+        False, "--push-dataset/--no-push-dataset",
+        help="Push results to the Dystrio Efficiency Dataset on HuggingFace. "
+             "Off by default — opt in to contribute your run data.",
     ),
     speed_profile: Optional[str] = typer.Option(
         None, "--speed-profile",
@@ -164,6 +205,17 @@ def sculpt(
         help="Comma-separated keep_frac values to evaluate (skip search, "
              "evaluate only these). E.g. '0.90,0.75' for two specific points.",
     ),
+    save_prescan: bool = typer.Option(
+        False, "--save-prescan/--no-save-prescan",
+        help="Save prescan structural analysis (per-layer risk scores, "
+             "compressibility order) to prescan_analysis.json for visualization.",
+    ),
+    selector: str = typer.Option(
+        "structural", "--selector",
+        help="Block selection algorithm: structural (default, Physarum), "
+             "sensitivity (importance-only, no Physarum), magnitude, random. "
+             "Use non-default selectors for ablation studies.",
+    ),
 ) -> None:
     """Compile a model across a Pareto frontier of quality vs speed."""
     log = logging.getLogger("dystrio.sculpt")
@@ -173,12 +225,23 @@ def sculpt(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype_str = "bf16" if device == "cuda" else "fp32"
 
+    if device == "cpu":
+        log.warning("")
+        log.warning("=" * 60)
+        log.warning("  NO GPU DETECTED — running on CPU.")
+        log.warning("  This will be 10-100x slower than GPU.")
+        log.warning("  For production use, run on a CUDA GPU.")
+        log.warning("=" * 60)
+        log.warning("")
+
     log.info("Dystrio Sculpt starting")
     log.info("  model:         %s", model_id)
     log.info("  outdir:        %s", outdir)
     log.info("  frontier:      %d", frontier)
     log.info("  deterministic: %s", deterministic)
     log.info("  device:        %s", device)
+    if selector != "structural":
+        log.info("  selector:      %s (ablation mode)", selector)
     log.info("  ppl_ceiling:   %s", max_ppl_multiplier if max_ppl_multiplier else "2.0 (default)")
     if target_prefill_speedup is not None:
         log.info("  target_speed:  %.2fx", target_prefill_speedup)
@@ -189,7 +252,7 @@ def sculpt(
     if distill_alpha is not None:
         distill = True
     if distill:
-        log.info("  distill:       enabled (alpha=%s, cache=%s)", distill_alpha or "adaptive", distill_cache)
+        log.info("  distill:       enabled (loss=%s, alpha=%s, cache=%s)", distill_loss, distill_alpha or "adaptive", distill_cache)
     if speed_profile is not None:
         log.info("  speed_profile: %s", speed_profile)
     if use_risk_schedule:
@@ -295,6 +358,8 @@ def sculpt(
         distill=distill,
         distill_alpha=distill_alpha,
         distill_cache=distill_cache,
+        distill_loss_fn=distill_loss,
+        selector=selector,
         speed_profile=speed_profile,
         use_risk_schedule=use_risk_schedule,
         protection_threshold=protection_threshold,
@@ -308,6 +373,9 @@ def sculpt(
     if not selected:
         log.error("no viable frontier points found")
         raise typer.Exit(code=1)
+
+    if save_prescan and search.risk_detail:
+        _save_prescan_analysis(outpath, search, workload=mixture_wl or workload)
 
     for pt in selected:
         cr = pt.compile_result
@@ -398,12 +466,32 @@ def sculpt(
     if n_extra:
         log.info("recorded %d additional UNSAFE points for degradation curve", n_extra)
 
+    log.info("")
     log.info("=" * 80)
-    log.info(
-        "Sculpt complete: %d points emitted to %s  (risk=%.3f, ceiling=%.2fx)",
-        len(selected), outpath, search.risk_score, search.max_ppl_multiplier,
-    )
+    log.info("  SCULPT COMPLETE")
+    log.info("=" * 80)
     _print_summary_table(selected, search.baseline_metrics or {})
+    log.info("")
+
+    base_w = (search.baseline_metrics or {}).get("weights_gb", 0)
+    for pt in selected:
+        cr = pt.compile_result
+        w_gb = cr.weights_bytes / 1e9 if cr and cr.weights_bytes else 0
+        reduction = ((base_w - w_gb) / base_w * 100) if base_w > 0 and w_gb > 0 else 0
+        model_path = outpath / pt.label / "model"
+        log.info("  %s", pt.label)
+        log.info("    %.1f GB  (%.0f%% smaller)", w_gb, reduction)
+        log.info("    %s", model_path)
+
+    log.info("")
+    best = selected[0]
+    best_path = outpath / best.label / "model"
+    log.info("  Load your sculpted model:")
+    log.info("")
+    log.info('    from transformers import AutoModelForCausalLM, AutoTokenizer')
+    log.info('    model = AutoModelForCausalLM.from_pretrained("%s")', best_path)
+    log.info('    tokenizer = AutoTokenizer.from_pretrained("%s")', best_path)
+    log.info("")
     log.info("=" * 80)
 
 

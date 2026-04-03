@@ -18,7 +18,7 @@ set -euo pipefail
 ###############################################################################
 
 BRANCH="experimental/distill-repair"
-REPO="https://github.com/clusteroptimizerengine/BumbleB.git"
+REPO="${SCULPT_REPO:-https://github.com/dystrio/sculpt.git}"
 WORKDIR="$HOME/BumbleB"
 
 echo "============================================================"

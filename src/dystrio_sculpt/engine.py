@@ -30,7 +30,8 @@ from ._bench import (
 from ._compile import compress_mlp_layer_swiglu_inplace
 from .selectors import select_for_layer, BLOCK_SIZE
 from .selectors.structural import prescan_structural_artifacts, CrossLayerNoveltyTracker
-from .repair import repair_layers, build_teacher_cache, _snapshot_trainable, _restore_trainable
+from .repair import repair_layers, build_teacher_cache, _snapshot_trainable, _restore_trainable, adaptive_distill_alpha
+from .risk import layer_risk_score
 from .policy import RepairPolicy, auto_select_policy, build_policy_ladder, escalate_policy, HELPFUL_THRESHOLD
 from .architectures.base import ArchitectureAdapter
 
@@ -254,6 +255,7 @@ def compile_model(
     distill: bool = False,
     distill_alpha_override: Optional[float] = None,
     distill_cache: bool = True,
+    distill_loss_fn: str = "jsd",
     keep_schedule: Optional[Dict[int, float]] = None,
     adapter: Optional[ArchitectureAdapter] = None,
 ) -> CompileResult:
@@ -303,8 +305,8 @@ def compile_model(
 
     rng = np.random.RandomState(seed) if deterministic else None
 
-    if prescan_cache is None and selector == "structural":
-        _log.info("running structural prescan on %d layers", num_layers)
+    if prescan_cache is None and selector in ("structural", "sensitivity"):
+        _log.info("running structural prescan on %d layers (%s selector)", num_layers, selector)
         prescan_cache = prescan_structural_artifacts(
             model, tok, layers, texts["cal"], MAX_LEN, device,
             block_size=BLOCK_SIZE, adapter=adapter,
@@ -324,7 +326,11 @@ def compile_model(
         elif policy is not None and policy.distill_alpha > 0.0:
             distill_alpha = policy.distill_alpha
         else:
-            distill_alpha = 0.5
+            distill_alpha = adaptive_distill_alpha(0.5, keep_frac)
+            _log.info(
+                "adaptive distill alpha: %.3f (base=0.5, keep_frac=%.3f)",
+                distill_alpha, keep_frac,
+            )
         if distill_alpha > 0.0:
             teacher_model = _create_teacher(eval_model, model_id, device, dtype, distill_alpha)
             if distill_cache and teacher_model is not None:
@@ -357,6 +363,17 @@ def compile_model(
             original_ffn_dims[li] = adapter.get_ffn_size(model, li)
         else:
             original_ffn_dims[li] = get_mlp(model, li).gate_proj.out_features
+
+    # Pre-compute per-layer risk scores for repair LR scaling
+    layer_risk_map: Dict[int, float] = {}
+    if prescan_cache:
+        for li in sorted(prescan_cache.keys()):
+            pre = prescan_cache[li]
+            bs = pre.get("block_sensitivity")
+            D = pre.get("D")
+            if bs is not None and D is not None:
+                risk, _ = layer_risk_score(bs, D, pre.get("block_energy"))
+                layer_risk_map[li] = risk
 
     novelty_tracker = CrossLayerNoveltyTracker() if selector == "structural" else None
 
@@ -513,7 +530,9 @@ def compile_model(
                 max_grad_norm=current_policy.max_grad_norm,
                 save_best=True, pre_repair_metric=stage_ppl,
                 teacher_model=teacher_model, distill_alpha=distill_alpha,
+                distill_loss_fn=distill_loss_fn,
                 teacher_cache=teacher_logit_cache,
+                layer_risk=layer_risk_map or None,
                 adapter=adapter,
             )
             total_repair_steps += int(sr["steps"])
@@ -566,7 +585,9 @@ def compile_model(
                         max_grad_norm=fallback.max_grad_norm,
                         save_best=True, pre_repair_metric=stage_ppl,
                         teacher_model=teacher_model, distill_alpha=distill_alpha,
+                        distill_loss_fn=distill_loss_fn,
                         teacher_cache=teacher_logit_cache,
+                        layer_risk=layer_risk_map or None,
                         adapter=adapter,
                     )
                     total_repair_steps += int(sr2["steps"])
@@ -655,7 +676,9 @@ def compile_model(
             max_grad_norm=current_policy.max_grad_norm,
             save_best=True, pre_repair_metric=pre_final_ppl,
             teacher_model=teacher_model, distill_alpha=distill_alpha,
+            distill_loss_fn=distill_loss_fn,
             teacher_cache=teacher_logit_cache,
+            layer_risk=layer_risk_map or None,
             adapter=adapter,
         )
         total_repair_steps += int(fr["steps"])
@@ -735,7 +758,9 @@ def compile_model(
         "distillation": {
             "enabled": distill,
             "alpha": distill_alpha,
+            "loss_fn": distill_loss_fn,
             "cached": teacher_logit_cache is not None,
+            "risk_scaled_lr": bool(layer_risk_map),
         },
     }
 

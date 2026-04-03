@@ -270,6 +270,7 @@ class FrontierSearch:
         distill: bool = False,
         distill_alpha: Optional[float] = None,
         distill_cache: bool = True,
+        distill_loss_fn: str = "jsd",
         speed_profile: Optional[str] = None,
         use_risk_schedule: bool = False,
         protection_threshold: Optional[float] = None,
@@ -306,6 +307,7 @@ class FrontierSearch:
         self.distill = distill
         self.distill_alpha = distill_alpha
         self.distill_cache = distill_cache
+        self.distill_loss_fn = distill_loss_fn
         self.mixture_workload = mixture_workload
 
         # Downstream SLO threshold (e.g. 0.95 = keep >=95% of baseline accuracy)
@@ -398,7 +400,7 @@ class FrontierSearch:
             torch.cuda.empty_cache()
 
     def _compute_prescan(self) -> None:
-        if self.selector != "structural":
+        if self.selector not in ("structural", "sensitivity"):
             return
         _log.info("running structural prescan (cached for all iterations)")
         setup_determinism(self.seed, self.deterministic)
@@ -531,6 +533,7 @@ class FrontierSearch:
                 distill=self.distill,
                 distill_alpha_override=self.distill_alpha,
                 distill_cache=self.distill_cache,
+                distill_loss_fn=self.distill_loss_fn,
                 keep_schedule=schedule,
                 adapter=self.adapter,
             )

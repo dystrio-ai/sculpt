@@ -6,6 +6,12 @@ Supports cached teacher logits: pre-compute top-k teacher softmax
 probabilities once, then reuse across all repair stages. Eliminates
 the teacher forward pass from the inner loop (~2x speedup with
 distillation quality preserved).
+
+Distillation loss functions:
+  - ``jsd`` (default): Jensen-Shannon Divergence — symmetric, bounded,
+    mode-seeking + mode-covering.  Fixes ARC/HellaSwag regression
+    observed with forward KL.
+  - ``kl``: Forward KL(teacher || student) — legacy Hinton 2015 behaviour.
 """
 
 from __future__ import annotations
@@ -121,6 +127,97 @@ def _kl_from_cache(
     return kl * (distill_temp ** 2)
 
 
+def _jsd_from_cache(
+    student_logits: torch.Tensor,
+    cache_entry: TeacherCacheEntry,
+    distill_temp: float,
+) -> torch.Tensor:
+    """Jensen-Shannon Divergence using cached sparse teacher probabilities.
+
+    JSD(P, Q) = 0.5 * KL(P || M) + 0.5 * KL(Q || M),  M = 0.5(P + Q).
+
+    Computed at the teacher's top-K indices where probability mass is
+    concentrated.  Non-top-K residual contributes negligible gradient.
+    """
+    student_probs = F.softmax(student_logits / distill_temp, dim=-1)
+
+    top_k_vals = cache_entry.top_k_vals.to(
+        device=student_probs.device, dtype=student_probs.dtype,
+    )
+    top_k_idx = cache_entry.top_k_idx.to(device=student_probs.device).long()
+
+    if student_probs.dim() == 3:
+        student_probs = student_probs.squeeze(0)
+
+    seq_len = min(student_probs.shape[0], top_k_vals.shape[0])
+    student_probs = student_probs[:seq_len]
+    top_k_vals = top_k_vals[:seq_len]
+    top_k_idx = top_k_idx[:seq_len]
+
+    student_at_topk = student_probs.gather(-1, top_k_idx)
+
+    m = 0.5 * (top_k_vals + student_at_topk)
+    m = m.clamp(min=1e-8)
+    log_m = m.log()
+
+    kl_teacher_m = (top_k_vals * (top_k_vals.clamp(min=1e-8).log() - log_m)).sum(-1).mean()
+    kl_student_m = (student_at_topk * (student_at_topk.clamp(min=1e-8).log() - log_m)).sum(-1).mean()
+
+    return 0.5 * (kl_teacher_m + kl_student_m) * (distill_temp ** 2)
+
+
+def _distill_loss_from_cache(
+    student_logits: torch.Tensor,
+    cache_entry: TeacherCacheEntry,
+    distill_temp: float,
+    loss_fn: str = "jsd",
+) -> torch.Tensor:
+    """Dispatch to the appropriate cached distillation loss."""
+    if loss_fn == "jsd":
+        return _jsd_from_cache(student_logits, cache_entry, distill_temp)
+    return _kl_from_cache(student_logits, cache_entry, distill_temp)
+
+
+def _distill_loss_live(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    distill_temp: float,
+    loss_fn: str = "jsd",
+) -> torch.Tensor:
+    """Compute distillation loss from live teacher logits."""
+    teacher_probs = F.softmax(teacher_logits / distill_temp, dim=-1)
+    V = student_logits.size(-1)
+
+    if loss_fn == "jsd":
+        student_probs = F.softmax(student_logits / distill_temp, dim=-1)
+        m = 0.5 * (teacher_probs + student_probs)
+        log_m = m.clamp(min=1e-8).log().reshape(-1, V)
+        kl_teacher_m = F.kl_div(
+            log_m, teacher_probs.reshape(-1, V), reduction="batchmean",
+        )
+        kl_student_m = F.kl_div(
+            log_m, student_probs.reshape(-1, V), reduction="batchmean",
+        )
+        return 0.5 * (kl_teacher_m + kl_student_m) * (distill_temp ** 2)
+
+    student_log_probs = F.log_softmax(student_logits / distill_temp, dim=-1)
+    return F.kl_div(
+        student_log_probs.reshape(-1, V),
+        teacher_probs.reshape(-1, V),
+        reduction="batchmean",
+    ) * (distill_temp ** 2)
+
+
+def adaptive_distill_alpha(base_alpha: float, keep_frac: float) -> float:
+    """Scale distillation alpha by compression severity.
+
+    More compression (lower keep_frac) → more teacher reliance.
+    Returns alpha clamped to [0.1, 0.9].
+    """
+    alpha = base_alpha + (1.0 - keep_frac) * 0.5
+    return max(0.1, min(0.9, alpha))
+
+
 def cosine_lr(step: int, total: int, base_lr: float, warmup: int) -> float:
     if step < warmup:
         return base_lr * (step + 1) / max(1, warmup)
@@ -176,7 +273,9 @@ def repair_layers(
     teacher_model=None,
     distill_alpha: float = 0.0,
     distill_temp: float = 2.0,
+    distill_loss_fn: str = "jsd",
     teacher_cache: Optional[List[Optional[TeacherCacheEntry]]] = None,
+    layer_risk: Optional[Dict[int, float]] = None,
     adapter=None,
 ) -> Dict[str, Any]:
     """Train only MLP params in selected layers with best-checkpoint restore.
@@ -200,6 +299,16 @@ def repair_layers(
        ``build_teacher_cache``) — uses pre-computed top-k teacher softmax
        probabilities.  Same quality, ~2x faster.  Preferred.
 
+    Distillation loss functions (``distill_loss_fn``):
+
+    - ``jsd`` (default): Jensen-Shannon Divergence — symmetric, bounded.
+    - ``kl``: Forward KL(teacher || student) — legacy behaviour.
+
+    Per-layer learning rate scaling (``layer_risk``):
+
+    When provided, maps layer index → structural risk score in [0, 1].
+    Higher-risk layers get proportionally larger LR: ``lr * (0.5 + risk)``.
+
     Returns dict with: steps, microsteps, curve, early_stopped, best_metric,
     best_step, repaired_ok.
     """
@@ -210,22 +319,48 @@ def repair_layers(
     if use_distill:
         mode = "cached" if use_distill_cached else "live"
         _log.info(
-            "distillation enabled (%s): alpha=%.2f temp=%.1f",
-            mode, distill_alpha, distill_temp,
+            "distillation enabled (%s): loss=%s alpha=%.2f temp=%.1f",
+            mode, distill_loss_fn, distill_alpha, distill_temp,
         )
 
     for p in model.parameters():
         p.requires_grad = False
+
+    # Build optimizer param groups — per-layer risk scaling when available
+    _use_risk_lr = bool(layer_risk is not None and adapter is None and layer_risk)
     if adapter is not None:
         params = adapter.get_trainable_params(model, layers)
         for p in params:
             p.requires_grad = True
+        param_groups_or_params: Any = params
+    elif _use_risk_lr:
+        param_groups: List[Dict[str, Any]] = []
+        for li in layers:
+            layer_params = list(get_mlp(model, li).parameters())
+            for p in layer_params:
+                p.requires_grad = True
+            risk = layer_risk.get(li, 0.5)
+            scale = 0.5 + risk
+            param_groups.append({
+                "params": layer_params,
+                "_lr_scale": scale,
+                "lr": lr * scale,
+            })
+        if _use_risk_lr:
+            _log.info(
+                "risk-scaled LR: min=%.3f max=%.3f across %d layers",
+                min(pg["_lr_scale"] for pg in param_groups),
+                max(pg["_lr_scale"] for pg in param_groups),
+                len(param_groups),
+            )
+        param_groups_or_params = param_groups
     else:
         params = []
         for li in layers:
             for p in get_mlp(model, li).parameters():
                 p.requires_grad = True
                 params.append(p)
+        param_groups_or_params = params
 
     # Local dispatch helpers so the rest of repair_layers stays clean
     def _snap() -> Dict[str, torch.Tensor]:
@@ -244,7 +379,7 @@ def repair_layers(
     if pre_repair_metric is not None:
         pre_repair_snap = _snap()
 
-    opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    opt = torch.optim.AdamW(param_groups_or_params, lr=lr, weight_decay=weight_decay)
     model.train()
 
     t0 = time.time()
@@ -331,7 +466,7 @@ def repair_layers(
 
         lr_now = cosine_lr(opt_step, steps, lr, warmup)
         for pg in opt.param_groups:
-            pg["lr"] = lr_now
+            pg["lr"] = lr_now * pg.get("_lr_scale", 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
         opt_step += 1
@@ -444,4 +579,6 @@ def repair_layers(
         "distillation_enabled": use_distill,
         "distill_alpha": distill_alpha if use_distill else 0.0,
         "distill_temp": distill_temp if use_distill else 0.0,
+        "distill_loss_fn": distill_loss_fn if use_distill else None,
+        "risk_scaled_lr": _use_risk_lr,
     }

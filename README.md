@@ -1,349 +1,292 @@
 # Dystrio Sculpt
 
-Structural FFN compiler for decoder-only transformer LLMs. Sculpt removes
-redundant neurons from SwiGLU feed-forward blocks using operator-fidelity
-analysis, coupling-geometry diversity scoring, and staged repair fine-tuning.
-The result is a smaller, faster HuggingFace-compatible model with controlled
-quality loss.
+Structural compression for transformer LLMs. Sculpt removes redundant neurons
+from feed-forward blocks (dense models) and prunes redundant experts from
+Mixture-of-Experts layers, then repairs quality with knowledge distillation.
+The output is a smaller, faster model that loads with standard HuggingFace
+`AutoModelForCausalLM.from_pretrained()` — no custom code, no special runtime.
 
-## What Sculpt does
+## Highlights
 
-1. **Analyze** — Prescan all FFN layers on the uncompressed model to measure
-   block-level operator sensitivity and inter-block coupling geometry.
-2. **Score risk** — Compute a structural risk score per layer (and aggregate)
-   from sensitivity, coupling concentration, and spectrum rank. This steers
-   the search bracket, repair policy, and stage ordering automatically.
-3. **Select** — Rank neuron blocks using a Physarum-inspired diversity penalty
-   on top of operator-fidelity scores. Blocks that are both unimportant and
-   redundant with their neighbours are pruned first.
-4. **Slice** — Physically remove the pruned neurons from `gate_proj`,
-   `up_proj`, and `down_proj` weight matrices. The model stays a valid
-   HuggingFace checkpoint with a uniform reduced `intermediate_size`.
-5. **Repair** — Fine-tune only the compressed MLP parameters with a cosine LR
-   schedule, staged across layer groups ordered by compressibility (safest
-   first) to prevent catastrophic quality loss.
-6. **Validate** — Reload the saved model and run a forward pass to confirm no
-   NaN/Inf and correct output shapes.
+- **One command** — `dystrio sculpt --model-id <hf_model>` handles everything
+- **Dense + MoE** — prunes SwiGLU neurons (dense) or entire experts (MoE)
+- **Drop-in output** — standard HuggingFace checkpoints, works with vLLM, TGI, llama.cpp, GGUF
+- **Quality-aware** — Thompson Sampling search finds the fastest model within your quality budget
+- **Workload presets** — calibrate for general, code, or custom workloads
+- **Stackable** — output is structurally pruned, orthogonal to quantization (GPTQ, AWQ, GGUF)
 
-## Default behaviour: fastest safe model
+## Published Models
 
-By default Sculpt searches for the **fastest model under a quality ceiling**
-(`--max-ppl-multiplier`, default 2.0x baseline PPL). The search algorithm
-(Safe Bracket Search) uses structural priors to choose an initial bracket of
-`keep_frac` candidates adapted to the model's risk profile:
+Pre-sculpted models are available on [HuggingFace](https://huggingface.co/dystrio):
 
-| Risk level | Starting bracket | Description |
-|---|---|---|
-| Low (≤ 0.35) | 0.85 → 0.55 | Aggressively explore — model tolerates pruning |
-| Medium | 0.88 → 0.62 | Standard sweep |
-| High (≥ 0.65) | 0.92 → 0.72 | Conservative — tight coupling or high sensitivity |
+| Model | Type | Tier | Memory Reduction | Avg Benchmark Delta |
+|-------|------|------|-----------------|-------------------|
+| Mistral-7B-Instruct-v0.3 | Dense | Production | 11% | -0.2% |
+| Mistral-7B-Instruct-v0.3 | Dense | Throughput | 18% | -1.4% |
+| Llama-3.1-8B-Instruct | Dense | Production | 12% | -0.5% |
+| Llama-3.2-3B-Instruct | Dense | Production | 10% | -0.3% |
+| Qwen2.5-3B-Instruct | Dense | Production | 11% | -0.4% |
+| gemma-2-2b-it | Dense | Production | 9% | -0.1% |
+| OLMoE-1B-7B-0924 | MoE | Balanced | 9% | +0.04% |
 
-Points that exceed the quality ceiling are rejected immediately. The search
-then bisects the safe/unsafe boundary to find the fastest keep_frac that stays
-within budget.
+All models evaluated with [lm-eval](https://github.com/EleutherAI/lm-evaluation-harness)
+on ARC-Challenge, HellaSwag, MMLU, and TruthfulQA. Full results in each model card.
 
-## Uniform-width artifact guarantee
+## Workload-Aware Compression
 
-All emitted models use a **single scalar `intermediate_size`** across all
-layers. This means every artifact is a drop-in HuggingFace checkpoint — no
-custom model classes, no per-layer width vectors, no special runtime code.
-Just `AutoModelForCausalLM.from_pretrained(path)`.
-
-## Enterprise hardening (V1)
-
-- **Structural risk scoring** — Prescan-derived risk score (sensitivity +
-  coupling concentration + spectrum rank) drives bracket selection, policy
-  ladder start, and repair budget scaling.
-- **Adaptive repair policy selection** — Pilot compile auto-selects a stable
-  repair LR and stage size. High-risk models start lower on the policy ladder.
-- **Risk-scaled repair** — High-risk models get more repair steps and larger
-  cheap-eval subsets automatically.
-- **Compressibility-ordered staging** — Layers are compressed safest-first
-  (sorted by increasing risk) to reduce inter-stage interference.
-- **Best-checkpoint restore** — During every repair loop the best metric
-  checkpoint is tracked and restored at end. Late regression is never shipped.
-- **"Never ship worse than compiled" invariant** — If repair fails to improve,
-  pre-repair weights are restored and the candidate is excluded from the
-  frontier.
-- **Staged rollback with policy downshift** — If a stage repair fails, the
-  stage is rolled back and retried with a more conservative policy.
-- **Quality ceiling enforcement** — No point is labelled "balanced" if its
-  PPL ratio exceeds the ceiling. If no safe point exists, only "conservative"
-  is emitted with a clear message.
-- **Deterministic two-tier evaluation** — Cheap eval for search; full eval
-  only on final selected points.
-
-## Logging and verbosity
-
-By default, Dystrio suppresses noisy output from Hugging Face libraries,
-httpx, and datasets (including harmless 404 probes for `additional_chat_templates`
-etc.). Only Dystrio's own INFO-level logs are shown.
+Structural redundancy is not absolute — it depends on what you use the model for.
+A neuron that's dead weight for code generation may be critical for math reasoning.
+Sculpt uses workload-specific calibration data so the Physarum selector identifies
+neurons and experts that are redundant **for your use case**.
 
 ```bash
-# Default: clean, product-like output
-dystrio sculpt --model-id Qwen/Qwen2-0.5B
+# Code-optimized: finds more redundancy by deprioritizing general-knowledge neurons
+dystrio sculpt --model-id meta-llama/Llama-3.1-8B-Instruct --workload code_v1
 
-# Quiet: warnings and errors only, progress bars disabled
-dystrio -q sculpt --model-id Qwen/Qwen2-0.5B
-
-# Verbose: full debug output including HF/httpx request tracing
-dystrio -v sculpt --model-id Qwen/Qwen2-0.5B
+# General: preserves broad capability, more conservative compression
+dystrio sculpt --model-id meta-llama/Llama-3.1-8B-Instruct --workload general_v2
 ```
 
-The `--quiet` / `-q` and `--verbose` / `-v` flags are global (apply to all
-commands: `sculpt`, `bench`, `bench-report`, `bench-audit`). They are mutually
-exclusive.
+Different workloads produce different models:
+- **Code workload** finds more structural redundancy because general-knowledge
+  neurons idle during code processing — quality loss concentrates in off-target
+  benchmarks (MMLU) while code benchmarks (HumanEval, MBPP) are preserved.
+- **General workload** compresses more conservatively to preserve all capabilities evenly.
+- **MoE models** show the effect most dramatically: different workloads activate
+  different expert subsets, so entire experts can be safely removed when they don't
+  contribute to the target workload.
 
-## Quick start
+Run the full showcase study to see workload-aware divergence on your hardware:
+
+```bash
+bash scripts/workload_showcase.sh
+```
+
+## Quick Start
 
 ```bash
 pip install -e .
 
+# Dense model — search for fastest safe compression
 dystrio sculpt --model-id Qwen/Qwen2-0.5B --outdir sculpt_out --frontier 4
+
+# MoE model — drop 10% of experts
+dystrio sculpt --model-id allenai/OLMoE-1B-7B-0924 --keep-fracs 0.90 --outdir sculpt_moe
+
+# Code-specialized workload
+dystrio sculpt --model-id mistralai/Mixtral-8x7B-v0.1 --workload code_v1 --outdir sculpt_code
 ```
 
-This will:
-- Compute structural risk score from prescan.
-- Auto-select a risk-aware repair policy via pilot compile.
-- Search for the fastest safe models under 2.0x PPL ceiling.
-- Emit up to 4 named points under `sculpt_out/`.
-
-Each frontier directory contains:
+Output:
 
 ```
 sculpt_out/
   frontier_0_conservative/
-    model/          # save_pretrained output (config.json, safetensors, tokenizer)
-    metrics.json    # PPL, throughput, speedup, risk_score
+    model/              # HuggingFace checkpoint (config.json, safetensors, tokenizer)
+    metrics.json        # PPL, throughput, speedup, memory, risk score
     compile_report.json
-    manifest.json   # full reproducibility record
+    manifest.json       # Full reproducibility record
   frontier_1_balanced/
     ...
-  summary.csv       # incremental summary with risk_score column
+  summary.csv
 ```
 
-## Frontier example
+Load a sculpted model:
 
-Search for the fastest model that stays within 1.5x baseline perplexity:
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained("sculpt_out/frontier_0_conservative/model")
+tokenizer = AutoTokenizer.from_pretrained("sculpt_out/frontier_0_conservative/model")
+```
+
+## How It Works
+
+1. **Prescan** — Measure operator sensitivity and inter-block coupling geometry
+   across all FFN layers (or expert routing statistics for MoE)
+2. **Risk scoring** — Compute structural risk per layer from sensitivity,
+   coupling concentration, and spectrum rank
+3. **Select** — Rank neurons/experts using a Physarum-inspired diversity penalty
+   on top of operator-fidelity scores
+4. **Compress** — Physically remove pruned neurons from weight matrices (dense)
+   or drop + merge experts (MoE). Staged by compressibility: safest layers first
+5. **Repair** — Knowledge distillation fine-tuning with cosine LR, regression
+   tripwires, and best-checkpoint restore
+6. **Validate** — Reload saved model, verify shapes and no NaN/Inf
+
+### Dense Models
+
+Sculpt removes neurons from `gate_proj`, `up_proj`, and `down_proj` weight
+matrices. The output has a uniform reduced `intermediate_size` across all
+layers — a standard HuggingFace config change with no per-layer width vectors.
+
+### MoE Models
+
+For Mixture-of-Experts architectures, Sculpt drops entire experts per layer.
+Dropped experts are merged into their most-coupled surviving neighbor (weighted
+by routing correlation) before removal. The router is patched to redistribute
+load across remaining experts.
+
+## Supported Architectures
+
+| Family | Models | Mode |
+|--------|--------|------|
+| Llama | Llama 2, Llama 3, Llama 3.1, Llama 3.2 | Dense |
+| Mistral | Mistral 7B, Mistral Nemo | Dense |
+| Qwen | Qwen2, Qwen2.5 | Dense |
+| Gemma | Gemma 2 | Dense |
+| Phi | Phi-3, Phi-3.5 | Dense |
+| Mixtral | Mixtral-8x7B, Mixtral-8x22B | MoE |
+| OLMoE | OLMoE-1B-7B | MoE |
+| Starcoder | Starcoder2-15B | Dense |
+| MiniCPM | MiniCPM-o | Dense |
+
+Any decoder-only transformer with SwiGLU FFN blocks (`gate_proj`/`up_proj`/`down_proj`)
+should work out of the box. Use `dystrio factory fingerprint --model-id <model>`
+to check compatibility.
+
+## Workload Presets
+
+Sculpt calibrates on task-specific data mixtures to preserve what matters for
+your deployment:
+
+| Preset | Focus | Sources |
+|--------|-------|---------|
+| `general_v2` | Balanced general capability | WikiText, MMLU, OpenHermes, HellaSwag, GSM8K, OpenOrca |
+| `code_v1` | Code generation | CodeAlpaca, MBPP, HumanEval, WikiText, OpenHermes |
 
 ```bash
-dystrio sculpt \
-  --model-id Qwen/Qwen2-0.5B \
-  --outdir sculpt_constrained \
-  --frontier 3 \
-  --max-ppl-multiplier 1.5
+# General workload (default)
+dystrio sculpt --model-id <model> --workload general_v2
+
+# Code-focused workload
+dystrio sculpt --model-id <model> --workload code_v1
 ```
 
-Target a specific prefill speedup:
+## Search Behavior
+
+By default Sculpt uses Thompson Sampling to search for the fastest model under
+a quality ceiling (`--max-ppl-multiplier`, default 2.0x baseline PPL). The risk
+score from prescan adapts the search bracket:
+
+| Risk | Starting Bracket | Strategy |
+|------|-----------------|----------|
+| Low (< 0.35) | 0.85 - 0.55 | Aggressive — model tolerates pruning |
+| Medium | 0.88 - 0.62 | Standard sweep |
+| High (> 0.65) | 0.92 - 0.72 | Conservative — tight coupling |
+
+To skip search and evaluate specific compression levels:
 
 ```bash
-dystrio sculpt \
-  --model-id Qwen/Qwen2-0.5B \
-  --outdir sculpt_fast \
-  --frontier 2 \
-  --target-prefill-speedup 1.3
+dystrio sculpt --model-id <model> --keep-fracs 0.90 0.85 0.75
 ```
 
-Time-bounded search (stop after 2 hours):
+## Benchmarking
 
-```bash
-dystrio sculpt \
-  --model-id Qwen/Qwen2-0.5B \
-  --outdir sculpt_timed \
-  --frontier 4 \
-  --max-compile-hours 2.0
-```
-
-## Custom calibration corpus
-
-By default Sculpt calibrates on `wikitext / wikitext-2-raw-v1 / train`.
-You can point it at any Hugging Face dataset:
-
-```bash
-dystrio sculpt \
-  --model-id Qwen/Qwen2-0.5B \
-  --outdir sculpt_c4 \
-  --calib-dataset allenai/c4 \
-  --calib-config en \
-  --calib-split train \
-  --calib-text-field text \
-  --calib-num-samples 1000 \
-  --calib-seed 42
-```
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--calib-dataset` | `wikitext` | HF dataset identifier |
-| `--calib-config` | `wikitext-2-raw-v1` | Dataset config name |
-| `--calib-split` | `train` | Dataset split |
-| `--calib-text-field` | `text` | Name of the text column |
-| `--calib-num-samples` | all available | Max calibration samples (deterministically sampled) |
-| `--calib-seq-len` | model default | Override sequence length for calibration |
-| `--calib-seed` | 0 | Seed for calibration sampling |
-
-Eval always uses WikiText-103 validation for comparable PPL measurement
-regardless of calibration corpus. The calibration dataset parameters are
-recorded in `run_metadata.json` for reproducibility.
-
-## Deterministic builds
-
-For bitwise-reproducible compilation:
-
-```bash
-dystrio sculpt \
-  --model-id Qwen/Qwen2-0.5B \
-  --outdir sculpt_deterministic \
-  --frontier 4 \
-  --deterministic
-```
-
-Deterministic mode:
-- Seeds `random`, `numpy`, `torch`, and CUDA RNGs.
-- Disables TF32 matmul and cuDNN non-deterministic algorithms.
-- Uses an isolated `np.random.RandomState` inside the structural selector's
-  Physarum conductance solver.
-- Selects fixed eval subsets via seeded shuffle for stable early-stopping
-  and repair curve checkpoints.
-- Records all determinism settings in `manifest.json`.
-
-## Supported architectures
-
-Sculpt targets **decoder-only transformers with SwiGLU FFN blocks**:
-- Qwen2 / Qwen2.5
-- Llama 2 / Llama 3
-- Mistral / Mixtral (dense MLP layers)
-- Any HuggingFace model with `gate_proj` / `up_proj` / `down_proj` structure
-
-Attention layers, embeddings, layer norms, and residual connections are not
-modified. Only the MLP projections are physically sliced.
-
-## Benchmarking sculpted models
-
-After sculpting, evaluate baseline and compiled models across workloads:
+Benchmark baseline vs. sculpted models across workloads:
 
 ```bash
 dystrio bench \
-  --models org/baseline-model org/sculpted-conservative org/sculpted-balanced \
+  --models org/baseline org/sculpted-balanced \
   --workloads wikitext chat rag code \
   --prompts-dir prompts/ \
-  --outdir bench_out \
-  --dtype bf16 --device cuda --deterministic --seed 42
+  --outdir bench_out
 ```
 
-Generate report from existing results (no model loading):
+Generate plots and model card snippets:
 
 ```bash
 dystrio bench-report --results-dir bench_out/results --outdir bench_out/report
 ```
 
-Audit results for publishability:
+Audit for publishability:
 
 ```bash
 dystrio bench-audit --bench-out bench_out
 ```
 
-### Metric definitions
-
-| Metric | Level | Description |
-|--------|-------|-------------|
-| **TTFT incl. prefill** (`ttft_ms`) | Request | Wall time from prompt submission to first token: prefill forward + first decode step. Computed per-prompt with CUDA sync. |
-| **First decode step** (`first_decode_step_ms`) | Request | Wall time of the first decode forward call only (post-prefill). Per-prompt. |
-| **Prefill wall** (`prefill_ms`) | Request | Wall time of the prefill forward pass only. Per-prompt. |
-| Prefill / Decode TPS | Microbench | Throughput from batched iteration benchmarks. Used for throughput comparison, not latency claims. |
-| `microbench_prefill_ms_*` | Microbench | Batched iteration latency percentiles. Internal reference — not publishable as request-level claims. |
-| **Weights** (`weights_gb`) | Deterministic | Model parameter memory: `sum(p.numel() * p.element_size())`. Runtime-independent, identical across workloads. **Recommended for headline VRAM claims.** |
-| `num_params` | Deterministic | Total parameter count. |
-| **Post-load** (`cold_alloc_gb`) | Runtime | `torch.cuda.memory_allocated()` right after `model.eval()` + `empty_cache()`. Captures weights + framework overhead before inference. |
-| End-of-bench (`steady_state_alloc_gb`) | Runtime | `torch.cuda.memory_allocated()` at end of workload. Includes KV-cache/activations. Workload-dependent — not suitable for headline claims. |
-| Peak (`peak_alloc_gb`) | Runtime | `torch.cuda.max_memory_allocated()` high-water mark during benchmark. |
-
-Warmup prompts (default 5) are excluded from all published percentile metrics.
-
-### Output layout
+## CLI Reference
 
 ```
-bench_out/
-  run_metadata.json
-  benchmarks.csv
-  results/
-    <sanitized_model_id>/
-      wikitext/metrics.json
-      chat/metrics.json + per_prompt.csv + run_metadata.json
-      rag/metrics.json + per_prompt.csv + run_metadata.json
-      code/metrics.json + per_prompt.csv + run_metadata.json
-  report/
-    frontier_rag_ttft_p95_vs_pplratio.png
-    frontier_chat_decode_p95_vs_pplratio.png
-    p95_latency_by_workload.png
-    throughput_by_workload.png
-    rag_ttft_cdf.png
-    memory_vs_quality.png              # steady-state (runtime, workload-dependent)
-    memory_vs_quality_weights.png      # weights-only (headline plot)
-    memory_vs_quality_cold_alloc.png   # post-load allocated VRAM
-    model_card_snippet.md
-    audit.json
-    audit.txt
-```
-
-### Generating prompt packs
-
-```bash
-python scripts/make_prompt_packs.py --outdir prompts/
-```
-
-## CLI reference
-
-```
-Global Options (apply to all commands):
-  --quiet / -q                  Minimal output; suppress most logs + progress bars
-  --verbose / -v                Debug output; show external library logs + request tracing
+Global flags (all commands):
+  --quiet / -q      Minimal output
+  --verbose / -v    Full debug output
 
 dystrio sculpt [OPTIONS]
+  --model-id TEXT                 HuggingFace model ID [required]
+  --outdir TEXT                   Output directory [default: sculpt_out]
+  --frontier INTEGER              Points to emit [default: 4]
+  --max-ppl-multiplier FLOAT      Quality ceiling [default: 2.0]
+  --keep-fracs FLOAT ...          Skip search, evaluate these fractions
+  --workload TEXT                 Workload preset [default: general_v2]
+  --target-prefill-speedup FLOAT  Min prefill speedup
+  --max-compile-hours FLOAT       Time budget in hours
+  --downstream-threshold FLOAT    Min downstream accuracy to accept
+  --deterministic                 Bitwise-reproducible builds
+  --push-dataset / --no-push-dataset  Push results to HF dataset
+  --save-prescan / --no-save-prescan  Save prescan analysis JSON
+  --policy TEXT                   Override auto-selected repair policy
 
-Options:
-  --model-id TEXT               HuggingFace model ID (required)
-  --outdir TEXT                 Output directory [default: sculpt_out]
-  --frontier INTEGER            Frontier points to emit [default: 4]
-  --max-ppl-multiplier FLOAT    Quality ceiling (PPL/baseline) [default: 2.0]
-  --target-prefill-speedup FLOAT  Min prefill speedup to keep
-  --max-compile-hours FLOAT     Time budget (hours)
-  --deterministic               Enable deterministic mode
-  --policy TEXT                 Override auto-selected repair policy (advanced)
-  --calib-dataset TEXT          HF dataset for calibration [default: wikitext]
-  --calib-config TEXT           HF dataset config [default: wikitext-2-raw-v1]
-  --calib-split TEXT            HF dataset split [default: train]
-  --calib-text-field TEXT       Text column name [default: text]
-  --calib-num-samples INTEGER   Max calibration samples
-  --calib-seq-len INTEGER       Calibration sequence length
-  --calib-seed INTEGER          Calibration sampling seed [default: 0]
-  --help                        Show this message and exit
+  Calibration overrides:
+  --calib-dataset TEXT            HF dataset [default: wikitext]
+  --calib-config TEXT             Dataset config [default: wikitext-2-raw-v1]
+  --calib-split TEXT              Dataset split [default: train]
+  --calib-text-field TEXT         Text column [default: text]
+  --calib-num-samples INTEGER     Max calibration samples
+  --calib-seq-len INTEGER         Sequence length
+  --calib-seed INTEGER            Sampling seed [default: 0]
 
 dystrio bench [OPTIONS]
-
-Options:
-  --models TEXT                 Model IDs to benchmark (required, repeatable)
-  --workloads TEXT              Workloads [default: wikitext chat rag code]
-  --prompts-dir TEXT            Directory with JSONL prompt packs
-  --outdir TEXT                 Output directory [default: bench_out]
-  --dtype TEXT                  bf16|fp16|fp32 [default: bf16]
-  --device TEXT                 cuda|cpu [default: cuda]
-  --seed INTEGER                Random seed [default: 0]
-  --deterministic               Enable deterministic mode
-  --baseline-model TEXT         Baseline model for ppl_ratio
+  --models TEXT ...               Models to benchmark [required]
+  --workloads TEXT ...            Workloads [default: wikitext chat rag code]
+  --prompts-dir TEXT              JSONL prompt packs directory
+  --outdir TEXT                   Output [default: bench_out]
+  --dtype TEXT                    bf16|fp16|fp32 [default: bf16]
+  --device TEXT                   cuda|cpu [default: cuda]
 
 dystrio bench-report [OPTIONS]
-
-Options:
-  --results-dir TEXT            Path to results/ directory (required)
-  --outdir TEXT                 Report output [default: bench_out/report]
-  --bench-out TEXT              Root bench dir (for model card env footnote)
+  --results-dir TEXT              Path to results/ [required]
+  --outdir TEXT                   Report output [default: bench_out/report]
 
 dystrio bench-audit [OPTIONS]
+  --bench-out TEXT                Bench output dir [required]
 
-Options:
-  --bench-out TEXT              Root bench output dir (required)
+dystrio factory fingerprint --model-id TEXT
+  Check architecture support for a model.
+
+dystrio factory run [OPTIONS]
+  Orchestrated compile + bench + publish pipeline.
 ```
+
+## Requirements
+
+- Python >= 3.10
+- PyTorch >= 2.1
+- CUDA GPU (A100 80GB recommended for 7B+ models)
+
+```bash
+# Install with dev tools (pytest, ruff)
+pip install -e ".[dev]"
+
+# Run tests
+pytest tests/
+```
+
+## Deterministic Builds
+
+For bitwise-reproducible results:
+
+```bash
+dystrio sculpt --model-id <model> --deterministic
+```
+
+Seeds all RNGs (Python, NumPy, PyTorch, CUDA), disables TF32 and non-deterministic
+cuDNN algorithms, and uses isolated random state in the structural selector.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-Apache 2.0
+[Apache 2.0](LICENSE)

@@ -152,7 +152,7 @@ tags:
 
 {description}
 
-Structurally pruned from [openbmb/MiniCPM-o-4_5](https://huggingface.co/openbmb/MiniCPM-o-4_5) using [Dystrio Sculpt](https://github.com/clusteroptimizerengine/BumbleB). Only the Qwen3-8B LLM backbone is pruned — vision (SigLip2), audio (Whisper), and TTS (CosyVoice2) modules are untouched.
+Structurally pruned from [openbmb/MiniCPM-o-4_5](https://huggingface.co/openbmb/MiniCPM-o-4_5) using [Dystrio Sculpt](https://github.com/dystrio/sculpt). Only the Qwen3-8B LLM backbone is pruned — vision (SigLip2), audio (Whisper), and TTS (CosyVoice2) modules are untouched.
 
 ## Quality (Downstream Probe — 250 questions)
 

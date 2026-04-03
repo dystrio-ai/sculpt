@@ -22,6 +22,7 @@ from .structural import (
     CrossLayerNoveltyTracker,
 )
 from .magnitude import select_for_layer_magnitude
+from .baselines import select_blocks_sensitivity, select_blocks_random
 from .._calibrate import (
     collect_block_geometry_swiglu,
     collect_block_operator_sensitivity_swiglu,
@@ -108,6 +109,63 @@ def select_for_layer(
             cross_layer_novelty=cross_layer_novelty,
         )
 
+        if moe_mode:
+            return kept_blocks, torch.tensor(kept_blocks, dtype=torch.long, device=device), arts
+        return kept_blocks, kept_idx.to(device), arts
+
+    if selector == "sensitivity":
+        if prescan_cache is not None and layer_idx in prescan_cache:
+            pre = prescan_cache[layer_idx]
+            block_sensitivity = pre["block_sensitivity"]
+            block_energy = pre.get("block_energy")
+            feature_multiplier = pre.get("feature_multiplier", 3)
+        elif adapter is not None:
+            sens = adapter.collect_block_sensitivity(
+                model, tokenizer, layer_idx, texts_cal, max_len, device,
+                block_size=BLOCK_SIZE, max_tokens=30_000,
+            )
+            geom = adapter.collect_block_geometry(
+                model, tokenizer, layer_idx, texts_cal, max_len, device,
+                block_size=BLOCK_SIZE, max_tokens=30_000,
+            )
+            block_sensitivity = sens["block_sensitivity"]
+            block_energy = geom.get("block_energy")
+            feature_multiplier = geom.get("feature_multiplier", 3)
+        else:
+            sens = collect_block_operator_sensitivity_swiglu(
+                model, tokenizer, layer_idx, texts_cal, max_len, device,
+                block_size=BLOCK_SIZE, max_tokens=30_000,
+            )
+            geom = collect_block_geometry_swiglu(
+                model, tokenizer, layer_idx, texts_cal, max_len, device,
+                block_size=BLOCK_SIZE, max_tokens=30_000,
+            )
+            block_sensitivity = sens["block_sensitivity"]
+            block_energy = geom.get("block_energy")
+            feature_multiplier = geom.get("feature_multiplier", 3)
+
+        block_size = 1 if moe_mode else BLOCK_SIZE
+        kept_blocks, kept_idx, arts = select_blocks_sensitivity(
+            block_sensitivity, keep_frac, block_size,
+            block_energy=block_energy,
+            feature_multiplier=feature_multiplier,
+        )
+        if moe_mode:
+            return kept_blocks, torch.tensor(kept_blocks, dtype=torch.long, device=device), arts
+        return kept_blocks, kept_idx.to(device), arts
+
+    if selector == "random":
+        if adapter is not None:
+            n_blocks = adapter.get_ffn_size(model, layer_idx) // BLOCK_SIZE
+        else:
+            from .._model import get_mlp
+            n_blocks = get_mlp(model, layer_idx).gate_proj.out_features // BLOCK_SIZE
+        block_size = 1 if moe_mode else BLOCK_SIZE
+        if moe_mode:
+            n_blocks = adapter.get_ffn_size(model, layer_idx)
+        kept_blocks, kept_idx, arts = select_blocks_random(
+            n_blocks, keep_frac, block_size, rng=rng,
+        )
         if moe_mode:
             return kept_blocks, torch.tensor(kept_blocks, dtype=torch.long, device=device), arts
         return kept_blocks, kept_idx.to(device), arts

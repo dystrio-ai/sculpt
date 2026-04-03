@@ -19,7 +19,7 @@ set -euo pipefail
 ###############################################################################
 
 BRANCH="experimental/moe-expert-prune"
-REPO="https://github.com/clusteroptimizerengine/BumbleB.git"
+REPO="${SCULPT_REPO:-https://github.com/dystrio/sculpt.git}"
 WORKDIR="$HOME/BumbleB"
 MODEL_ID="Qwen/Qwen3.5-35B-A3B"
 OUTDIR="sculpt_out_qwen35_35b_moe"
