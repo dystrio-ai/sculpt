@@ -674,6 +674,7 @@ def _select_stage_size(
     candidates: tuple = (4, 2),
     n_probe_stages: int = 2,
     budget_remaining_s: float = 120.0,
+    adapter=None,
 ) -> tuple:
     """Probe stage_size candidates using stratified chunks, prefer largest
     stable but allow smaller when recovery signal is materially stronger.
@@ -946,6 +947,7 @@ def tune_policy_with_pilot(
             num_layers=num_layers,
             prescan_cache=prescan_cache, layer_order=layer_order,
             selector=selector, budget_remaining_s=budget_remaining,
+            adapter=adapter,
         )
         if chosen_ss != chosen.stage_size:
             chosen = _with_stage_size(chosen, chosen_ss)
