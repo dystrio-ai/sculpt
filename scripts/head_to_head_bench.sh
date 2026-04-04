@@ -2,23 +2,26 @@
 set -uo pipefail
 
 # =============================================================================
-# Head-to-Head Benchmark: Sculpt vs Published Structured Pruning Methods
+# Head-to-Head Benchmark: Sculpt Frontier Curve vs Published Methods
 #
-# Runs Sculpt (Physarum structural selector) on LLaMA-2-7B at sparsity levels
-# matching published results from DDP (ICML'26), SlimLLM, LoRAP, etc.
+# Runs Sculpt across a sweep of keep_fracs to map the full quality-vs-
+# compression curve, then compares against published structured pruning
+# results from DDP (ICML'26), SlimLLM (ICML'25), LoRAP, etc.
 #
-# Published targets (DDP Table 2, LLaMA-2-7B):
-#   20% total sparsity: Wiki2=14.39 (DDP), 15.28 (SlimLLM), 14.67 (LoRAP)
-#   50% total sparsity: Wiki2=26.34 (DDP), 27.29 (SlimLLM), 26.26 (LoRAP)
+# Published targets (DDP Table 2, LLaMA-2-7B, 20% total sparsity):
+#   DDP:     Wiki2=14.39, Mean Acc=64.82%
+#   SlimLLM: Wiki2=15.28, Mean Acc=61.70%
+#   LoRAP:   Wiki2=14.67, Mean Acc=61.20%
 #
-# Since Sculpt prunes MLP channels only (not attention heads), we run at
-# two sets of keep_fracs:
-#   "matched": MLP keep_frac calibrated to match the same total param reduction
-#   "direct":  MLP keep_frac = 1 - sparsity_ratio (for direct comparison)
+# Sculpt prunes MLP channels only (not attention heads). Parameter mapping:
+#   LLaMA-2-7B: MLP = 64.3% of params
+#   kf=0.90 → ~6.4% total reduction    kf=0.60 → ~25.7% total reduction
+#   kf=0.80 → ~12.9% total reduction   kf=0.50 → ~32.1% total reduction
+#   kf=0.69 → ~20.0% total reduction   kf=0.40 → ~38.6% total reduction
 #
 # Usage:
-#   bash scripts/head_to_head_bench.sh                # full run
-#   SKIP_LMEVAL=1 bash scripts/head_to_head_bench.sh  # perplexity screening
+#   bash scripts/head_to_head_bench.sh                # full run with lm-eval
+#   SKIP_LMEVAL=1 bash scripts/head_to_head_bench.sh  # perplexity sweep only
 # =============================================================================
 
 MODEL="${MODEL:-meta-llama/Llama-2-7b-hf}"
@@ -26,45 +29,22 @@ WORKLOAD="${WORKLOAD:-general_v2}"
 OUTBASE="${OUTBASE:-h2h_results}"
 SKIP_LMEVAL="${SKIP_LMEVAL:-0}"
 
-# DDP paper benchmarks: ARC-e, ARC-c, OBQA, WinoGrande, PIQA, HellaSwag,
-# MathQA, RTE, BoolQ — 9 tasks
+# Sweep from light to aggressive compression
+KEEP_FRACS="${KEEP_FRACS:-0.95,0.90,0.85,0.80,0.75,0.69,0.60,0.50}"
+
+# DDP paper eval: 9 zero-shot tasks via lm-eval harness
 LMEVAL_TASKS="arc_easy,arc_challenge,openbookqa,winogrande,piqa,hellaswag,mathqa,rte,boolq"
-
-# LLaMA-2-7B parameter breakdown:
-#   Embeddings:  ~262M  (3.9%)
-#   Attention:   ~2147M (31.9%)  [32 layers × 4 × 4096 × 4096]
-#   MLP:         ~4329M (64.3%)  [32 layers × 3 × 4096 × 11008]
-#   Total:       ~6738M
-#
-# DDP prunes attention heads + MLP channels jointly. We prune MLP only.
-# To match 20% total param reduction via MLP-only pruning:
-#   0.20 × 6738M = 1347.6M from MLP → MLP keep = 1 - (1347.6/4329) ≈ 0.69
-# To match 50% total param reduction via MLP-only pruning:
-#   0.50 × 6738M = 3369M from MLP → MLP keep = 1 - (3369/4329) ≈ 0.22
-#   But 0.22 is extreme for MLP-only; cap at 0.50 and note the difference.
-
-# Run configurations: label, keep_frac
-#
-# We can realistically match 20% total sparsity via MLP-only (kf=0.69).
-# 50% total is not achievable through MLP-only pruning without destroying
-# the model — those methods prune attention heads too. We include kf=0.50
-# as our aggressive point for reference (actual total reduction ~32%).
-CONFIGS=(
-    "matched_20pct,0.69"
-    "direct_20pct,0.80"
-    "direct_15pct,0.85"
-    "aggressive_32pct,0.50"
-)
 
 MODEL_SHORT=$(echo "$MODEL" | sed 's|.*/||')
 
 echo "=============================================="
-echo "  Head-to-Head Benchmark"
+echo "  Head-to-Head Frontier Sweep"
 echo "=============================================="
-echo "  Model:    $MODEL"
-echo "  Workload: $WORKLOAD"
-echo "  Output:   $OUTBASE/"
-echo "  lm-eval:  $([ "$SKIP_LMEVAL" = "1" ] && echo "SKIPPED" || echo "$LMEVAL_TASKS")"
+echo "  Model:      $MODEL"
+echo "  Keep fracs: $KEEP_FRACS"
+echo "  Workload:   $WORKLOAD"
+echo "  Output:     $OUTBASE/"
+echo "  lm-eval:    $([ "$SKIP_LMEVAL" = "1" ] && echo "SKIPPED" || echo "$LMEVAL_TASKS")"
 echo "=============================================="
 
 mkdir -p "$OUTBASE"
@@ -80,7 +60,7 @@ _collect_lm_eval_results() {
     fi
 }
 
-# ── Phase 1: Baseline lm-eval ───────────────────────────────────────────────
+# ── Phase 1: Baseline ───────────────────────────────────────────────────────
 
 BASELINE_DIR="$OUTBASE/baseline_${MODEL_SHORT}"
 
@@ -96,30 +76,29 @@ if [ ! -f "$BASELINE_DIR/lm_eval_results.json" ] && [ "$SKIP_LMEVAL" != "1" ]; t
         --output_path "$BASELINE_LMEVAL_OUT" \
         2>&1 | tee "$BASELINE_DIR/lm_eval.log"
     _collect_lm_eval_results "$BASELINE_LMEVAL_OUT" "$BASELINE_DIR/lm_eval_results.json"
-    echo "  Baseline eval complete."
+    echo "  Baseline lm-eval complete."
 else
     echo ""
     echo "[Phase 1] Baseline eval exists or skipped."
 fi
 
-# ── Phase 2: Sculpt runs ────────────────────────────────────────────────────
+# ── Phase 2: Sculpt frontier sweep ──────────────────────────────────────────
 
 echo ""
-echo "[Phase 2] Sculpt runs"
+echo "[Phase 2] Sculpt frontier sweep"
 
-for CONFIG in "${CONFIGS[@]}"; do
-    LABEL=$(echo "$CONFIG" | cut -d',' -f1)
-    KF=$(echo "$CONFIG" | cut -d',' -f2)
+IFS=',' read -ra KF_ARRAY <<< "$KEEP_FRACS"
 
-    RUN_DIR="$OUTBASE/${MODEL_SHORT}_${LABEL}_kf${KF}"
+for KF in "${KF_ARRAY[@]}"; do
+    RUN_DIR="$OUTBASE/${MODEL_SHORT}_kf${KF}"
 
     if [ -d "$RUN_DIR" ] && [ -f "$RUN_DIR/run_metadata.json" ]; then
-        echo "  [$LABEL kf=$KF] Already complete, skipping."
+        echo "  [kf=$KF] Already complete, skipping."
         continue
     fi
 
     echo ""
-    echo "  [$LABEL kf=$KF] Starting sculpt..."
+    echo "  [kf=$KF] Starting sculpt..."
     mkdir -p "$RUN_DIR"
 
     if dystrio sculpt \
@@ -134,17 +113,17 @@ for CONFIG in "${CONFIGS[@]}"; do
         --save-prescan \
         --deterministic \
         2>&1 | tee "$RUN_DIR/sculpt.log"; then
-        echo "  [$LABEL kf=$KF] Sculpt complete."
+        echo "  [kf=$KF] Sculpt complete."
     else
-        echo "  [$LABEL kf=$KF] Sculpt FAILED (exit $?) — recorded."
-        echo '{"failed": true, "label": "'"$LABEL"'", "keep_frac": '"$KF"'}' > "$RUN_DIR/run_metadata.json"
+        echo "  [kf=$KF] Sculpt FAILED (exit $?) — recorded."
+        echo '{"failed": true, "keep_frac": '"$KF"'}' > "$RUN_DIR/run_metadata.json"
     fi
 
     # lm-eval on sculpted model
     if [ "$SKIP_LMEVAL" != "1" ]; then
         SCULPTED_MODEL=$(find "$RUN_DIR" -name "config.json" -path "*/model/*" -exec dirname {} \; | head -1)
         if [ -n "$SCULPTED_MODEL" ]; then
-            echo "  [$LABEL kf=$KF] Running lm-eval..."
+            echo "  [kf=$KF] Running lm-eval..."
             RUN_LMEVAL_OUT="$RUN_DIR/lm_eval_output"
             lm_eval --model hf \
                 --model_args "pretrained=$SCULPTED_MODEL,dtype=bfloat16" \
@@ -153,32 +132,43 @@ for CONFIG in "${CONFIGS[@]}"; do
                 --output_path "$RUN_LMEVAL_OUT" \
                 2>&1 | tee "$RUN_DIR/lm_eval.log"
             _collect_lm_eval_results "$RUN_LMEVAL_OUT" "$RUN_DIR/lm_eval_results.json"
-            echo "  [$LABEL kf=$KF] lm-eval complete."
+            echo "  [kf=$KF] lm-eval complete."
         else
-            echo "  [$LABEL kf=$KF] WARNING: No sculpted model found, skipping lm-eval."
+            echo "  [kf=$KF] WARNING: No sculpted model found, skipping lm-eval."
         fi
     fi
 done
 
-# ── Phase 3: Summary ────────────────────────────────────────────────────────
+# ── Phase 3: Summary table ──────────────────────────────────────────────────
 
 echo ""
 echo "=============================================="
-echo "  Head-to-Head Benchmark Complete"
+echo "  Frontier Sweep Results"
 echo "=============================================="
 echo ""
-echo "Published targets (DDP Table 2, LLaMA-2-7B):"
-echo "  20% sparsity: Wiki2=14.39 (DDP/SOTA), Mean Acc=64.82%"
-echo "  50% sparsity: Wiki2=26.34 (DDP/SOTA), Mean Acc=56.70%"
-echo ""
-echo "Our results:"
-for CONFIG in "${CONFIGS[@]}"; do
-    LABEL=$(echo "$CONFIG" | cut -d',' -f1)
-    KF=$(echo "$CONFIG" | cut -d',' -f2)
-    RUN_DIR="$OUTBASE/${MODEL_SHORT}_${LABEL}_kf${KF}"
+printf "%-8s %-12s %-14s %s\n" "kf" "total_reduc" "ppl_ratio" "status"
+printf "%-8s %-12s %-14s %s\n" "----" "----------" "---------" "------"
+for KF in "${KF_ARRAY[@]}"; do
+    RUN_DIR="$OUTBASE/${MODEL_SHORT}_kf${KF}"
+    # MLP is 64.3% of LLaMA-2-7B params
+    TOTAL_REDUC=$(python3 -c "print(f'{(1-$KF)*64.3:.1f}%')" 2>/dev/null || echo "?")
     PPL=$(grep -a 'ppl_ratio' "$RUN_DIR/sculpt.log" 2>/dev/null | tail -1 | grep -oP 'ppl_ratio=\S+' || echo "N/A")
-    echo "  $LABEL (kf=$KF): $PPL"
+    FAILED=$(grep -a 'failed=True' "$RUN_DIR/sculpt.log" 2>/dev/null | tail -1)
+    if [ -n "$FAILED" ]; then
+        STATUS="FAILED"
+    else
+        STATUS="ok"
+    fi
+    printf "%-8s %-12s %-14s %s\n" "$KF" "$TOTAL_REDUC" "$PPL" "$STATUS"
 done
+
 echo ""
-echo "Results directory: $OUTBASE/"
+echo "Published comparison points (LLaMA-2-7B, 20% total sparsity):"
+echo "  DDP (ICML'26 SOTA):  Wiki2=14.39  Acc=64.82%"
+echo "  SlimLLM (ICML'25):   Wiki2=15.28  Acc=61.70%"
+echo "  LoRAP:               Wiki2=14.67  Acc=61.20%"
+echo "  Dense baseline:      Wiki2=12.18  Acc=66.63%"
+echo ""
+echo "  Sculpt kf=0.69 → ~20% total reduction (direct comparison point)"
+echo ""
 echo "=============================================="
