@@ -44,11 +44,16 @@ LMEVAL_TASKS="arc_easy,arc_challenge,openbookqa,winogrande,piqa,hellaswag,mathqa
 #   But 0.22 is extreme for MLP-only; cap at 0.50 and note the difference.
 
 # Run configurations: label, keep_frac
+#
+# We can realistically match 20% total sparsity via MLP-only (kf=0.69).
+# 50% total is not achievable through MLP-only pruning without destroying
+# the model — those methods prune attention heads too. We include kf=0.50
+# as our aggressive point for reference (actual total reduction ~32%).
 CONFIGS=(
     "matched_20pct,0.69"
-    "matched_50pct,0.22"
     "direct_20pct,0.80"
-    "direct_50pct,0.50"
+    "direct_15pct,0.85"
+    "aggressive_32pct,0.50"
 )
 
 MODEL_SHORT=$(echo "$MODEL" | sed 's|.*/||')
