@@ -88,7 +88,7 @@ for SELECTOR in $SELECTORS; do
     for KF in "${KF_ARRAY[@]}"; do
         RUN_DIR="$OUTBASE/${MODEL_SHORT}_${SELECTOR}_kf${KF}"
 
-        if [ -d "$RUN_DIR" ] && [ -f "$RUN_DIR/metrics.json" ]; then
+        if [ -d "$RUN_DIR" ] && [ -f "$RUN_DIR/run_metadata.json" ]; then
             echo "  [$SELECTOR kf=$KF] Already complete, skipping."
             continue
         fi
@@ -97,7 +97,7 @@ for SELECTOR in $SELECTORS; do
         echo "  [$SELECTOR kf=$KF] Starting sculpt..."
         mkdir -p "$RUN_DIR"
 
-        dystrio sculpt \
+        if dystrio sculpt \
             --model-id "$MODEL" \
             --outdir "$RUN_DIR" \
             --selector "$SELECTOR" \
@@ -108,9 +108,12 @@ for SELECTOR in $SELECTORS; do
             --no-push-dataset \
             --save-prescan \
             --deterministic \
-            2>&1 | tee "$RUN_DIR/sculpt.log"
-
-        echo "  [$SELECTOR kf=$KF] Sculpt complete."
+            2>&1 | tee "$RUN_DIR/sculpt.log"; then
+            echo "  [$SELECTOR kf=$KF] Sculpt complete."
+        else
+            echo "  [$SELECTOR kf=$KF] Sculpt FAILED (exit $?) — recorded as failure."
+            echo '{"failed": true, "selector": "'"$SELECTOR"'", "keep_frac": '"$KF"'}' > "$RUN_DIR/run_metadata.json"
+        fi
 
         # Run lm-eval on the sculpted model
         if [ "$SKIP_LMEVAL" != "1" ]; then
@@ -137,7 +140,7 @@ done
 # Phase 3: Visualization
 echo ""
 echo "[Phase 3] Generating comparison charts"
-python3 scripts/visualize_ablation.py "$OUTBASE" --model "$MODEL_SHORT"
+python3 scripts/visualize_ablation.py "$OUTBASE" --model "$MODEL_SHORT" || echo "  Visualization failed (non-fatal)."
 
 echo ""
 echo "=============================================="

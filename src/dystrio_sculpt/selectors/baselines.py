@@ -31,13 +31,12 @@ def select_blocks_sensitivity(
 
     Blocks with the highest sensitivity scores are kept (they contribute
     most to the MLP output, so losing them hurts most).
+
+    Note: block_sensitivity is already at block granularity (one score per
+    block), unlike the covariance matrix D which has feature_multiplier
+    entries per block.  We do NOT divide by feature_multiplier here.
     """
-    n_feat = block_sensitivity.shape[0]
-    F = feature_multiplier
-    n_blocks = n_feat // F
-    if n_blocks == 0:
-        n_blocks = max(1, n_feat)
-        F = 1
+    n_blocks = block_sensitivity.shape[0]
     keep_n = max(1, int(math.ceil(keep_frac * n_blocks)))
 
     scores = np.asarray(block_sensitivity, dtype=np.float64)[:n_blocks]

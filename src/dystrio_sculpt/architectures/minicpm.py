@@ -66,7 +66,7 @@ class MiniCPMAdapter(ArchitectureAdapter):
     @torch.no_grad()
     def compress_layer(
         self, model, layer_idx: int, kept_idx: torch.Tensor,
-        dtype: torch.dtype, device: str,
+        dtype: torch.dtype, device: str, **kwargs: Any,
     ) -> Dict[str, int]:
         mlp = self.get_mlp(model, layer_idx)
         old_gate, old_up, old_down = mlp.gate_proj, mlp.up_proj, mlp.down_proj

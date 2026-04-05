@@ -30,7 +30,7 @@ OUTBASE="${OUTBASE:-h2h_results}"
 SKIP_LMEVAL="${SKIP_LMEVAL:-0}"
 
 # Sweep from light to aggressive compression
-KEEP_FRACS="${KEEP_FRACS:-0.95,0.90,0.85,0.80,0.75,0.69,0.60,0.50}"
+KEEP_FRACS="${KEEP_FRACS:-0.85,0.80,0.75,0.69,0.60,0.50}"
 
 # DDP paper eval: 9 zero-shot tasks via lm-eval harness
 LMEVAL_TASKS="arc_easy,arc_challenge,openbookqa,winogrande,piqa,hellaswag,mathqa,rte,boolq"

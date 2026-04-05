@@ -36,7 +36,7 @@ class SwiGLUDenseAdapter(ArchitectureAdapter):
 
     def compress_layer(
         self, model, layer_idx: int, kept_idx: torch.Tensor,
-        dtype: torch.dtype, device: str,
+        dtype: torch.dtype, device: str, **kwargs: Any,
     ) -> Dict[str, int]:
         from .._compile import compress_mlp_layer_swiglu_inplace
         return compress_mlp_layer_swiglu_inplace(model, layer_idx, kept_idx, dtype, device)

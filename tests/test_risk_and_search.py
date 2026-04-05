@@ -21,7 +21,7 @@ from dystrio_sculpt.risk import (
 )
 from dystrio_sculpt.search import (
     BetaArm, FrontierPoint, _is_safe, _assign_labels, _safety_reward,
-    blended_speedup, SPEED_PROFILES,
+    adaptive_ceiling, blended_speedup, SPEED_PROFILES,
 )
 from dystrio_sculpt.selectors.structural import (
     CrossLayerNoveltyTracker, DEFAULT_NOVELTY_LAMBDA,
@@ -141,8 +141,12 @@ def _make_point(kf: float, ppl_ratio: float, speedup: float, failed: bool = Fals
 class TestCeilingEnforcement:
     def test_is_safe_respects_ceiling(self):
         pt_ok = _make_point(0.8, 1.5, 1.2)
-        pt_over = _make_point(0.6, 2.5, 1.8)
         assert _is_safe(pt_ok, 2.0)
+        # Adaptive ceiling at kf=0.6: 2.0 * (1 + 0.4*3) = 4.4, so 2.5 is safe
+        pt_moderate = _make_point(0.6, 2.5, 1.8)
+        assert _is_safe(pt_moderate, 2.0)
+        # But 5.0 exceeds even the adaptive ceiling at kf=0.6
+        pt_over = _make_point(0.6, 5.0, 1.8)
         assert not _is_safe(pt_over, 2.0)
 
     def test_failed_point_never_safe(self):
@@ -154,13 +158,15 @@ class TestCeilingEnforcement:
         pts = [
             _make_point(0.9, 1.2, 1.1),
             _make_point(0.7, 1.8, 1.5),
-            _make_point(0.5, 3.0, 2.0),  # above ceiling
+            _make_point(0.5, 6.0, 2.0),  # above adaptive ceiling (5.0 at kf=0.5)
         ]
         _assign_labels(pts, ceiling)
         for pt in pts:
             if "production" in pt.label:
-                assert pt.ppl_ratio <= ceiling, (
-                    f"production label on point with ppl_ratio={pt.ppl_ratio} > ceiling={ceiling}"
+                adj = adaptive_ceiling(ceiling, pt.keep_frac)
+                assert pt.ppl_ratio <= adj, (
+                    f"production label on point with ppl_ratio={pt.ppl_ratio} > "
+                    f"adaptive_ceiling={adj} (kf={pt.keep_frac})"
                 )
 
     def test_single_point_labeled(self):
@@ -200,7 +206,7 @@ class TestCeilingEnforcement:
         pts = [
             _make_point(0.9, 1.1, 1.0),
             _make_point(0.7, 1.5, 1.3),
-            _make_point(0.5, 2.5, 1.8),  # above 2.0 ceiling
+            _make_point(0.5, 6.0, 1.8),  # above adaptive ceiling (5.0x at kf=0.5)
         ]
         _assign_labels(pts, 2.0)
         above = [p for p in pts if p.keep_frac == 0.5][0]
@@ -304,12 +310,16 @@ class TestSafetyReward:
 
     def test_at_upper_limit_gives_zero(self):
         ceiling = 2.0
-        pt = _make_point(0.5, ceiling * 1.5, 2.0)
+        # kf=0.9: adaptive_ceiling=2.6, upper=3.9 → need ppl_ratio >= 3.9
+        pt = _make_point(0.9, ceiling * 1.5 * adaptive_ceiling(ceiling, 0.9) / ceiling, 2.0)
+        # Simpler: use kf=0.9 where adaptive ceiling is tightest
+        pt = _make_point(0.9, adaptive_ceiling(ceiling, 0.9) * 1.5, 2.0)
         assert _safety_reward(pt, ceiling) == 0.0
 
     def test_above_upper_limit_gives_zero(self):
         ceiling = 2.0
-        pt = _make_point(0.4, ceiling * 2.0, 2.5)
+        # kf=0.9: adaptive_ceiling=2.6, upper=3.9 → 5.2 well above
+        pt = _make_point(0.9, adaptive_ceiling(ceiling, 0.9) * 2.0, 2.5)
         assert _safety_reward(pt, ceiling) == 0.0
 
     def test_monotonically_decreasing(self):
@@ -325,9 +335,11 @@ class TestSafetyReward:
 
     def test_midpoint_reward(self):
         ceiling = 2.0
-        upper = ceiling * 1.5  # 3.0
-        mid_ratio = (1.0 + upper) / 2  # 2.0
-        pt = _make_point(0.7, mid_ratio, 1.3)
+        kf = 0.7
+        adj = adaptive_ceiling(ceiling, kf)
+        upper = adj * 1.5
+        mid_ratio = (1.0 + upper) / 2
+        pt = _make_point(kf, mid_ratio, 1.3)
         reward = _safety_reward(pt, ceiling)
         assert 0.3 < reward < 0.7, f"expected ~0.5 at midpoint, got {reward}"
 

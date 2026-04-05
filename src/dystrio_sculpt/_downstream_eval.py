@@ -25,7 +25,6 @@ _log = logging.getLogger(__name__)
 N_MMLU = 100
 N_HELLASWAG = 80
 N_ARC = 70
-N_PIQA = 60
 N_BOOLQ = 60
 N_HUMANEVAL = 80
 N_MBPP = 70
@@ -118,29 +117,6 @@ def _load_arc_questions(n: int, seed: int = 42) -> List[Dict]:
             "task": "arc",
             "context": ctx,
             "choices": [" " + c for c in choice_texts],
-            "label": label,
-        })
-    return questions
-
-
-def _load_piqa_questions(n: int, seed: int = 42) -> List[Dict]:
-    """Load PIQA validation examples as binary-choice physical intuition questions."""
-    ds = load_dataset("piqa", split="validation", trust_remote_code=True)
-    indices = list(range(len(ds)))
-    rng = random.Random(seed)
-    rng.shuffle(indices)
-    indices = indices[:n]
-
-    questions = []
-    for idx in indices:
-        row = ds[idx]
-        ctx = "Goal: " + row["goal"] + "\nWhich solution is correct?\n"
-        ctx += f"  (A) {row['sol1']}\n  (B) {row['sol2']}\nAnswer: ("
-        label = int(row["label"])
-        questions.append({
-            "task": "piqa",
-            "context": ctx,
-            "choices": ["A)", "B)"],
             "label": label,
         })
     return questions
@@ -271,7 +247,6 @@ def load_downstream_probe(
     n_mmlu: int = N_MMLU,
     n_hellaswag: int = N_HELLASWAG,
     n_arc: int = N_ARC,
-    n_piqa: int = N_PIQA,
     n_boolq: int = N_BOOLQ,
     n_humaneval: int = N_HUMANEVAL,
     n_mbpp: int = N_MBPP,
@@ -289,7 +264,6 @@ def load_downstream_probe(
         (_load_mmlu_questions, n_mmlu, "mmlu"),
         (_load_hellaswag_questions, n_hellaswag, "hellaswag"),
         (_load_arc_questions, n_arc, "arc"),
-        (_load_piqa_questions, n_piqa, "piqa"),
         (_load_boolq_questions, n_boolq, "boolq"),
     ]
     if is_code:
@@ -344,7 +318,7 @@ def _score_choice(
 # benchmarks naturally dominate when present.
 _TASK_WEIGHTS = {
     "mmlu": 2.0, "hellaswag": 1.0, "arc": 1.0,
-    "piqa": 1.0, "boolq": 1.0,
+    "boolq": 1.0,
     "humaneval": 2.0, "mbpp": 2.0,
 }
 

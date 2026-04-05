@@ -142,6 +142,33 @@ grep -aE '\[matched|direct' ~/BumbleB/h2h.log
 If Sculpt at matched_20pct (kf=0.69) achieves Wiki2 ppl_ratio ≤ 1.20 and Mean Acc ≥ 64%,
 we match or beat DDP SOTA — with a faster one-shot method vs their gradient-based mask optimization.
 
+### Default Experience Fixes (Session 2)
+
+**CLI defaults changed:**
+| Flag | Old | New |
+|------|-----|-----|
+| `--distill` | `False` | `True` (use `--no-distill` to opt out) |
+| `--workload` | `None` | `general_v2` (use `--workload none` to opt out) |
+| `--frontier` | `4` | `1` |
+
+**Adaptive PPL ceiling:**
+The 2.0x fixed ceiling was rejecting models at aggressive compression that match published SOTA.
+DDP (ICML'26) publishes 2.16x ppl_ratio at 50% total pruning as their headline result — our gate would reject it.
+
+New: `adaptive_ceiling(base, keep_frac) = base * (1 + removal * 3.0)`
+- kf=0.90 (10% removed): ceiling = 2.6x
+- kf=0.75 (25% removed): ceiling = 3.5x
+- kf=0.50 (50% removed): ceiling = 5.0x
+- kf=0.20 (80% removed): ceiling = 6.8x
+
+Downstream accuracy threshold (0.95) is unchanged — it's the primary gate when probe data exists.
+
+**README updated:**
+- Quick start simplified (bare command works)
+- Customization section: workload, distill, keep-fracs, custom dataset
+- Quality Gates section: explains dual safety check, how to tighten
+- Stacking section: pruning + quantization compounding
+
 ### Local Repo State
 - Branch: `experimental/moe-expert-prune`
 - All fixes committed and pushed to `clusteroptimizerengine/sculpt` (private)

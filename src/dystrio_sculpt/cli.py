@@ -98,7 +98,7 @@ def _print_summary_table(selected, baseline_metrics) -> None:
 def sculpt(
     model_id: str = typer.Option(..., "--model-id", help="HuggingFace model ID (required)."),
     outdir: str = typer.Option("sculpt_out", "--outdir", help="Output directory."),
-    frontier: int = typer.Option(4, "--frontier", help="Number of frontier points to emit."),
+    frontier: int = typer.Option(1, "--frontier", help="Number of frontier points to emit."),
     max_ppl_multiplier: Optional[float] = typer.Option(
         None, "--max-ppl-multiplier",
         help="Quality ceiling: PPL <= baseline * multiplier. [default: 2.0]",
@@ -121,10 +121,11 @@ def sculpt(
              "Format: ss<N>_lr<X>_p<Y> or policy index 0-3.",
     ),
     workload: Optional[str] = typer.Option(
-        None, "--workload",
+        "general_v2", "--workload",
         help="Workload preset for calibration data. "
-             "Presets: general, general_v2 (recommended), code, code_v1, chat, math. "
+             "Presets: general, general_v2 (default), code, code_v1, chat, math. "
              "Sets calibration/repair corpus to match your deployment. "
+             "Use --workload none for raw wikitext-only calibration. "
              "Individual --calib-* flags override the preset.",
     ),
     calib_dataset: Optional[str] = typer.Option(
@@ -156,9 +157,9 @@ def sculpt(
         help="Name of the text column in the HF dataset (overrides --workload).",
     ),
     distill: bool = typer.Option(
-        False, "--distill",
-        help="Enable knowledge distillation during repair (teacher = uncompressed model). "
-             "Active at ALL compression levels — no threshold gating.",
+        True, "--distill/--no-distill",
+        help="Knowledge distillation during repair (teacher = uncompressed model). "
+             "On by default. Use --no-distill to disable.",
     ),
     distill_alpha: Optional[float] = typer.Option(
         None, "--distill-alpha",
@@ -290,7 +291,7 @@ def sculpt(
 
     # Resolve workload preset, then layer on any explicit --calib-* overrides
     mixture_wl: Optional[str] = None
-    if workload is not None:
+    if workload is not None and workload.lower() != "none":
         if is_mixture_workload(workload):
             mixture_wl = workload
             log.info("  workload:      %s (mixture)", workload)
@@ -298,6 +299,7 @@ def sculpt(
             log.info("  workload:      %s", workload)
         calib_cfg = calib_config_for_workload(workload)
     else:
+        log.info("  workload:      none (raw wikitext calibration)")
         calib_cfg = CalibConfig()
 
     if calib_dataset is not None:

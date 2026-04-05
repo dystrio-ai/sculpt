@@ -45,7 +45,7 @@ class ArchitectureAdapter(ABC):
     @abstractmethod
     def compress_layer(
         self, model, layer_idx: int, kept_idx: torch.Tensor,
-        dtype: torch.dtype, device: str,
+        dtype: torch.dtype, device: str, **kwargs: Any,
     ) -> Dict[str, int]:
         """Physically compress a layer in-place, return info dict."""
         ...

@@ -67,14 +67,41 @@ bash scripts/workload_showcase.sh
 ```bash
 pip install -e .
 
-# Dense model — search for fastest safe compression
-dystrio sculpt --model-id Qwen/Qwen2-0.5B --outdir sculpt_out --frontier 4
+# One command — finds the best compression automatically
+dystrio sculpt --model-id Qwen/Qwen2.5-3B-Instruct
 
-# MoE model — drop 10% of experts
-dystrio sculpt --model-id allenai/OLMoE-1B-7B-0924 --keep-fracs 0.90 --outdir sculpt_moe
+# MoE model
+dystrio sculpt --model-id allenai/OLMoE-1B-7B-0924
 
 # Code-specialized workload
-dystrio sculpt --model-id mistralai/Mixtral-8x7B-v0.1 --workload code_v1 --outdir sculpt_code
+dystrio sculpt --model-id meta-llama/Llama-3.1-8B-Instruct --workload code_v1
+```
+
+Defaults: distillation ON, `general_v2` workload, 1 frontier point. The output model
+is ready to load with HuggingFace or convert to GGUF — no special runtime needed.
+
+### Customizing
+
+```bash
+# Emit 4 Pareto-optimal points instead of 1
+dystrio sculpt --model-id <model> --frontier 4
+
+# Disable distillation (faster, lower quality)
+dystrio sculpt --model-id <model> --no-distill
+
+# Skip search, evaluate specific compression levels
+dystrio sculpt --model-id <model> --keep-fracs "0.90,0.80,0.70"
+
+# Custom workload — provide your own calibration data
+dystrio sculpt --model-id <model> \
+  --workload none \
+  --calib-dataset your-org/your-dataset \
+  --calib-config default \
+  --calib-split train \
+  --calib-text-field text
+
+# Raw wikitext-only calibration (no workload mixture)
+dystrio sculpt --model-id <model> --workload none
 ```
 
 Output:
@@ -215,10 +242,11 @@ Global flags (all commands):
 dystrio sculpt [OPTIONS]
   --model-id TEXT                 HuggingFace model ID [required]
   --outdir TEXT                   Output directory [default: sculpt_out]
-  --frontier INTEGER              Points to emit [default: 4]
+  --frontier INTEGER              Points to emit [default: 1]
   --max-ppl-multiplier FLOAT      Quality ceiling [default: 2.0]
-  --keep-fracs FLOAT ...          Skip search, evaluate these fractions
+  --keep-fracs TEXT               Skip search, evaluate these (comma-separated)
   --workload TEXT                 Workload preset [default: general_v2]
+  --distill / --no-distill        Knowledge distillation [default: on]
   --target-prefill-speedup FLOAT  Min prefill speedup
   --max-compile-hours FLOAT       Time budget in hours
   --downstream-threshold FLOAT    Min downstream accuracy to accept
@@ -257,6 +285,44 @@ dystrio factory fingerprint --model-id TEXT
 dystrio factory run [OPTIONS]
   Orchestrated compile + bench + publish pipeline.
 ```
+
+## Quality Gates
+
+Sculpt classifies compressed models as **safe** or **over-ceiling** based on two checks:
+
+1. **Downstream accuracy** (primary): retains >= 95% of baseline accuracy on a fast
+   multi-task probe (MMLU, HellaSwag, ARC, BoolQ). Threshold: `--downstream-threshold 0.95`
+2. **Perplexity ratio** (fallback): `pruned_ppl / baseline_ppl <= ceiling`.
+   Default ceiling: `--max-ppl-multiplier 2.0`
+
+Only "safe" models get published tier labels (production, throughput, etc.).
+Over-ceiling models are still emitted but labeled generically. To tighten quality:
+
+```bash
+# Stricter: model must be within 1.3x baseline perplexity
+dystrio sculpt --model-id <model> --max-ppl-multiplier 1.3
+
+# Stricter: must retain 98% of downstream accuracy
+dystrio sculpt --model-id <model> --downstream-threshold 0.98
+```
+
+## Stacking with Quantization
+
+Sculpt outputs standard dense HuggingFace checkpoints with physically smaller weight
+matrices. This is orthogonal to quantization — you can stack both for compounding gains:
+
+```bash
+# 1. Structural pruning with Sculpt (removes neurons, ~15-25% size reduction)
+dystrio sculpt --model-id meta-llama/Llama-3.1-8B-Instruct
+
+# 2. Quantize the pruned model (4-bit, ~75% further reduction)
+#    Works with any quantization tool — the output is a standard model
+python -m awq.entry --model_path sculpt_out/frontier_0_production/model --w_bit 4
+# or: llama.cpp convert + quantize to GGUF Q4_K_M
+```
+
+A pruned + quantized model can be 5-6x smaller than the original with minimal quality loss,
+and runs on standard hardware with no sparse runtime.
 
 ## Requirements
 
