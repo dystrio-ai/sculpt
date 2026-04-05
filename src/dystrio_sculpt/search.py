@@ -191,15 +191,17 @@ def _is_safe(
 ) -> bool:
     """A point is safe if it retains sufficient quality.
 
-    When downstream accuracy is available, uses it as primary signal:
-    safe = accuracy >= baseline_accuracy * threshold.
-    Falls back to adaptive PPL ceiling (scaled by compression level).
+    Uses an OR gate: safe if downstream accuracy is retained OR perplexity
+    is within the adaptive ceiling.  This prevents a noisy small-sample
+    downstream probe from vetoing models with excellent perplexity.
     """
     if pt.failed:
         return False
+    ppl_ok = pt.ppl_ratio <= adaptive_ceiling(ceiling, pt.keep_frac)
     if pt.downstream_score is not None and baseline_downstream is not None:
-        return pt.downstream_score >= baseline_downstream * downstream_threshold
-    return pt.ppl_ratio <= adaptive_ceiling(ceiling, pt.keep_frac)
+        ds_ok = pt.downstream_score >= baseline_downstream * downstream_threshold
+        return ds_ok or ppl_ok
+    return ppl_ok
 
 
 _ORDERED_TIER_NAMES = ["default", "production", "throughput", "experimental", "frontier"]
