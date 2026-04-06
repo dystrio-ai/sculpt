@@ -205,7 +205,7 @@ score from prescan adapts the search bracket:
 To skip search and evaluate specific compression levels:
 
 ```bash
-dystrio sculpt --model-id <model> --keep-fracs 0.90 0.85 0.75
+dystrio sculpt --model-id <model> --keep-fracs "0.90,0.85,0.75"
 ```
 
 ## Benchmarking
@@ -288,12 +288,14 @@ dystrio factory run [OPTIONS]
 
 ## Quality Gates
 
-Sculpt classifies compressed models as **safe** or **over-ceiling** based on two checks:
+Sculpt classifies compressed models as **safe** or **over-ceiling** using an OR gate:
 
-1. **Downstream accuracy** (primary): retains >= 95% of baseline accuracy on a fast
-   multi-task probe (MMLU, HellaSwag, ARC, BoolQ). Threshold: `--downstream-threshold 0.95`
-2. **Perplexity ratio** (fallback): `pruned_ppl / baseline_ppl <= ceiling`.
-   Default ceiling: `--max-ppl-multiplier 2.0`
+A model is safe if **either** condition holds:
+1. **Downstream accuracy**: retains >= 95% of baseline accuracy on a fast
+   multi-task probe (MMLU, HellaSwag, ARC, BoolQ)
+2. **Perplexity ratio**: within the adaptive ceiling (scales with compression —
+   tighter for light pruning, relaxed for aggressive compression, matching
+   published SOTA operating points)
 
 Only "safe" models get published tier labels (production, throughput, etc.).
 Over-ceiling models are still emitted but labeled generically. To tighten quality:
@@ -304,6 +306,64 @@ dystrio sculpt --model-id <model> --max-ppl-multiplier 1.3
 
 # Stricter: must retain 98% of downstream accuracy
 dystrio sculpt --model-id <model> --downstream-threshold 0.98
+```
+
+## Workload-Adaptive Pruning
+
+Unlike other pruning tools that publish one fixed checkpoint per model, Sculpt lets you
+**tune the pruning to your deployment**. The entire pipeline — prescan, neuron selection,
+repair, and distillation — optimizes for the data distribution you provide.
+
+This means:
+- **Math-heavy deployment?** Use `--workload math` — the distillation fights to preserve
+  chain-of-thought reasoning neurons, and GSM8K-style capabilities survive compression
+- **Code assistant?** Use `--workload code_v1` — HumanEval/MBPP performance is preserved
+  while general-knowledge neurons get pruned more aggressively
+- **Your own domain?** Bring your own data with `--workload none --calib-dataset <your-data>`
+  — the model is pruned and repaired specifically for your use case
+
+```bash
+# Domain-specific: prune for your internal docs / conversations
+dystrio sculpt --model-id meta-llama/Llama-3.1-8B-Instruct \
+  --workload none \
+  --calib-dataset your-org/customer-support-logs \
+  --calib-text-field message
+
+# The pruned model retains capabilities your workload needs
+# while removing neurons that are dead weight for your use case
+```
+
+The competition gives you a one-size-fits-all pruned model. Sculpt gives you a model
+that's smaller **and** better at your specific task, because it knows what to keep.
+
+## Run Locally
+
+Sculpt runs on consumer GPUs for smaller models. Rough VRAM requirements:
+
+| Model Size | Min GPU VRAM | Example GPU | Approx Time |
+|------------|-------------|-------------|-------------|
+| 1-3B | 8 GB | RTX 3070/4070 | 15-30 min |
+| 3-8B | 16-24 GB | RTX 3090/4090 | 30-90 min |
+| 7-14B | 40-48 GB | A6000 / A100 | 1-3 hours |
+| 70B+ | 80 GB+ | H100 / multi-GPU | 4-8 hours |
+
+```bash
+# On a 3090 (24GB) — sculpt a 3B model locally
+dystrio sculpt --model-id Qwen/Qwen2.5-3B-Instruct
+
+# On a 4090 — sculpt a 7B model
+dystrio sculpt --model-id mistralai/Mistral-7B-Instruct-v0.3
+
+# Reduce memory: disable distillation (faster but lower quality)
+dystrio sculpt --model-id <model> --no-distill
+```
+
+The output is a standard HuggingFace checkpoint. Convert to GGUF and run on CPU/laptop:
+
+```bash
+# After sculpting, convert to GGUF for llama.cpp
+python convert_hf_to_gguf.py sculpt_out/frontier_0_production/model --outfile model.gguf
+llama-quantize model.gguf model-Q4_K_M.gguf Q4_K_M
 ```
 
 ## Stacking with Quantization
