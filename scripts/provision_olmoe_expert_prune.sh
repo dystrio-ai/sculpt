@@ -18,7 +18,7 @@ set -euo pipefail
 #   4. Compare
 ###############################################################################
 
-BRANCH="experimental/moe-expert-prune"
+BRANCH="main"
 REPO="${SCULPT_REPO:-https://github.com/dystrio/sculpt.git}"
 WORKDIR="$HOME/BumbleB"
 MODEL_ID="allenai/OLMoE-1B-7B-0924"

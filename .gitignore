@@ -31,6 +31,10 @@ zoo/
 *.pt
 *.gguf
 
+# Session notes / internal docs
+ablation_session_notes.md
+*_session_notes.md
+
 # Legacy / internal (removed from public repo)
 src/pnn_compiler/
 configs/

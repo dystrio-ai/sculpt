@@ -18,7 +18,7 @@ set -euo pipefail
 #   TP_SIZE=4 bash scripts/provision_fp8_cacheready.sh
 ###############################################################################
 
-BRANCH="experimental/distill-repair"
+BRANCH="main"
 REPO="${SCULPT_REPO:-https://github.com/dystrio/sculpt.git}"
 WORKDIR="$HOME/BumbleB"
 

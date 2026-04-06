@@ -19,7 +19,7 @@ set -euo pipefail
 # Expected runtime: ~7-9 hours
 ###############################################################################
 
-BRANCH="experimental/distill-repair"
+BRANCH="main"
 REPO="${SCULPT_REPO:-https://github.com/dystrio/sculpt.git}"
 WORKDIR="$HOME/BumbleB"
 

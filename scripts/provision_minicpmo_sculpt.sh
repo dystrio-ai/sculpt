@@ -25,10 +25,10 @@ echo "============================================================"
 if [ ! -d ~/BumbleB ]; then
     echo ">> Cloning BumbleB..."
     if [ -n "${GITHUB_PAT:-}" ]; then
-        git clone --branch experimental/distill-repair \
+        git clone --branch main \
             "https://${GITHUB_PAT}@github.com/dystrio/sculpt.git" ~/BumbleB
     else
-        git clone --branch experimental/distill-repair \
+        git clone --branch main \
             https://github.com/dystrio/sculpt.git ~/BumbleB
     fi
 else

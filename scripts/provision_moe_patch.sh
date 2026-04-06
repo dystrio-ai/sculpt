@@ -18,7 +18,7 @@ set -euo pipefail
 # Time:   ~30-60 min calibration (batch mode, all 48 layers in one pass)
 ###############################################################################
 
-BRANCH="experimental/distill-repair"
+BRANCH="main"
 REPO="${SCULPT_REPO:-https://github.com/dystrio/sculpt.git}"
 WORKDIR="$HOME/BumbleB"
 MODEL_ID="Qwen/Qwen3.5-122B-A10B"

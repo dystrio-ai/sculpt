@@ -11,13 +11,13 @@ set -euo pipefail
 #
 # What it does:
 #   1. Installs system deps + Python 3.10 if needed
-#   2. Clones repo (experimental/distill-repair branch)
+#   2. Clones repo (main branch)
 #   3. Installs dystrio-sculpt + lm-eval
 #   4. Runs Gemma 2B test (fast validation, ~20 min)
 #   5. If test passes, runs Qwen 3.5 27B flagship (~2-4 hours)
 ###############################################################################
 
-BRANCH="experimental/distill-repair"
+BRANCH="main"
 REPO="${SCULPT_REPO:-https://github.com/dystrio/sculpt.git}"
 WORKDIR="$HOME/BumbleB"
 

@@ -10,7 +10,7 @@ set -euo pipefail
 #
 # What it does:
 #   1. Installs system deps + Python env
-#   2. Clones repo (experimental/moe-expert-prune branch)
+#   2. Clones repo (main branch)
 #   3. Installs dystrio-sculpt + lm-eval
 #   4. Runs Qwen3.5-35B-A3B expert pruning (keep_frac=0.80 → ~51 of 64 experts)
 #
@@ -18,7 +18,7 @@ set -euo pipefail
 # with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True and no teacher cache.
 ###############################################################################
 
-BRANCH="experimental/moe-expert-prune"
+BRANCH="main"
 REPO="${SCULPT_REPO:-https://github.com/dystrio/sculpt.git}"
 WORKDIR="$HOME/BumbleB"
 MODEL_ID="Qwen/Qwen3.5-35B-A3B"
