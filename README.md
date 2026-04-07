@@ -9,11 +9,12 @@ The output is a smaller, faster model that loads with standard HuggingFace
 ## Highlights
 
 - **One command** — `dystrio sculpt --model-id <hf_model>` handles everything
+- **Standard output** — HuggingFace checkpoints that work with vLLM, TGI, llama.cpp, GGUF, Ollama
+- **LoRA-ready** — sculpted models are standard architectures, fine-tune with PEFT/Unsloth/Axolotl
+- **Stackable** — prune → LoRA fine-tune → quantize for compounding 5-6x size reduction
+- **Workload-adaptive** — prune for your domain so downstream fine-tuning needs less correction
 - **Dense + MoE** — prunes SwiGLU neurons (dense) or entire experts (MoE)
-- **Drop-in output** — standard HuggingFace checkpoints, works with vLLM, TGI, llama.cpp, GGUF
 - **Quality-aware** — Thompson Sampling search finds the fastest model within your quality budget
-- **Workload presets** — calibrate for general, code, or custom workloads
-- **Stackable** — output is structurally pruned, orthogonal to quantization (GPTQ, AWQ, GGUF)
 
 ## Published Models
 
@@ -308,37 +309,80 @@ dystrio sculpt --model-id <model> --max-ppl-multiplier 1.3
 dystrio sculpt --model-id <model> --downstream-threshold 0.98
 ```
 
-## Workload-Adaptive Pruning
+## The Full Stack: Sculpt → Fine-Tune → Quantize → Deploy
 
-Unlike other pruning tools that publish one fixed checkpoint per model, Sculpt lets you
-**tune the pruning to your deployment**. The entire pipeline — prescan, neuron selection,
-repair, and distillation — optimizes for the data distribution you provide.
+Sculpt is step one of a complete model optimization pipeline. Because the output is a
+**standard HuggingFace checkpoint** with physically smaller weight matrices, every
+downstream tool in the ecosystem works on it — LoRA fine-tuning, quantization, GGUF
+conversion, serving frameworks. No adapters, no custom inference code, no sparse runtime.
 
-This means:
-- **Math-heavy deployment?** Use `--workload math` — the distillation fights to preserve
-  chain-of-thought reasoning neurons, and GSM8K-style capabilities survive compression
-- **Code assistant?** Use `--workload code_v1` — HumanEval/MBPP performance is preserved
-  while general-knowledge neurons get pruned more aggressively
-- **Your own domain?** Bring your own data with `--workload none --calib-dataset <your-data>`
-  — the model is pruned and repaired specifically for your use case
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  1. SCULPT          2. FINE-TUNE       3. QUANTIZE     4. DEPLOY   │
+│                                                                     │
+│  dystrio sculpt     LoRA / QLoRA       GPTQ / AWQ      vLLM       │
+│  --workload code    (PEFT, Unsloth,    GGUF Q4_K_M     TGI        │
+│                      Axolotl)                           llama.cpp  │
+│                                                         Ollama     │
+│  Removes redundant  Adapts to your     4-bit weights   Runs on    │
+│  neurons for your   specific task      on smaller       any stack  │
+│  workload                              matrices                    │
+│                                                                     │
+│  7B → 5.6B          Cheaper: smaller   5.6B → ~1.5GB   Standard   │
+│  (20% smaller)      base = less VRAM   (GGUF Q4)       model      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Why workload-aligned pruning makes fine-tuning cheaper
+
+When you sculpt with your workload data, the pruning preserves the neurons your task
+needs and the distillation repairs domain-relevant capabilities. The model arrives
+**pre-aligned to your domain** before fine-tuning even starts.
+
+This means LoRA has less to fix: fewer training steps, smaller adapter rank, less
+compute. Compare this to fine-tuning a generically pruned model, where LoRA has to
+recover capabilities that pruning blindly destroyed.
 
 ```bash
-# Domain-specific: prune for your internal docs / conversations
+# Step 1: Sculpt with your workload
 dystrio sculpt --model-id meta-llama/Llama-3.1-8B-Instruct \
   --workload none \
   --calib-dataset your-org/customer-support-logs \
   --calib-text-field message
 
-# The pruned model retains capabilities your workload needs
-# while removing neurons that are dead weight for your use case
+# Step 2: LoRA fine-tune the sculpted model (any tool works)
+# The model is a standard HF checkpoint — PEFT, Unsloth, Axolotl all work
+python -m peft.train \
+  --model_name sculpt_out/frontier_0_production/model \
+  --dataset your-org/training-data \
+  --lora_r 16
+
+# Step 3: Quantize for deployment
+python -m awq.entry --model_path sculpt_out/frontier_0_production/model --w_bit 4
+# or: convert to GGUF for llama.cpp / Ollama
+python convert_hf_to_gguf.py sculpt_out/frontier_0_production/model --outfile model.gguf
+llama-quantize model.gguf model-Q4_K_M.gguf Q4_K_M
 ```
 
-The competition gives you a one-size-fits-all pruned model. Sculpt gives you a model
-that's smaller **and** better at your specific task, because it knows what to keep.
+A sculpted + LoRA fine-tuned + quantized model can be **5-6x smaller** than the original,
+run on a laptop, and perform **better on your task** than the full-size base model —
+because every step in the pipeline was optimized for your workload.
+
+### vs. other pruning methods
+
+| | Sculpt | Unstructured (Wanda, SparseGPT) | LLM-Pruner |
+|---|---|---|---|
+| Output format | Standard HF checkpoint | Same-size model with zeros | Standard HF checkpoint |
+| Speedup without special runtime | Yes | No (needs sparse kernels) | Yes |
+| LoRA fine-tune after | Works perfectly | Sparse matrices break LoRA | Works |
+| Stack with quantization | Yes (orthogonal) | Zeros conflict with quantization | Yes |
+| Workload-adaptive | Yes | No | No |
+| GGUF / llama.cpp / Ollama | Yes | No | Yes |
+| Setup | One command | One command | Multi-step (prune + LoRA recovery) |
 
 ## Run Locally
 
-Sculpt runs on consumer GPUs for smaller models. Rough VRAM requirements:
+Sculpt runs on consumer GPUs for smaller models:
 
 | Model Size | Min GPU VRAM | Example GPU | Approx Time |
 |------------|-------------|-------------|-------------|
@@ -361,28 +405,9 @@ dystrio sculpt --model-id <model> --no-distill
 The output is a standard HuggingFace checkpoint. Convert to GGUF and run on CPU/laptop:
 
 ```bash
-# After sculpting, convert to GGUF for llama.cpp
 python convert_hf_to_gguf.py sculpt_out/frontier_0_production/model --outfile model.gguf
 llama-quantize model.gguf model-Q4_K_M.gguf Q4_K_M
 ```
-
-## Stacking with Quantization
-
-Sculpt outputs standard dense HuggingFace checkpoints with physically smaller weight
-matrices. This is orthogonal to quantization — you can stack both for compounding gains:
-
-```bash
-# 1. Structural pruning with Sculpt (removes neurons, ~15-25% size reduction)
-dystrio sculpt --model-id meta-llama/Llama-3.1-8B-Instruct
-
-# 2. Quantize the pruned model (4-bit, ~75% further reduction)
-#    Works with any quantization tool — the output is a standard model
-python -m awq.entry --model_path sculpt_out/frontier_0_production/model --w_bit 4
-# or: llama.cpp convert + quantize to GGUF Q4_K_M
-```
-
-A pruned + quantized model can be 5-6x smaller than the original with minimal quality loss,
-and runs on standard hardware with no sparse runtime.
 
 ## Requirements
 
