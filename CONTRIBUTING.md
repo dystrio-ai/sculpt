@@ -5,7 +5,7 @@ We welcome contributions. Here's how to get started.
 ## Setup
 
 ```bash
-git clone https://github.com/dystrio/sculpt.git
+git clone https://github.com/dystrio-ai/sculpt.git
 cd sculpt
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"

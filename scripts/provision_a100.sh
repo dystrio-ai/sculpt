@@ -18,7 +18,7 @@ set -euo pipefail
 ###############################################################################
 
 BRANCH="main"
-REPO="${SCULPT_REPO:-https://github.com/dystrio/sculpt.git}"
+REPO="${SCULPT_REPO:-https://github.com/dystrio-ai/sculpt.git}"
 WORKDIR="$HOME/BumbleB"
 
 echo "============================================================"

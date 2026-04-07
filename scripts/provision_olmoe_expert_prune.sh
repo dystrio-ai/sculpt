@@ -19,7 +19,7 @@ set -euo pipefail
 ###############################################################################
 
 BRANCH="main"
-REPO="${SCULPT_REPO:-https://github.com/dystrio/sculpt.git}"
+REPO="${SCULPT_REPO:-https://github.com/dystrio-ai/sculpt.git}"
 WORKDIR="$HOME/BumbleB"
 MODEL_ID="allenai/OLMoE-1B-7B-0924"
 OUTDIR="sculpt_out_olmoe_expert_prune"

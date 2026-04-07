@@ -26,10 +26,10 @@ if [ ! -d ~/BumbleB ]; then
     echo ">> Cloning BumbleB..."
     if [ -n "${GITHUB_PAT:-}" ]; then
         git clone --branch main \
-            "https://${GITHUB_PAT}@github.com/dystrio/sculpt.git" ~/BumbleB
+            "https://${GITHUB_PAT}@github.com/dystrio-ai/sculpt.git" ~/BumbleB
     else
         git clone --branch main \
-            https://github.com/dystrio/sculpt.git ~/BumbleB
+            https://github.com/dystrio-ai/sculpt.git ~/BumbleB
     fi
 else
     echo ">> Pulling latest..."

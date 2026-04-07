@@ -19,7 +19,7 @@ set -euo pipefail
 ###############################################################################
 
 BRANCH="main"
-REPO="${SCULPT_REPO:-https://github.com/dystrio/sculpt.git}"
+REPO="${SCULPT_REPO:-https://github.com/dystrio-ai/sculpt.git}"
 WORKDIR="$HOME/BumbleB"
 MODEL_ID="Qwen/Qwen3.5-122B-A10B"
 OUTPUT_DIR="$HOME/moe_cache_ready"
