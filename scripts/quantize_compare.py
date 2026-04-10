@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """Sculpt + Quantize comparison: proves structural pruning stacks with AWQ.
 
-Quantizes both the baseline and sculpted-conservative models to AWQ 4-bit,
+Quantizes both the baseline and sculpted checkpoint to AWQ 4-bit,
 then evaluates PPL on WikiText-103 for all four variants:
   1. Baseline bf16
   2. Baseline AWQ-4bit
-  3. Sculpt-conservative bf16
-  4. Sculpt-conservative AWQ-4bit
+  3. Sculpted bf16
+  4. Sculpted AWQ-4bit
 
 Usage:
   python3 scripts/quantize_compare.py \
     --baseline mistralai/Mistral-7B-Instruct-v0.3 \
-    --sculpted /data/zoo/mistral-7b-instruct/frontier_0_conservative/model \
+    --sculpted /data/zoo/mistral-7b-instruct/frontier_0_production/model \
     --outdir /data/zoo/quant_compare_mistral
+
+Use the ``model/`` directory under your run's ``frontier_*`` folder (e.g.
+``frontier_0_production`` or ``frontier_0_default`` — see README).
 """
 from __future__ import annotations
 
@@ -149,7 +152,11 @@ def load_and_eval(model_id, label, device="cuda", is_awq=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline", required=True, help="HF model ID for baseline")
-    parser.add_argument("--sculpted", required=True, help="Path to sculpted conservative model")
+    parser.add_argument(
+        "--sculpted",
+        required=True,
+        help="Path to sculpted model checkpoint (e.g. sculpt_out/frontier_0_production/model)",
+    )
     parser.add_argument("--outdir", required=True, help="Output directory for quantized models and results")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -174,7 +181,7 @@ def main():
     # Step 2: Quantize sculpted
     if not sculpted_awq_dir.exists():
         print("\n" + "=" * 60)
-        print("STEP 2: Quantize sculpted conservative to AWQ 4-bit")
+        print("STEP 2: Quantize sculpted checkpoint to AWQ 4-bit")
         print("=" * 60)
         quantize_awq(args.sculpted, str(sculpted_awq_dir), args.device)
     else:
@@ -187,8 +194,8 @@ def main():
 
     results.append(load_and_eval(args.baseline, "Baseline bf16", args.device))
     results.append(load_and_eval(str(baseline_awq_dir), "Baseline AWQ-4bit", args.device, is_awq=True))
-    results.append(load_and_eval(args.sculpted, "Sculpt-conservative bf16", args.device))
-    results.append(load_and_eval(str(sculpted_awq_dir), "Sculpt-conservative AWQ-4bit", args.device, is_awq=True))
+    results.append(load_and_eval(args.sculpted, "Sculpted bf16", args.device))
+    results.append(load_and_eval(str(sculpted_awq_dir), "Sculpted AWQ-4bit", args.device, is_awq=True))
 
     # Step 4: Print comparison table
     print("\n")

@@ -30,6 +30,9 @@ Pre-sculpted models are available on [HuggingFace](https://huggingface.co/dystri
 | gemma-2-2b-it | Dense | Production | 9% | -0.1% |
 | OLMoE-1B-7B-0924 | MoE | Balanced | 9% | +0.04% |
 
+Additional MoE families (for example Mixtral) are **supported by the CLI**; the table
+above lists the pre-sculpted checkpoints we publish on HuggingFace today.
+
 All models evaluated with [lm-eval](https://github.com/EleutherAI/lm-evaluation-harness)
 on ARC-Challenge, HellaSwag, MMLU, and TruthfulQA. Full results in each model card.
 
@@ -107,25 +110,32 @@ dystrio sculpt --model-id <model> --workload none
 
 Output:
 
+Each run writes one directory per frontier point. Names come from the quality search
+(see `src/dystrio_sculpt/search.py`): **`frontier_<i>_<tier>`** where `<tier>` is one of
+`default`, `production`, `throughput`, `experimental`, `frontier` (or a generic
+`pointN` label if a point sits above the quality ceiling).
+
+With **`--frontier 1`** (the default), you typically get **`frontier_0_production`** if the
+chosen point is within the quality ceiling, otherwise **`frontier_0_default`**. List
+`sculpt_out/` after a run to see the exact name on disk.
+
 ```
 sculpt_out/
-  frontier_0_conservative/
-    model/              # HuggingFace checkpoint (config.json, safetensors, tokenizer)
-    metrics.json        # PPL, throughput, speedup, memory, risk score
+  frontier_0_production/    # or frontier_0_default — see above
+    model/                  # HuggingFace checkpoint (config.json, safetensors, tokenizer)
+    metrics.json            # PPL, throughput, speedup, memory, risk score
     compile_report.json
-    manifest.json       # Full reproducibility record
-  frontier_1_balanced/
-    ...
+    manifest.json           # Full reproducibility record
   summary.csv
 ```
 
-Load a sculpted model:
+Load a sculpted model (adjust the folder to match your run):
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model = AutoModelForCausalLM.from_pretrained("sculpt_out/frontier_0_conservative/model")
-tokenizer = AutoTokenizer.from_pretrained("sculpt_out/frontier_0_conservative/model")
+model = AutoModelForCausalLM.from_pretrained("sculpt_out/frontier_0_production/model")
+tokenizer = AutoTokenizer.from_pretrained("sculpt_out/frontier_0_production/model")
 ```
 
 ## How It Works
@@ -164,7 +174,7 @@ load across remaining experts.
 | Qwen | Qwen2, Qwen2.5 | Dense |
 | Gemma | Gemma 2 | Dense |
 | Phi | Phi-3, Phi-3.5 | Dense |
-| Mixtral | Mixtral-8x7B, Mixtral-8x22B | MoE |
+| Mixtral | Mixtral-8x7B, Mixtral-8x22B | MoE (CLI; no pre-sculpted HF repo yet) |
 | OLMoE | OLMoE-1B-7B | MoE |
 | Starcoder | Starcoder2-15B | Dense |
 | MiniCPM | MiniCPM-o | Dense |
@@ -215,7 +225,7 @@ Benchmark baseline vs. sculpted models across workloads:
 
 ```bash
 dystrio bench \
-  --models org/baseline org/sculpted-balanced \
+  --models org/baseline org/sculpted-production \
   --workloads wikitext chat rag code \
   --prompts-dir prompts/ \
   --outdir bench_out
@@ -413,7 +423,7 @@ llama-quantize model.gguf model-Q4_K_M.gguf Q4_K_M
 
 - Python >= 3.10
 - PyTorch >= 2.1
-- CUDA GPU (A100 80GB recommended for 7B+ models)
+- CUDA GPU (8–24GB is enough for small models; 7B+ with distillation is more comfortable on 40GB+ — see **Run Locally**)
 
 ```bash
 # Install with dev tools (pytest, ruff)
