@@ -16,7 +16,7 @@
 #   WORKDIR       $HOME/sculpt
 #   MODEL         meta-llama/Llama-3.1-8B-Instruct
 #   SKIP_LMEVAL   0              # set to 1 to skip lm-eval (faster, PPL-only sculpt side)
-#   HF_TOKEN      (unset)        # export hf_... for gated models / faster Hub
+#   HF_TOKEN      (unset)        # export hf_... for gated models (must be valid — check expiry)
 # =============================================================================
 set -euo pipefail
 
@@ -65,15 +65,33 @@ fi
 # shellcheck source=/dev/null
 source .venv/bin/activate
 
-pip install -U pip setuptools wheel -q
+pip install -U pip wheel -q
+# torch<=2.11 currently requires setuptools<82; avoid resolver noise and breakage
+pip install "setuptools>=68,<82" -q
 pip install -e ".[dev]" -q
 pip install "lm-eval>=0.4" huggingface_hub -q
 
 if [ -n "${HF_TOKEN:-}" ]; then
   echo ">> Hugging Face login (token from env)"
-  python -c "from huggingface_hub import login; login(token='${HF_TOKEN}')"
+  if python -c "from huggingface_hub import login; login(token='${HF_TOKEN}')"; then
+    echo "   OK"
+  else
+    echo ""
+    echo "ERROR: Hugging Face rejected HF_TOKEN (expired or invalid)."
+    echo "  1. Create a new token: https://huggingface.co/settings/tokens"
+    echo "  2. For Llama: accept Meta license on the model page on Hugging Face."
+    echo "  3. export HF_TOKEN='hf_...'  then re-run this script."
+    echo "  4. Or: unset HF_TOKEN  and use MODEL=Qwen/Qwen2.5-3B-Instruct (public)."
+    exit 1
+  fi
 else
-  echo ">> HF_TOKEN not set — fine for public models; set it for gated weights."
+  echo ">> HF_TOKEN not set — OK for fully public models only."
+  case "$MODEL" in
+    meta-llama/*|Llama-*|llama-*)
+      echo "ERROR: MODEL=$MODEL is gated; export a valid HF_TOKEN before running."
+      exit 1
+      ;;
+  esac
 fi
 
 echo ">> pytest (quick sanity)"
