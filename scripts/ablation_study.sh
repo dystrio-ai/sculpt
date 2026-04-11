@@ -65,6 +65,7 @@ if [ ! -f "$BASELINE_DIR/lm_eval_results.json" ] && [ "$SKIP_LMEVAL" != "1" ]; t
     echo "  Running lm-eval on uncompressed model..."
     mkdir -p "$BASELINE_DIR"
     BASELINE_LMEVAL_OUT="$BASELINE_DIR/lm_eval_output"
+    set +e
     lm_eval --model hf \
         --model_args "pretrained=$MODEL,dtype=bfloat16" \
         --tasks "$LMEVAL_TASKS" \
@@ -72,8 +73,15 @@ if [ ! -f "$BASELINE_DIR/lm_eval_results.json" ] && [ "$SKIP_LMEVAL" != "1" ]; t
         --batch_size auto \
         --output_path "$BASELINE_LMEVAL_OUT" \
         2>&1 | tee "$BASELINE_DIR/lm_eval.log"
-    _collect_lm_eval_results "$BASELINE_LMEVAL_OUT" "$BASELINE_DIR/lm_eval_results.json"
-    echo "  Baseline eval complete."
+    BASELINE_LMEVAL_EXIT=${PIPESTATUS[0]}
+    set -e
+    if [ "$BASELINE_LMEVAL_EXIT" -eq 0 ]; then
+        _collect_lm_eval_results "$BASELINE_LMEVAL_OUT" "$BASELINE_DIR/lm_eval_results.json"
+        echo "  Baseline eval complete."
+    else
+        echo "  Baseline lm-eval FAILED (exit $BASELINE_LMEVAL_EXIT) — fix CUDA/HF and re-run, or SKIP_LMEVAL=1."
+        exit 1
+    fi
 else
     echo "  Baseline eval exists or skipped."
 fi
@@ -88,15 +96,24 @@ for SELECTOR in $SELECTORS; do
     for KF in "${KF_ARRAY[@]}"; do
         RUN_DIR="$OUTBASE/${MODEL_SHORT}_${SELECTOR}_kf${KF}"
 
-        if [ -d "$RUN_DIR" ] && [ -f "$RUN_DIR/run_metadata.json" ]; then
-            echo "  [$SELECTOR kf=$KF] Already complete, skipping."
-            continue
+        # Skip only when this cell finished successfully (not merely run_metadata from a failed sculpt).
+        if [ -d "$RUN_DIR" ]; then
+            if [ "$SKIP_LMEVAL" = "1" ]; then
+                if find "$RUN_DIR" -path '*/model/config.json' -type f 2>/dev/null | head -1 | grep -q .; then
+                    echo "  [$SELECTOR kf=$KF] Sculpt output exists, skipping."
+                    continue
+                fi
+            elif [ -f "$RUN_DIR/lm_eval_results.json" ]; then
+                echo "  [$SELECTOR kf=$KF] Already complete (lm-eval results present), skipping."
+                continue
+            fi
         fi
 
         echo ""
         echo "  [$SELECTOR kf=$KF] Starting sculpt..."
         mkdir -p "$RUN_DIR"
 
+        SCULPT_OK=0
         if dystrio sculpt \
             --model-id "$MODEL" \
             --outdir "$RUN_DIR" \
@@ -110,17 +127,21 @@ for SELECTOR in $SELECTORS; do
             --deterministic \
             2>&1 | tee "$RUN_DIR/sculpt.log"; then
             echo "  [$SELECTOR kf=$KF] Sculpt complete."
+            SCULPT_OK=1
         else
-            echo "  [$SELECTOR kf=$KF] Sculpt FAILED (exit $?) — recorded as failure."
+            echo "  [$SELECTOR kf=$KF] Sculpt FAILED — recorded as failure. See $RUN_DIR/sculpt.log"
             echo '{"failed": true, "selector": "'"$SELECTOR"'", "keep_frac": '"$KF"'}' > "$RUN_DIR/run_metadata.json"
+            echo "  [$SELECTOR kf=$KF] Skipping lm-eval (no trusted checkpoint). To retry: rm -rf ${RUN_DIR@Q}"
         fi
 
-        # Run lm-eval on the sculpted model
-        if [ "$SKIP_LMEVAL" != "1" ]; then
+        # lm-eval only after a successful sculpt — partial dirs after a crash still have config.json
+        # and will break transformers / waste hours.
+        if [ "$SCULPT_OK" -eq 1 ] && [ "$SKIP_LMEVAL" != "1" ]; then
             SCULPTED_MODEL=$(find "$RUN_DIR" -name "config.json" -path "*/model/*" -exec dirname {} \; | head -1)
             if [ -n "$SCULPTED_MODEL" ]; then
                 echo "  [$SELECTOR kf=$KF] Running lm-eval on $SCULPTED_MODEL..."
                 RUN_LMEVAL_OUT="$RUN_DIR/lm_eval_output"
+                set +e
                 lm_eval --model hf \
                     --model_args "pretrained=$SCULPTED_MODEL,dtype=bfloat16" \
                     --tasks "$LMEVAL_TASKS" \
@@ -128,10 +149,16 @@ for SELECTOR in $SELECTORS; do
                     --batch_size auto \
                     --output_path "$RUN_LMEVAL_OUT" \
                     2>&1 | tee "$RUN_DIR/lm_eval.log"
-                _collect_lm_eval_results "$RUN_LMEVAL_OUT" "$RUN_DIR/lm_eval_results.json"
-                echo "  [$SELECTOR kf=$KF] lm-eval complete."
+                CELL_LMEVAL_EXIT=${PIPESTATUS[0]}
+                set -e
+                if [ "$CELL_LMEVAL_EXIT" -eq 0 ]; then
+                    _collect_lm_eval_results "$RUN_LMEVAL_OUT" "$RUN_DIR/lm_eval_results.json"
+                    echo "  [$SELECTOR kf=$KF] lm-eval complete."
+                else
+                    echo "  [$SELECTOR kf=$KF] lm-eval FAILED (exit $CELL_LMEVAL_EXIT) — continuing with other cells."
+                fi
             else
-                echo "  [$SELECTOR kf=$KF] WARNING: No sculpted model found, skipping lm-eval."
+                echo "  [$SELECTOR kf=$KF] WARNING: Sculpt reported OK but no model/ found, skipping lm-eval."
             fi
         fi
     done
