@@ -174,6 +174,10 @@ if ! grep -q "ABLATION_VIZ_BUILD" "$VIZ_SCRIPT" 2>/dev/null; then
     echo "    Fix: cd \"$REPO_ROOT\" && git pull origin main" >&2
     echo "    Or: curl -fsSL https://raw.githubusercontent.com/dystrio-ai/sculpt/main/scripts/visualize_ablation.py -o \"$VIZ_SCRIPT\"" >&2
 fi
+if ! python3 -c "import matplotlib" 2>/dev/null; then
+    echo "  matplotlib not in venv — installing for charts..."
+    pip install matplotlib -q
+fi
 python3 "$VIZ_SCRIPT" "$OUTBASE" --model "$MODEL_SHORT" || echo "  Visualization failed (non-fatal)."
 
 echo ""
