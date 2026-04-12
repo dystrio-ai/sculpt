@@ -68,7 +68,7 @@ source .venv/bin/activate
 pip install -U pip wheel -q
 # torch<=2.11 currently requires setuptools<82; avoid resolver noise and breakage
 pip install "setuptools>=68,<82" -q
-pip install -e ".[dev]" -q
+pip install -e ".[dev,viz]" -q
 pip install "lm-eval>=0.4" huggingface_hub -q
 
 if [ -n "${HF_TOKEN:-}" ]; then
