@@ -167,7 +167,14 @@ done
 # Phase 3: Visualization
 echo ""
 echo "[Phase 3] Generating comparison charts"
-python3 scripts/visualize_ablation.py "$OUTBASE" --model "$MODEL_SHORT" || echo "  Visualization failed (non-fatal)."
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VIZ_SCRIPT="$REPO_ROOT/scripts/visualize_ablation.py"
+if ! grep -q "ABLATION_VIZ_BUILD" "$VIZ_SCRIPT" 2>/dev/null; then
+    echo "  WARNING: $VIZ_SCRIPT looks stale (no ABLATION_VIZ_BUILD)." >&2
+    echo "    Fix: cd \"$REPO_ROOT\" && git pull origin main" >&2
+    echo "    Or: curl -fsSL https://raw.githubusercontent.com/dystrio-ai/sculpt/main/scripts/visualize_ablation.py -o \"$VIZ_SCRIPT\"" >&2
+fi
+python3 "$VIZ_SCRIPT" "$OUTBASE" --model "$MODEL_SHORT" || echo "  Visualization failed (non-fatal)."
 
 echo ""
 echo "=============================================="

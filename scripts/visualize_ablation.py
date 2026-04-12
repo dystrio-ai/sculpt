@@ -10,7 +10,7 @@ Usage:
     python scripts/visualize_ablation.py ablation_results/ --model Llama-3.1-8B-Instruct
     python scripts/visualize_ablation.py -V   # print build id only
 
-The first line of a normal run includes the same build id (e.g. …2026-04-09c). If it is missing,
+The first lines of a normal run include build id and absolute script path. If they are missing,
 `git pull` in this repo did not update the script you are executing.
 """
 from __future__ import annotations
@@ -24,7 +24,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-ABLATION_VIZ_BUILD = "2026-04-09c"  # always printed on run; bump when CLI/discovery changes
+ABLATION_VIZ_BUILD = "2026-04-09d"  # always printed on run; bump when CLI/discovery changes
 
 SELECTORS = ["structural", "sensitivity", "magnitude", "random"]
 SELECTOR_LABELS = {
@@ -525,12 +525,14 @@ def main():
         print(f"Results directory not found: {base}", file=sys.stderr)
         sys.exit(1)
 
+    _script_path = Path(__file__).resolve()
     print(
         f"Loading results from {base}/ for model {args.model}...  "
         f"(visualize_ablation {ABLATION_VIZ_BUILD})"
     )
+    print(f"  Script path: {_script_path}")
     if args.verbose:
-        print(f"  Script: {Path(__file__).resolve()}  (build {ABLATION_VIZ_BUILD})")
+        print(f"  cwd: {Path.cwd()}")
     runs = discover_runs(base, args.model)
     baseline = load_baseline(base, args.model)
 
