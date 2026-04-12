@@ -8,9 +8,10 @@ Reads sculpt output directories and produces:
 
 Usage:
     python scripts/visualize_ablation.py ablation_results/ --model Llama-3.1-8B-Instruct
-    python scripts/visualize_ablation.py -V   # print build id (verify git pull)
+    python scripts/visualize_ablation.py -V   # print build id only
 
-Build id bumps when CLI output / discovery logic changes (check after git pull on remote GPUs).
+The first line of a normal run includes the same build id (e.g. …2026-04-09c). If it is missing,
+`git pull` in this repo did not update the script you are executing.
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-ABLATION_VIZ_BUILD = "2026-04-09b"  # glob discovery, lm-eval tree scan, run hints
+ABLATION_VIZ_BUILD = "2026-04-09c"  # always printed on run; bump when CLI/discovery changes
 
 SELECTORS = ["structural", "sensitivity", "magnitude", "random"]
 SELECTOR_LABELS = {
@@ -524,7 +525,10 @@ def main():
         print(f"Results directory not found: {base}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Loading results from {base}/ for model {args.model}...")
+    print(
+        f"Loading results from {base}/ for model {args.model}...  "
+        f"(visualize_ablation {ABLATION_VIZ_BUILD})"
+    )
     if args.verbose:
         print(f"  Script: {Path(__file__).resolve()}  (build {ABLATION_VIZ_BUILD})")
     runs = discover_runs(base, args.model)
