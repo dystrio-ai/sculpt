@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -114,37 +114,49 @@ def load_metrics_json(path: Path) -> Dict[str, Any]:
         return json.load(f)
 
 
+def _pick_run_metrics(entry: Path) -> Dict[str, Any]:
+    """metrics.json usually lives under frontier_*/ not the run root."""
+    candidates = sorted(entry.glob("**/metrics.json"))
+    if not candidates:
+        return {}
+    for c in candidates:
+        if "frontier_0_production" in c.parts:
+            return load_metrics_json(c)
+    return load_metrics_json(candidates[-1])
+
+
 def discover_runs(base_dir: Path, model_short: str) -> Dict[str, Dict[float, Dict]]:
     """Discover all ablation runs organized by (selector, keep_frac)."""
     runs: Dict[str, Dict[float, Dict]] = defaultdict(dict)
+    base_dir = base_dir.expanduser().resolve()
+
+    # Anchored regex: prefix-matching "magnitude" vs "random" etc. is error-prone.
+    run_dir_re = re.compile(
+        rf"^{re.escape(model_short)}_(structural|sensitivity|magnitude|random)_kf([0-9.]+)$"
+    )
 
     for entry in sorted(base_dir.iterdir()):
         if not entry.is_dir():
             continue
-        name = entry.name
-        if not name.startswith(model_short):
+        m = run_dir_re.match(entry.name.strip())
+        if not m:
+            continue
+        sel, kf_str = m.group(1), m.group(2)
+        try:
+            kf = float(kf_str)
+        except ValueError:
             continue
 
-        for sel in SELECTORS:
-            tag = f"{model_short}_{sel}_kf"
-            if name.startswith(tag):
-                kf_str = name[len(tag):]
-                try:
-                    kf = float(kf_str)
-                except ValueError:
-                    continue
+        run_data: Dict[str, Any] = {"path": entry, "keep_frac": kf}
 
-                run_data: Dict[str, Any] = {"path": entry, "keep_frac": kf}
+        metrics = _pick_run_metrics(entry)
+        run_data["metrics"] = metrics
+        run_data["ppl"] = metrics.get("ppl_w103_valid")
 
-                metrics = load_metrics_json(entry / "metrics.json")
-                run_data["metrics"] = metrics
-                run_data["ppl"] = metrics.get("ppl_w103_valid")
+        lm_eval_path = entry / "lm_eval_results.json"
+        run_data["benchmarks"] = load_lm_eval_results(lm_eval_path)
 
-                lm_eval_path = entry / "lm_eval_results.json"
-                run_data["benchmarks"] = load_lm_eval_results(lm_eval_path)
-
-                runs[sel][kf] = run_data
-                break
+        runs[sel][kf] = run_data
 
     return dict(runs)
 
