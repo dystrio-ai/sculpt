@@ -28,6 +28,9 @@ dev = [
     "pytest>=7.0",
     "ruff>=0.2",
 ]
+viz = [
+    "matplotlib>=3.7",
+]
 
 [project.scripts]
 dystrio = "dystrio_sculpt.cli:app"

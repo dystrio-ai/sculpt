@@ -12,12 +12,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import glob as glob_std
 import json
 import re
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 
 SELECTORS = ["structural", "sensitivity", "magnitude", "random"]
@@ -63,6 +64,55 @@ METRIC_KEYS = {
 }
 
 
+def _benchmarks_from_raw(raw: Any) -> Dict[str, float]:
+    """Map lm-eval task dict to our benchmark keys."""
+    if not isinstance(raw, dict):
+        return {}
+    results: Dict[str, float] = {}
+    for bench_key in BENCHMARKS:
+        for task_key in [bench_key, f"leaderboard_{bench_key}", f"hendrycks_{bench_key}"]:
+            if task_key not in raw:
+                continue
+            task_data = raw[task_key]
+            if isinstance(task_data, dict):
+                for mk in METRIC_KEYS.get(bench_key, ["acc,none"]):
+                    if mk in task_data:
+                        val = task_data[mk]
+                        if isinstance(val, str):
+                            val = val.rstrip("%")
+                        results[bench_key] = float(val)
+                        break
+            elif isinstance(task_data, (int, float)):
+                results[bench_key] = float(task_data)
+            break
+    return results
+
+
+def _load_lm_eval_json_file(json_path: Path) -> Dict[str, float]:
+    try:
+        with open(json_path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    raw = data.get("results", data)
+    return _benchmarks_from_raw(raw)
+
+
+def _scan_tree_for_lm_eval(root: Path) -> Dict[str, float]:
+    """Use the richest results*.json under root (prefers lm_eval_output/)."""
+    if not root.is_dir():
+        return {}
+    candidates = sorted(root.glob("**/results*.json"))
+    preferred = [c for c in candidates if "lm_eval_output" in c.parts]
+    ordered = preferred + [c for c in candidates if c not in preferred]
+    best: Dict[str, float] = {}
+    for c in ordered:
+        parsed = _load_lm_eval_json_file(c)
+        if len(parsed) > len(best):
+            best = parsed
+    return best
+
+
 def load_lm_eval_results(path: Path) -> Dict[str, float]:
     """Load lm-eval results, handling various output formats.
 
@@ -71,39 +121,18 @@ def load_lm_eval_results(path: Path) -> Dict[str, float]:
       - lm-eval 0.4.x: {"results": {"task_name": {"acc,none": 0.5, "alias": "..."}}}
       - Flat format: {"task_name": 0.5}
       - Directory format: searches for results*.json if path is a directory
+      - Missing / empty lm_eval_results.json: scans run dir for results*.json
     """
     if path.is_dir():
-        candidates = sorted(path.glob("**/results*.json"))
-        if not candidates:
-            return {}
-        path = candidates[-1]
+        return _scan_tree_for_lm_eval(path)
 
     if not path.exists():
-        return {}
+        return _scan_tree_for_lm_eval(path.parent)
 
-    with open(path) as f:
-        data = json.load(f)
-
-    results: Dict[str, float] = {}
-    raw = data.get("results", data)
-
-    for bench_key, display_name in BENCHMARKS.items():
-        for task_key in [bench_key, f"leaderboard_{bench_key}", f"hendrycks_{bench_key}"]:
-            if task_key in raw:
-                task_data = raw[task_key]
-                if isinstance(task_data, dict):
-                    for mk in METRIC_KEYS.get(bench_key, ["acc,none"]):
-                        if mk in task_data:
-                            val = task_data[mk]
-                            if isinstance(val, str):
-                                val = val.rstrip("%")
-                            results[bench_key] = float(val)
-                            break
-                elif isinstance(task_data, (int, float)):
-                    results[bench_key] = float(task_data)
-                break
-
-    return results
+    primary = _load_lm_eval_json_file(path)
+    if primary:
+        return primary
+    return _scan_tree_for_lm_eval(path.parent)
 
 
 def load_metrics_json(path: Path) -> Dict[str, Any]:
@@ -125,6 +154,23 @@ def _pick_run_metrics(entry: Path) -> Dict[str, Any]:
     return load_metrics_json(candidates[-1])
 
 
+def _ppl_from_metrics(metrics: Dict[str, Any]) -> Optional[float]:
+    """Best-effort PPL from sculpt metrics.json (keys / types vary slightly)."""
+    if not metrics:
+        return None
+    for key in ("ppl_w103_valid", "ppl_w103"):
+        v = metrics.get(key)
+        if v is None:
+            continue
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+        try:
+            return float(str(v).split()[0])
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def discover_runs(base_dir: Path, model_short: str) -> Dict[str, Dict[float, Dict]]:
     """Discover all ablation runs organized by (selector, keep_frac)."""
     runs: Dict[str, Dict[float, Dict]] = defaultdict(dict)
@@ -135,7 +181,9 @@ def discover_runs(base_dir: Path, model_short: str) -> Dict[str, Dict[float, Dic
         rf"^{re.escape(model_short)}_(structural|sensitivity|magnitude|random)_kf([0-9.]+)$"
     )
 
-    for entry in sorted(base_dir.iterdir()):
+    # Glob is more reliable than iterdir() on symlinked / ephemeral result trees.
+    prefix = glob_std.escape(model_short)
+    for entry in sorted(base_dir.glob(f"{prefix}_*_kf*")):
         if not entry.is_dir():
             continue
         m = run_dir_re.match(entry.name.strip())
@@ -151,7 +199,7 @@ def discover_runs(base_dir: Path, model_short: str) -> Dict[str, Dict[float, Dic
 
         metrics = _pick_run_metrics(entry)
         run_data["metrics"] = metrics
-        run_data["ppl"] = metrics.get("ppl_w103_valid")
+        run_data["ppl"] = _ppl_from_metrics(metrics)
 
         lm_eval_path = entry / "lm_eval_results.json"
         run_data["benchmarks"] = load_lm_eval_results(lm_eval_path)
@@ -469,6 +517,22 @@ def main():
     print(f"  Found runs: {found}")
     print(f"  Baseline benchmarks: {list(baseline.keys()) or 'none'}")
 
+    prefix_esc = glob_std.escape(args.model)
+    random_dirs = sorted(p for p in base.glob(f"{prefix_esc}_random_kf*") if p.is_dir())
+    if not random_dirs:
+        print(
+            f"  Note: no random runs under {base}/ (expected dirs like "
+            f"{args.model}_random_kf0.90). The random selector loop may not have finished."
+        )
+
+    for sel, kfs in runs.items():
+        for kf, run in kfs.items():
+            if not run.get("benchmarks"):
+                print(
+                    f"  Warning: no lm-eval benchmarks for {sel} keep_frac={kf} "
+                    f"— check {run['path']}/lm_eval.log and lm_eval_output/"
+                )
+
     charts_dir = base / "charts"
     charts_dir.mkdir(exist_ok=True)
 
@@ -494,6 +558,7 @@ def main():
         generate_commonsense_avg_chart(runs, baseline, charts_dir / "commonsense7_avg_vs_compression.png")
     except ImportError:
         print("  matplotlib not available, skipping charts.")
+        print("  Install: pip install matplotlib  # or: pip install -e '.[viz]'")
 
     generate_summary_table(runs, baseline, base / "ablation_summary.md")
 
