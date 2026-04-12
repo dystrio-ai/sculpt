@@ -24,7 +24,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-ABLATION_VIZ_BUILD = "2026-04-09d"  # always printed on run; bump when CLI/discovery changes
+ABLATION_VIZ_BUILD = "2026-04-09e"  # always printed on run; bump when CLI/discovery changes
 
 SELECTORS = ["structural", "sensitivity", "magnitude", "random"]
 SELECTOR_LABELS = {
@@ -39,6 +39,13 @@ SELECTOR_STYLES = {
     "magnitude": {"color": "#9C27B0", "marker": "^", "linewidth": 1.5},
     "random": {"color": "#757575", "marker": "x", "linewidth": 1.5, "linestyle": "--"},
 }
+
+if __name__ == "__main__":
+    # First line of real runs; skipped for -V/--version only.
+    _argv_rest = sys.argv[1:]
+    if _argv_rest not in (["-V"], ["--version"]):
+        sys.stderr.write(f"[visualize_ablation {ABLATION_VIZ_BUILD}] exec {__file__}\n")
+        sys.stderr.flush()
 
 BENCHMARKS = {
     "mmlu": "MMLU",
