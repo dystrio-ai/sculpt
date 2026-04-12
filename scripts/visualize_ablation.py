@@ -8,6 +8,9 @@ Reads sculpt output directories and produces:
 
 Usage:
     python scripts/visualize_ablation.py ablation_results/ --model Llama-3.1-8B-Instruct
+    python scripts/visualize_ablation.py -V   # print build id (verify git pull)
+
+Build id bumps when CLI output / discovery logic changes (check after git pull on remote GPUs).
 """
 from __future__ import annotations
 
@@ -20,6 +23,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+ABLATION_VIZ_BUILD = "2026-04-09b"  # glob discovery, lm-eval tree scan, run hints
 
 SELECTORS = ["structural", "sensitivity", "magnitude", "random"]
 SELECTOR_LABELS = {
@@ -496,9 +500,24 @@ def generate_summary_table(
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize Physarum ablation results")
-    parser.add_argument("results_dir", type=str, help="Path to ablation results directory")
-    parser.add_argument("--model", type=str, required=True, help="Model short name (e.g. Llama-3.1-8B-Instruct)")
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"%(prog)s build {ABLATION_VIZ_BUILD}",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Print resolved script path")
+    parser.add_argument("results_dir", nargs="?", help="Path to ablation results directory")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Model short name (e.g. Llama-3.1-8B-Instruct)",
+    )
     args = parser.parse_args()
+
+    if not args.results_dir or not args.model:
+        parser.error("results_dir and --model are required (use -V to print build id)")
 
     base = Path(args.results_dir)
     if not base.exists():
@@ -506,6 +525,8 @@ def main():
         sys.exit(1)
 
     print(f"Loading results from {base}/ for model {args.model}...")
+    if args.verbose:
+        print(f"  Script: {Path(__file__).resolve()}  (build {ABLATION_VIZ_BUILD})")
     runs = discover_runs(base, args.model)
     baseline = load_baseline(base, args.model)
 
