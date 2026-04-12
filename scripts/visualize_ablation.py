@@ -2,12 +2,14 @@
 """Visualize Physarum ablation study results.
 
 Reads sculpt output directories and produces:
-  1. Quality-vs-compression chart (one line per selector)
-  2. Per-benchmark retention bar chart
+  1. Quality-vs-compression chart (one line per selector; needs matplotlib)
+  2. Per-benchmark retention charts (matplotlib)
   3. Summary markdown table
+  4. Optional --csv long-format export (no matplotlib; chart in Excel/Sheets/Python)
 
 Usage:
     python scripts/visualize_ablation.py ablation_results/ --model Llama-3.1-8B-Instruct
+    python scripts/visualize_ablation.py ablation_results/ --model Llama-3.1-8B-Instruct --csv
     python scripts/visualize_ablation.py -V   # print build id only
 
 The first lines of a normal run include build id and absolute script path. If they are missing,
@@ -16,6 +18,7 @@ The first lines of a normal run include build id and absolute script path. If th
 from __future__ import annotations
 
 import argparse
+import csv
 import glob as glob_std
 import json
 import re
@@ -24,7 +27,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-ABLATION_VIZ_BUILD = "2026-04-09e"  # always printed on run; bump when CLI/discovery changes
+ABLATION_VIZ_BUILD = "2026-04-10a"  # always printed on run; bump when CLI/discovery changes
 
 SELECTORS = ["structural", "sensitivity", "magnitude", "random"]
 SELECTOR_LABELS = {
@@ -291,6 +294,125 @@ def _commonsense_avg(bench: Dict[str, float]) -> Optional[float]:
     return sum(vals) / len(vals) if len(vals) >= 4 else None
 
 
+def export_chart_csv(
+    runs: Dict[str, Dict[float, Dict]],
+    baseline: Dict[str, float],
+    output_path: Path,
+) -> None:
+    """Long-format CSV for Excel, Google Sheets, or any plotting stack (no matplotlib)."""
+    fieldnames = [
+        "selector_key",
+        "selector_label",
+        "keep_frac",
+        "fraction_removed",
+        "benchmark_key",
+        "benchmark_label",
+        "accuracy_pct",
+        "baseline_pct",
+        "retention_pct_of_baseline",
+        "ppl",
+    ]
+    rows: list[dict[str, Any]] = []
+
+    if baseline:
+        for bk, blabel in BENCHMARKS.items():
+            if bk not in baseline:
+                continue
+            bp = baseline[bk] * 100
+            rows.append(
+                {
+                    "selector_key": "baseline",
+                    "selector_label": "Baseline",
+                    "keep_frac": 1.0,
+                    "fraction_removed": 0.0,
+                    "benchmark_key": bk,
+                    "benchmark_label": blabel,
+                    "accuracy_pct": round(bp, 6),
+                    "baseline_pct": round(bp, 6),
+                    "retention_pct_of_baseline": 100.0,
+                    "ppl": "",
+                }
+            )
+        cs = _commonsense_avg(baseline)
+        if cs is not None:
+            cp = cs * 100
+            rows.append(
+                {
+                    "selector_key": "baseline",
+                    "selector_label": "Baseline",
+                    "keep_frac": 1.0,
+                    "fraction_removed": 0.0,
+                    "benchmark_key": "commonsense_7_avg",
+                    "benchmark_label": "Commonsense-7 Avg",
+                    "accuracy_pct": round(cp, 6),
+                    "baseline_pct": round(cp, 6),
+                    "retention_pct_of_baseline": 100.0,
+                    "ppl": "",
+                }
+            )
+
+    for sel in SELECTORS:
+        if sel not in runs:
+            continue
+        for kf in sorted(runs[sel].keys(), reverse=True):
+            run = runs[sel][kf]
+            bench = run.get("benchmarks", {})
+            ppl = run.get("ppl")
+            ppl_out = f"{float(ppl):.6f}" if ppl is not None else ""
+            label = SELECTOR_LABELS.get(sel, sel)
+            fr = round(1.0 - kf, 6)
+            for bk, blabel in BENCHMARKS.items():
+                val = bench.get(bk)
+                bv = baseline.get(bk) if baseline else None
+                acc_pct: Any = round(val * 100, 6) if val is not None else ""
+                b_pct: Any = round(bv * 100, 6) if bv is not None else ""
+                ret_pct: Any = (
+                    round(val / bv * 100, 4) if val is not None and bv not in (None, 0) else ""
+                )
+                rows.append(
+                    {
+                        "selector_key": sel,
+                        "selector_label": label,
+                        "keep_frac": kf,
+                        "fraction_removed": fr,
+                        "benchmark_key": bk,
+                        "benchmark_label": blabel,
+                        "accuracy_pct": acc_pct,
+                        "baseline_pct": b_pct,
+                        "retention_pct_of_baseline": ret_pct,
+                        "ppl": ppl_out,
+                    }
+                )
+            cs = _commonsense_avg(bench)
+            b_cs = _commonsense_avg(baseline) if baseline else None
+            if cs is not None:
+                acc_pct = round(cs * 100, 6)
+                b_pct: Any = round(b_cs * 100, 6) if b_cs is not None else ""
+                ret_pct: Any = (
+                    round(cs / b_cs * 100, 4) if b_cs not in (None, 0) else ""
+                )
+                rows.append(
+                    {
+                        "selector_key": sel,
+                        "selector_label": label,
+                        "keep_frac": kf,
+                        "fraction_removed": fr,
+                        "benchmark_key": "commonsense_7_avg",
+                        "benchmark_label": "Commonsense-7 Avg",
+                        "accuracy_pct": acc_pct,
+                        "baseline_pct": b_pct,
+                        "retention_pct_of_baseline": ret_pct,
+                        "ppl": ppl_out,
+                    }
+                )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+
+
 def generate_ppl_chart(
     runs: Dict[str, Dict[float, Dict]],
     output_path: Path,
@@ -522,6 +644,15 @@ def main():
         default=None,
         help="Model short name (e.g. Llama-3.1-8B-Instruct)",
     )
+    parser.add_argument(
+        "--csv",
+        nargs="?",
+        default=None,
+        const="",
+        metavar="FILE",
+        help="Export long-format CSV for charting (Excel/Sheets/plotly); no matplotlib. "
+        "Default file: <results_dir>/ablation_chart_data.csv",
+    )
     args = parser.parse_args()
 
     if not args.results_dir or not args.model:
@@ -566,6 +697,15 @@ def main():
                     f"  Warning: no lm-eval benchmarks for {sel} keep_frac={kf} "
                     f"— check {run['path']}/lm_eval.log and lm_eval_output/"
                 )
+
+    if args.csv is not None:
+        csv_path = (
+            base / "ablation_chart_data.csv" if args.csv == "" else Path(args.csv).expanduser()
+        )
+        if not csv_path.is_absolute():
+            csv_path = Path.cwd() / csv_path
+        export_chart_csv(runs, baseline, csv_path)
+        print(f"  Saved: {csv_path}")
 
     charts_dir = base / "charts"
     charts_dir.mkdir(exist_ok=True)
