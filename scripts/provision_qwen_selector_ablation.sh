@@ -73,6 +73,28 @@ source .venv/bin/activate
 
 pip install -U pip wheel -q
 pip install "setuptools>=68,<82" -q
+
+# Install torch matching the box's CUDA driver to avoid version mismatches.
+# Detect driver CUDA version and pick the best compatible torch index.
+CUDA_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | tr -d ' ')
+DRIVER_CUDA=$(python3 -c "
+import subprocess, re
+out = subprocess.check_output(['nvidia-smi'], text=True)
+m = re.search(r'CUDA Version:\s*(\d+)\.(\d+)', out)
+print(f'{m.group(1)}.{m.group(2)}' if m else 'unknown')
+" 2>/dev/null || echo "unknown")
+
+echo "   Driver CUDA: $DRIVER_CUDA"
+if python3 -c "v='$DRIVER_CUDA'; major,minor=v.split('.'); exit(0 if int(major)>=12 and int(minor)>=4 else 1)" 2>/dev/null; then
+    TORCH_INDEX="https://download.pytorch.org/whl/cu124"
+elif python3 -c "v='$DRIVER_CUDA'; major,minor=v.split('.'); exit(0 if int(major)>=12 and int(minor)>=1 else 1)" 2>/dev/null; then
+    TORCH_INDEX="https://download.pytorch.org/whl/cu121"
+else
+    TORCH_INDEX="https://download.pytorch.org/whl/cu118"
+fi
+echo "   Torch index: $TORCH_INDEX"
+pip install torch torchvision torchaudio --index-url "$TORCH_INDEX" -q
+
 pip install -e ".[dev,viz]" -q
 pip install "lm-eval>=0.4" huggingface_hub -q
 
