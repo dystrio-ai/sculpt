@@ -29,15 +29,17 @@ from typing import Any, Dict, Optional
 
 ABLATION_VIZ_BUILD = "2026-04-10a"  # always printed on run; bump when CLI/discovery changes
 
-SELECTORS = ["structural", "sensitivity", "magnitude", "random"]
+SELECTORS = ["structural", "cohesion", "sensitivity", "magnitude", "random"]
 SELECTOR_LABELS = {
-    "structural": "Physarum (full)",
+    "structural": "Physarum (diversity)",
+    "cohesion": "Physarum (cohesion)",
     "sensitivity": "Sensitivity only",
     "magnitude": "Magnitude",
     "random": "Random",
 }
 SELECTOR_STYLES = {
     "structural": {"color": "#2196F3", "marker": "o", "linewidth": 2.5},
+    "cohesion": {"color": "#4CAF50", "marker": "D", "linewidth": 2.5},
     "sensitivity": {"color": "#FF9800", "marker": "s", "linewidth": 2.0},
     "magnitude": {"color": "#9C27B0", "marker": "^", "linewidth": 1.5},
     "random": {"color": "#757575", "marker": "x", "linewidth": 1.5, "linestyle": "--"},

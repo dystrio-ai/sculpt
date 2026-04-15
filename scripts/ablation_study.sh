@@ -21,7 +21,7 @@ set -euo pipefail
 
 MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 KEEP_FRACS="${KEEP_FRACS:-0.90,0.85,0.80,0.75}"
-SELECTORS="${SELECTORS:-structural sensitivity magnitude random}"
+SELECTORS="${SELECTORS:-structural cohesion sensitivity magnitude random}"
 WORKLOAD="${WORKLOAD:-general_v2}"
 OUTBASE="${OUTBASE:-ablation_results}"
 

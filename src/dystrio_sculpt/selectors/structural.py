@@ -94,6 +94,66 @@ def physarum_conductance(
     return k
 
 
+def physarum_conductance_v2(
+    u: np.ndarray, v: np.ndarray, w: np.ndarray,
+    n_nodes: int, n_iters: int = 200, mu: float = 1.0, eps: float = 1e-8,
+    rng: np.random.RandomState | None = None,
+) -> np.ndarray:
+    """Improved Physarum conductance with graph-aware source/sink selection.
+
+    Differences from v1:
+      - mu defaults to 1.0 (linear reinforcement) for smoother conductance
+        landscapes instead of concentrating on a few dominant paths.
+      - Source/sink pairs are selected from actual graph endpoints (high-degree
+        nodes) rather than arbitrary index arithmetic, so flow patterns reflect
+        the real coupling topology.
+    """
+    n_edges = len(u)
+    if n_edges == 0:
+        return np.zeros(0, dtype=np.float64)
+    if rng is None:
+        rng = np.random.RandomState()
+
+    degree = np.zeros(n_nodes, dtype=np.float64)
+    for e in range(n_edges):
+        degree[u[e]] += w[e]
+        degree[v[e]] += w[e]
+
+    active_nodes = np.where(degree > 0)[0]
+    if len(active_nodes) < 2:
+        return w.copy()
+    degree_probs = degree[active_nodes]
+    degree_probs /= degree_probs.sum()
+
+    k = w.copy() + eps
+    for _ in range(n_iters):
+        src = rng.choice(active_nodes, p=degree_probs)
+        snk_candidates = active_nodes[active_nodes != src]
+        inv_probs = degree[snk_candidates]
+        inv_probs = inv_probs.max() - inv_probs + eps
+        inv_probs /= inv_probs.sum()
+        snk = rng.choice(snk_candidates, p=inv_probs)
+
+        G = k + eps
+        L = np.zeros((n_nodes, n_nodes), dtype=np.float64)
+        for e in range(n_edges):
+            L[u[e], u[e]] += G[e]
+            L[v[e], v[e]] += G[e]
+            L[u[e], v[e]] -= G[e]
+            L[v[e], u[e]] -= G[e]
+        L += eps * np.eye(n_nodes)
+        rhs = np.zeros(n_nodes, dtype=np.float64)
+        rhs[src] = 1.0
+        rhs[snk] = -1.0
+        try:
+            p = np.linalg.solve(L, rhs)
+        except np.linalg.LinAlgError:
+            continue
+        flow = np.abs(G * (p[u] - p[v]))
+        k = 0.95 * k + 0.05 * (np.power(flow + eps, mu) + eps)
+    return k
+
+
 # ── Cross-layer novelty tracking ──────────────────────────────────────────────
 
 
@@ -282,6 +342,110 @@ def select_blocks_structural(
         "k_edge": torch.from_numpy(k_edge),
         "block_scores": torch.from_numpy(raw_scores),
         "block_adj_norm": adj_norm,
+    }
+    return selected, torch.tensor(idx, dtype=torch.long), artifacts
+
+
+# ── Cohesion-based selection ──────────────────────────────────────────────────
+
+
+def select_blocks_cohesion(
+    D: torch.Tensor,
+    keep_frac: float,
+    block_size: int,
+    topk_edges: int = 20,
+    n_physarum_iters: int = 200,
+    cohesion_lambda: float = 0.15,
+    block_energy: torch.Tensor | None = None,
+    feature_multiplier: int = 3,
+    block_sensitivity: torch.Tensor | None = None,
+    rng: np.random.RandomState | None = None,
+    cross_layer_novelty: np.ndarray | None = None,
+    mu: float = 1.0,
+) -> Tuple[List[int], torch.Tensor, Dict[str, object]]:
+    """Cohesion-based block selection: keeps structurally coupled groups intact.
+
+    Uses the same Physarum conductance pipeline as ``select_blocks_structural``
+    but *inverts* the coupling signal: instead of penalising selection of
+    tightly-coupled neighbours (diversity), it *boosts* them (cohesion).
+
+    The insight: correlated blocks typically form functional circuits.
+    Keeping co-dependent blocks together preserves circuit integrity;
+    the old diversity penalty was breaking these circuits apart.
+    """
+    n_feat = D.shape[0]
+    F = feature_multiplier
+    n_blocks = n_feat // F
+    if n_blocks == 0:
+        n_blocks = max(1, n_feat)
+        F = 1
+    keep_n = max(1, int(math.ceil(keep_frac * n_blocks)))
+
+    u, v, w = build_graph_from_cov(D, k=topk_edges)
+    k_edge = physarum_conductance_v2(
+        u, v, w, n_feat, n_iters=n_physarum_iters, mu=mu, rng=rng,
+    )
+
+    adj = np.zeros((n_blocks, n_blocks), dtype=np.float64)
+    for e in range(len(u)):
+        bu, bv = int(u[e]) // F, int(v[e]) // F
+        if bu != bv:
+            adj[bu, bv] += k_edge[e]
+            adj[bv, bu] += k_edge[e]
+    adj_norm = adj / (adj.max(axis=1, keepdims=True) + 1e-30)
+
+    if block_sensitivity is not None:
+        sens = np.asarray(block_sensitivity, dtype=np.float64)[:n_blocks]
+        raw_scores = sens.copy()
+    else:
+        raw_scores = np.zeros(n_blocks, dtype=np.float64)
+        for e in range(len(u)):
+            bu, bv = int(u[e]) // F, int(v[e]) // F
+            raw_scores[bu] += k_edge[e]
+            if bv != bu:
+                raw_scores[bv] += k_edge[e]
+
+    if block_energy is not None:
+        be = np.asarray(block_energy, dtype=np.float64)[:n_blocks]
+        be_norm = be / (be.max() + 1e-30)
+        raw_scores = raw_scores * (0.5 + 0.5 * be_norm)
+
+    if cross_layer_novelty is not None:
+        raw_scores = raw_scores * cross_layer_novelty[:n_blocks]
+
+    # Greedy selection with cohesion BOOST (not penalty).
+    # Selecting block A increases the scores of A's coupled neighbours,
+    # making it more likely to keep functional groups intact.
+    scores = raw_scores.copy()
+    selected: List[int] = []
+    for _ in range(keep_n):
+        best = int(np.argmax(scores))
+        selected.append(best)
+        scores[best] = -1e30
+        if cohesion_lambda > 0:
+            boost = cohesion_lambda * adj_norm[best] * raw_scores[best]
+            mask = scores > -1e30
+            scores[mask] += boost[mask]
+    selected.sort()
+
+    ffn = n_blocks * block_size
+    idx: List[int] = []
+    for b in selected:
+        lo = b * block_size
+        hi = min(ffn, (b + 1) * block_size)
+        idx.extend(range(lo, hi))
+
+    edges = (
+        torch.tensor(np.stack([u, v, w], axis=1), dtype=torch.float64)
+        if len(u) > 0
+        else torch.zeros(0, 3, dtype=torch.float64)
+    )
+    artifacts = {
+        "edges": edges,
+        "k_edge": torch.from_numpy(k_edge),
+        "block_scores": torch.from_numpy(raw_scores),
+        "block_adj_norm": adj_norm,
+        "method": "cohesion",
     }
     return selected, torch.tensor(idx, dtype=torch.long), artifacts
 

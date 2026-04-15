@@ -213,7 +213,8 @@ def sculpt(
     ),
     selector: str = typer.Option(
         "structural", "--selector",
-        help="Block selection algorithm: structural (default, Physarum), "
+        help="Block selection algorithm: structural (default, Physarum diversity), "
+             "cohesion (Physarum cohesion — keeps coupled groups intact), "
              "sensitivity (importance-only, no Physarum), magnitude, random. "
              "Use non-default selectors for ablation studies.",
     ),
