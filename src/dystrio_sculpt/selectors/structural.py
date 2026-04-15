@@ -349,6 +349,52 @@ def select_blocks_structural(
 # ── Cohesion-based selection ──────────────────────────────────────────────────
 
 
+def _cluster_coupled_blocks(
+    adj_raw: np.ndarray,
+    n_blocks: int,
+    percentile: float = 95.0,
+) -> List[List[int]]:
+    """Partition blocks into coupled groups via single-linkage clustering.
+
+    Uses the *raw* (unnormalized) block adjacency so that the threshold
+    reflects absolute coupling strength rather than per-row relative rank.
+    The threshold is set at the given *percentile* of non-zero edge weights,
+    so only edges in the top tail trigger grouping.  This separates planted
+    circuits (strong direct coupling) from weak transitive coupling.
+
+    Blocks with no strong coupling form singleton groups.
+    """
+    vals = adj_raw[np.triu_indices(n_blocks, k=1)]
+    nz = vals[vals > 0]
+    if len(nz) == 0:
+        return [[i] for i in range(n_blocks)]
+    threshold = float(np.percentile(nz, percentile))
+
+    parent = list(range(n_blocks))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(n_blocks):
+        for j in range(i + 1, n_blocks):
+            if adj_raw[i, j] > threshold:
+                union(i, j)
+
+    groups: Dict[int, List[int]] = {}
+    for i in range(n_blocks):
+        r = find(i)
+        groups.setdefault(r, []).append(i)
+    return list(groups.values())
+
+
 def select_blocks_cohesion(
     D: torch.Tensor,
     keep_frac: float,
@@ -362,16 +408,22 @@ def select_blocks_cohesion(
     rng: np.random.RandomState | None = None,
     cross_layer_novelty: np.ndarray | None = None,
     mu: float = 1.0,
+    coupling_percentile: float = 95.0,
 ) -> Tuple[List[int], torch.Tensor, Dict[str, object]]:
-    """Cohesion-based block selection: keeps structurally coupled groups intact.
+    """Group-aware block selection: uses Physarum to keep/drop coupled groups atomically.
 
-    Uses the same Physarum conductance pipeline as ``select_blocks_structural``
-    but *inverts* the coupling signal: instead of penalising selection of
-    tightly-coupled neighbours (diversity), it *boosts* them (cohesion).
+    Instead of selecting individual blocks with a boost/penalty, this selector
+    uses Physarum conductance to discover *functional groups* (strongly coupled
+    block clusters), then makes keep/drop decisions at the group level.
 
-    The insight: correlated blocks typically form functional circuits.
-    Keeping co-dependent blocks together preserves circuit integrity;
-    the old diversity penalty was breaking these circuits apart.
+    This naturally works at all compression levels:
+      - Light pruning: most groups fit; only the least important groups are
+        dropped, and they're dropped whole — no circuit is partially broken.
+      - Aggressive pruning: the most important groups are kept intact while
+        less important groups are dropped intact.
+
+    After group-level selection hits the target count, remaining budget is
+    filled with the highest-sensitivity ungrouped blocks.
     """
     n_feat = D.shape[0]
     F = feature_multiplier
@@ -394,6 +446,7 @@ def select_blocks_cohesion(
             adj[bv, bu] += k_edge[e]
     adj_norm = adj / (adj.max(axis=1, keepdims=True) + 1e-30)
 
+    # Block-level scores
     if block_sensitivity is not None:
         sens = np.asarray(block_sensitivity, dtype=np.float64)[:n_blocks]
         raw_scores = sens.copy()
@@ -413,20 +466,34 @@ def select_blocks_cohesion(
     if cross_layer_novelty is not None:
         raw_scores = raw_scores * cross_layer_novelty[:n_blocks]
 
-    # Greedy selection with cohesion BOOST (not penalty).
-    # Selecting block A increases the scores of A's coupled neighbours,
-    # making it more likely to keep functional groups intact.
-    scores = raw_scores.copy()
-    selected: List[int] = []
-    for _ in range(keep_n):
-        best = int(np.argmax(scores))
-        selected.append(best)
-        scores[best] = -1e30
-        if cohesion_lambda > 0:
-            boost = cohesion_lambda * adj_norm[best] * raw_scores[best]
-            mask = scores > -1e30
-            scores[mask] += boost[mask]
-    selected.sort()
+    # Discover functional groups from Physarum coupling (raw adjacency)
+    groups = _cluster_coupled_blocks(adj, n_blocks, percentile=coupling_percentile)
+
+    # Score each group: mean sensitivity × sqrt(group_size) to reward
+    # keeping multi-block circuits over singletons at equal per-block quality.
+    group_scores = []
+    for gi, group in enumerate(groups):
+        mean_sens = np.mean([raw_scores[b] for b in group])
+        size_bonus = math.sqrt(len(group))
+        group_scores.append((mean_sens * size_bonus, gi))
+    group_scores.sort(reverse=True)
+
+    # Greedy group selection: add whole groups until budget is spent.
+    selected_set: set = set()
+    for _, gi in group_scores:
+        group = groups[gi]
+        if len(selected_set) + len(group) <= keep_n:
+            selected_set.update(group)
+
+    # Fill remaining budget with highest-scoring unselected individual blocks.
+    remaining = keep_n - len(selected_set)
+    if remaining > 0:
+        unselected = [(raw_scores[b], b) for b in range(n_blocks) if b not in selected_set]
+        unselected.sort(reverse=True)
+        for _, b in unselected[:remaining]:
+            selected_set.add(b)
+
+    selected = sorted(selected_set)
 
     ffn = n_blocks * block_size
     idx: List[int] = []
@@ -446,6 +513,8 @@ def select_blocks_cohesion(
         "block_scores": torch.from_numpy(raw_scores),
         "block_adj_norm": adj_norm,
         "method": "cohesion",
+        "n_groups": len(groups),
+        "group_sizes": [len(g) for g in groups],
     }
     return selected, torch.tensor(idx, dtype=torch.long), artifacts
 

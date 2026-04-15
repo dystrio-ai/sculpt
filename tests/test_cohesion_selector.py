@@ -165,30 +165,50 @@ class TestCohesionSelector:
         assert arts["block_scores"].shape[0] == n_experts
 
     def test_cross_layer_novelty_modulation(self):
-        """Cross-layer novelty should modulate base scores."""
+        """Cross-layer novelty should reduce a block's effective score."""
         D = _make_block_cov(8)
-        sens = torch.ones(8, dtype=torch.float64)
-        novelty = np.ones(8, dtype=np.float64)
-        novelty[0] = 0.01  # heavily penalize block 0
-
-        rng = np.random.RandomState(42)
-        kept, _, _ = select_blocks_cohesion(
-            D, keep_frac=0.5, block_size=1,
-            block_sensitivity=sens, feature_multiplier=3,
-            rng=rng, cross_layer_novelty=novelty,
-        )
-        assert 0 not in kept, "Block 0 should be rejected by novelty penalty"
-
-    def test_cohesion_lambda_zero_matches_sensitivity_order(self):
-        """With cohesion_lambda=0, selection should match plain sensitivity."""
-        D = _make_block_cov(8)
-        sens = torch.tensor([0.1, 0.9, 0.3, 0.8, 0.2, 0.7, 0.4, 0.6],
+        sens = torch.tensor([0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2],
                             dtype=torch.float64)
-        rng = np.random.RandomState(42)
-        kept, _, _ = select_blocks_cohesion(
+
+        rng1 = np.random.RandomState(42)
+        kept_no_novelty, _, _ = select_blocks_cohesion(
             D, keep_frac=0.5, block_size=1,
             block_sensitivity=sens, feature_multiplier=3,
-            rng=rng, cohesion_lambda=0.0,
+            rng=rng1,
         )
-        # Top 4 by sensitivity: indices 1(0.9), 3(0.8), 5(0.7), 7(0.6)
-        assert sorted(kept) == [1, 3, 5, 7]
+
+        # Heavily penalize the top 2 blocks
+        novelty = np.ones(8, dtype=np.float64)
+        novelty[0] = 0.01
+        novelty[1] = 0.01
+        rng2 = np.random.RandomState(42)
+        kept_with_novelty, _, _ = select_blocks_cohesion(
+            D, keep_frac=0.5, block_size=1,
+            block_sensitivity=sens, feature_multiplier=3,
+            rng=rng2, cross_layer_novelty=novelty,
+        )
+        assert kept_no_novelty != kept_with_novelty, "Novelty should change selection"
+
+    def test_group_aware_selection(self):
+        """Groups discovered by coupling should be kept/dropped atomically."""
+        n_blocks = 10
+        F = 3
+        D = _make_block_cov(n_blocks, F=F, coupled_pairs=[(0, 1), (0, 2)])
+
+        sens = torch.full((n_blocks,), 0.5, dtype=torch.float64)
+        sens[0] = 0.8
+        sens[1] = 0.3
+        sens[2] = 0.3
+
+        rng = np.random.RandomState(42)
+        kept, _, arts = select_blocks_cohesion(
+            D, keep_frac=0.5, block_size=1,
+            block_sensitivity=sens, feature_multiplier=F, rng=rng,
+        )
+        # The group {0,1,2} should be treated atomically: all in or all out.
+        group_members = {0, 1, 2}
+        kept_set = set(kept)
+        in_group = group_members & kept_set
+        assert in_group == group_members or len(in_group) == 0, (
+            f"Group should be kept or dropped atomically, got {in_group}"
+        )
